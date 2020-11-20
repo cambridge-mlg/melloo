@@ -1,0 +1,12 @@
+include 'meta_dataset/learn/gin/models/learner_config.gin'
+Trainer.train_learner_class = @RelationNetworkLearner
+Trainer.eval_learner_class = @RelationNetworkLearner
+Learner.embedding_fn = 'relationnet_embedding'
+Learner.transductive_batch_norm = True
+
+Learner.weight_decay = 1e-6
+
+# Allow transductive batch norm to be faithful with the original Relation Net
+# implementation, even though this gives it an advantage over the rest of the
+# models we used on Meta-Dataset.
+Learner.transductive_batch_norm = True

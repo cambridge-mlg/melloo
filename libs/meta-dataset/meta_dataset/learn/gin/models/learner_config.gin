@@ -1,0 +1,6 @@
+Trainer.checkpoint_to_restore = ''
+Trainer.learning_rate = 1e-4
+Trainer.decay_learning_rate = False
+Trainer.decay_every = 5000
+Trainer.decay_rate = 0.5
+Trainer.pretrained_source = ''
