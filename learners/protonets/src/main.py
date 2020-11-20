@@ -183,8 +183,13 @@ class Learner:
 
             accuracy_loo = []
             for i, im in enumerate(context_images):
-                context_images_loo = context_images[0:i] + context_images[i+1:]
-                context_labels_loo = context_labels[0:i] + context_labels[i+1:]
+                if i == 0:
+                    context_images_loo = context_images[i + 1:]
+                    context_labels_loo = context_labels[i + 1:]
+                else:
+                    context_images_loo = context_images[0:i] + context_images[i + 1:]
+                    context_labels_loo = context_labels[0:i] + context_labels[i + 1:]
+
                 logits = self.model(context_images_loo, context_labels_loo, target_images)
                 accuracy = self.accuracy_fn(logits, target_labels)
                 print_and_log(self.logfile, 'Loo {} accuracy: {0:3.1f}'.format(i, true_accuracy - accuracy))
