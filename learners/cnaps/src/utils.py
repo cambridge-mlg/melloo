@@ -4,7 +4,85 @@ import os
 import math
 from enum import Enum
 import sys
+import pickle
+import bz2
+import _pickle as cPickle
 
+class SavedDataset:
+    def __init__(self, pickle_file_path):
+        # If path is directory, then we are loading task-by-task
+        if os.path.isdir(pickle_file_path):
+            task_dict_list, get_task, num_tasks = load_partial_pickle(pickle_file_path)
+        # Else if path is to an actual file, we just load the whole file
+        else:
+            task_dict_list, get_task, num_tasks = load_pickle(pickle_file_path)
+
+        assert len(task_dict_list) > 0
+        self.num_tasks = num_tasks
+        self.tasks = get_task
+
+        # Assumes all tasks have the same shot, way, query.
+        # This may not be a valid assumption
+        self.shot = task_dict_list[0]['shot']
+        self.way = task_dict_list[0]['way']
+        self.query = task_dict_list[0]['query']
+
+    def get_task(self, task_index, device):
+        task = self.tasks(task_index)
+        context_labels = task['context_labels'].type(torch.LongTensor).to(device)
+        return task['context_images'].to(device), context_labels, task['target_images'].to(device), task['target_labels'].to(device)
+
+    def get_num_tasks(self):
+        return self.num_tasks
+
+    def get_way(self):
+        return self.way
+
+def save_pickle(file_path, data, compress=False):
+    if compress:
+        file_path += ".pbz2"
+        with bz2.BZ2File(filename=file_path, mode='w') as f:
+            cPickle.dump(data, f)
+    else:
+        file_path += ".pickle"
+        f = open(file_path, 'wb')
+        pickle.dump(data, f)
+        f.close()
+
+def save_partial_pickle(path, partial_index, data):
+    if not os.path.exists(path):
+        os.makedirs(path)
+    file_path = os.path.join(path, '{}.pickle'.format(partial_index))
+    f = open(file_path, 'wb')
+    pickle.dump(data, f)
+    f.close()
+
+def load_pickle(file_path):
+    extension = os.path.splitext(file_path)[1]
+    if extension == '.pbz2':
+        task_dict_list = bz2.BZ2File(file_path, 'rb')
+        task_dict_list = cPickle.load(task_dict_list)
+    else:
+        f = open(file_path, 'rb')
+        task_dict_list = pickle.load(f)
+        f.close()
+    get_task = lambda index: task_dict_list[index]
+    return task_dict_list, get_task, len(task_dict_list)
+
+def load_partial_pickle(file_path):
+    # No zip supoprt
+    def get_task(index):
+        f = open(os.path.join(file_path, '{}.pickle'.format(index)), 'rb')
+        data = pickle.load(f)
+        f.close()
+        return data
+
+    # Load the first task, so that we have access to the shot, way, etc
+    task_0 = get_task(0)
+    lazy_task_list = [task_0]
+    # Get the number of tasks in the dir
+    num_tasks = len([name for name in os.listdir(file_path) if os.path.isfile(os.path.join(file_path, name))])
+    return lazy_task_list, get_task, num_tasks
 
 class ValidationAccuracies:
     """
