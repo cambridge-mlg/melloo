@@ -7,7 +7,7 @@ from learners.protonets.src.model import ProtoNets
 from learners.protonets.src.data import MiniImageNetData, OmniglotData
 
 NUM_VALIDATION_TASKS = 400
-NUM_TEST_TASKS = 1000
+NUM_TEST_TASKS = 1
 PRINT_FREQUENCY = 100
 
 
@@ -129,7 +129,7 @@ class Learner:
             self.test(self.checkpoint_path_validation)
 
         if self.args.mode == 'test':
-            self.test(self.args.test_model_path)
+            self.test_leave_one_out(self.args.test_model_path)
 
         self.logfile.close()
 
@@ -160,6 +160,37 @@ class Learner:
             print_and_log(self.logfile, 'Validation Accuracy: {0:3.1f}+/-{1:2.1f}'.format(accuracy, confidence))
 
         return accuracy
+
+    def test_leave_one_out(self, path):
+        print_and_log(self.logfile, "")  # add a blank line
+        print_and_log(self.logfile, 'Testing model {0:}: '.format(path))
+        self.model = self.init_model()
+        self.model.load_state_dict(torch.load(path))
+
+        self.model.eval()
+        with torch.no_grad():
+
+            task_dict = self.dataset.get_test_task(self.args.test_way, # task way
+                                                   self.args.test_shot, # context set shot
+                                                   self.args.query) # target shot
+            context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict, shuffle=False)
+
+            logits = self.model(context_images, context_labels, target_images)
+            true_accuracy = self.accuracy_fn(logits, target_labels)
+            print_and_log(self.logfile, 'True accuracy: {0:3.1f}'.format(true_accuracy))
+
+            import pdb; pdb.set_trace()
+
+            accuracy_loo = []
+            for i, im in enumerate(context_images):
+                context_images_loo = context_images[0:i] + context_images[i+1:]
+                context_labels_loo = context_labels[0:i] + context_labels[i+1:]
+                logits = self.model(context_images_loo, context_labels_loo, target_images)
+                accuracy = self.accuracy_fn(logits, target_labels)
+                print_and_log(self.logfile, 'Loo {} accuracy: {0:3.1f}'.format(i, true_accuracy - accuracy))
+                accuracy_loo.append(accuracy)
+                del logits
+
 
     def test(self, path):
         print_and_log(self.logfile, "")  # add a blank line
