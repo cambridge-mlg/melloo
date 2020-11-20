@@ -349,23 +349,34 @@ class Learner:
 
             logits = self.model(context_images, context_labels, target_images)
             true_accuracy = self.accuracy_fn(logits, target_labels).item()
-            print_and_log(self.logfile, 'True accuracy: {0:3.1f}'.format(true_accuracy))
+            print_and_log(self.logfile, 'True accuracy: {0:3.5f}'.format(true_accuracy))
+            print_and_log(self.logfile, 'Class Labels: {}'.format(context_labels))
 
-            import pdb; pdb.set_trace()
+
+            #import pdb; pdb.set_trace()
 
             accuracy_loo = []
-            for i, im in enumerate(context_images):
+            for i in range(context_images.shape[0]):
                 if i == 0:
                     context_images_loo = context_images[i + 1:]
                     context_labels_loo = context_labels[i + 1:]
                 else:
-                    context_images_loo = context_images[0:i] + context_images[i + 1:]
-                    context_labels_loo = context_labels[0:i] + context_labels[i + 1:]
+                    context_images_loo = torch.cat((context_images[0:i], context_images[i + 1:]), 0)
+                    context_labels_loo = torch.cat((context_labels[0:i], context_labels[i + 1:]), 0)
 
                 logits = self.model(context_images_loo, context_labels_loo, target_images)
                 accuracy = self.accuracy_fn(logits, target_labels).item()
-                print_and_log(self.logfile, 'Loo {} accuracy: {0:3.1f}'.format(i, true_accuracy - accuracy))
+                #import pdb; pdb.set_trace()
+                print_and_log(self.logfile, 'Loo {0:} accuracy: {1:3.5f}'.format(i, true_accuracy - accuracy))
                 accuracy_loo.append(accuracy)
+                for c in range(0, self.args.way):
+                    target_images_c = target_images[c*(self.args.query_test): (c+1)*self.args.query_test]
+                    target_labels_c = target_labels[c*(self.args.query_test): (c+1)*self.args.query_test]
+                    logits = self.model(context_images_loo, context_labels_loo, target_images_c)
+                    accuracy = self.accuracy_fn(logits, target_labels_c).item()
+                    print_and_log(self.logfile, '\tLoo {0:} class {1:}  accuracy: {2:3.5f}'.format(i, c, true_accuracy - accuracy))
+
+
                 del logits
 
 
@@ -528,11 +539,18 @@ class Learner:
         all_target_labels = torch.from_numpy(all_target_labels_np)
         all_target_labels = all_target_labels.type(torch.LongTensor)
 
+	
         target_images, target_labels = all_target_images, all_target_labels
-        target_images_np = all_target_images_np
-        extra_datasets = (context_images_np, target_images_np, None, None)
 
-        return context_images, target_images, context_labels, target_labels, extra_datasets
+        context_images = context_images.to(self.device)
+        target_images = target_images.to(self.device)
+        target_labels = target_labels.to(self.device)
+        context_labels = context_labels.to(self.device)
+
+        #target_images_np = all_target_images_np
+        #extra_datasets = (context_images_np, target_images_np, None, None)
+
+        return context_images, target_images, context_labels, target_labels
 
     def loss_fn(self, test_logits_sample, test_labels):
         """
