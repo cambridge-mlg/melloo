@@ -50,7 +50,6 @@ from normalization_layers import TaskNormI
 from utils import print_and_log, write_to_log, get_log_files, ValidationAccuracies, loss, aggregate_accuracy, verify_checkpoint_dir
 from model import Cnaps
 from meta_dataset_reader import MetaDatasetReader, SingleDatasetReader
-from attacks.attack_utils import save_pickle
 
 from tqdm import tqdm
 
@@ -63,9 +62,6 @@ tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)  # Quiet TensorFl
 from PIL import Image
 import sys
 # sys.path.append(os.path.abspath('attacks'))
-from attacks.attack_helpers import create_attack
-from attacks.attack_utils import split_target_set, make_adversarial_task_dict, make_swap_attack_task_dict, infer_num_shots
-from attacks.attack_utils import AdversarialDataset, save_partial_pickle
 
 NUM_VALIDATION_TASKS = 200
 NUM_TEST_TASKS = 600
@@ -131,8 +127,6 @@ class Learner:
         elif self.args.dataset != "from_file":
             self.dataset = SingleDatasetReader(self.args.data_path, self.args.mode, self.args.dataset, self.args.way,
                                                self.args.shot, self.args.query_train, self.args.query_test * num_target_sets)
-        else:
-            self.dataset = AdversarialDataset(self.args.data_path)
 
         self.loss = loss
         self.accuracy_fn = aggregate_accuracy
@@ -506,290 +500,15 @@ class Learner:
 
 
     def meta_dataset_attack_swap(self, path, session):
-        write_to_log(self.logfile, 'Attacking model {0:}: '.format(path))
-        # Swap attacks only make sense if doing evaluation with independent target sets
-        #
-        self.model = self.init_model()
-        self.model.load_state_dict(torch.load(path), strict=False)
-
-        context_attack = create_attack(self.args.attack_config_path, self.checkpoint_dir)
-        context_attack.set_attack_mode('context')
-        assert self.args.indep_eval
-
-        target_attack = create_attack(self.args.attack_config_path, self.checkpoint_dir)
-        target_attack.set_attack_mode('target')
-
-        for item in self.test_set:
-            # Accuracies for setting in which we generate attacks.
-            # Useful for debugging attacks
-            gen_clean_accuracies = []
-            gen_adv_context_accuracies = []
-            gen_adv_target_accuracies = []
-
-            # Accuracies for evaluation setting
-            clean_accuracies = []
-            clean_target_as_context_accuracies = []
-            adv_context_accuracies = []
-            adv_target_as_context_accuracies = []
-
-            for t in tqdm(range(self.args.attack_tasks - self.args.continue_from_task), dynamic_ncols=True):
-                task_dict = self.dataset.get_test_task(item, session)
-                if self.args.continue_from_task != 0:
-                    #Skip the first one, which is deterministic
-                    task_dict = self.dataset.get_test_task(item, session)
-                # Retry until the task is small enough to load into debugging machine's memory
-                # while len(task_dict['context_images']) > 200:
-                #    task_dict = self.dataset.get_test_task(item, session)
-                context_images, target_images, context_labels, target_labels, (
-                target_images_small, target_labels_small, eval_images, eval_labels) = self.prepare_task(task_dict,shuffle=False)
-
-                adv_context_images, adv_context_indices = context_attack.generate(context_images, context_labels, target_images, target_labels, self.model, self.model, self.model.device)
-                adv_target_images, adv_target_indices = target_attack.generate(context_images, context_labels, target_images_small, target_labels_small, self.model, self.model, self.model.device)
-
-                adv_target_as_context = context_images.clone()
-                # Parallel array to keep track of where we actually put the adv_target_images
-                # Since not all of them might have room to get swapped
-                swap_indices_context = []
-                swap_indices_adv = []
-                target_labels_int = target_labels.type(torch.IntTensor)
-                failed_to_swap = 0
-
-                for index in adv_target_indices:
-                    c = target_labels_int[index]
-                    # Replace the first best instance of class c with the adv query point (assuming we haven't already swapped it)
-                    shot_indices = extract_class_indices(context_labels.cpu(), c)
-                    k = 0
-                    while k < len(shot_indices) and shot_indices[k] in swap_indices_context:
-                        k += 1
-                    if k == len(shot_indices):
-                        failed_to_swap += 1
-                    else:
-                        index_to_swap = shot_indices[k]
-                        swap_indices_context.append(index_to_swap)
-                        swap_indices_adv.append(index)
-                assert (len(swap_indices_context)+failed_to_swap) == len(adv_target_indices)
-
-                # First swap in the clean targets, to make sure the two clean accs are the same (debug)
-                for i, swap_i in enumerate(swap_indices_context):
-                    adv_target_as_context[swap_i] = target_images[swap_indices_adv[i]]
-
-                with torch.no_grad():
-                    # Evaluate in normal/generation setting
-                    gen_clean_accuracies.append(
-                        self.calc_accuracy(context_images, context_labels, target_images, target_labels))
-                    gen_adv_context_accuracies.append(
-                        self.calc_accuracy(adv_context_images, context_labels, target_images, target_labels))
-                    gen_adv_target_accuracies.append(
-                        self.calc_accuracy(context_images, context_labels, adv_target_images, target_labels_small))
-
-                    # Evaluate on independent target sets
-                    for k in range(len(eval_images)):
-                        eval_imgs_k = eval_images[k].to(self.device)
-                        eval_labels_k = eval_labels[k].to(self.device)
-                        clean_accuracies.append(self.calc_accuracy(context_images, context_labels, eval_imgs_k, eval_labels_k))
-                        clean_target_as_context_accuracies.append(self.calc_accuracy(adv_target_as_context, context_labels, eval_imgs_k, eval_labels_k))
-                    
-                    for k in range(len(eval_images)):
-                        eval_imgs_k = eval_images[k].to(self.device)
-                        eval_labels_k = eval_labels[k].to(self.device)
-
-                        adv_context_accuracies.append(self.calc_accuracy(adv_context_images, context_labels, eval_imgs_k, eval_labels_k))
-                        # Now swap in the adv targets
-                        for i, swap_i in enumerate(swap_indices_context):
-                            adv_target_as_context[swap_i] = adv_target_images[swap_indices_adv[i]]
-                        adv_target_as_context_accuracies.append(self.calc_accuracy(adv_target_as_context, context_labels, eval_imgs_k, eval_labels_k))
-
-                del adv_target_as_context
-
-                if self.args.save_attack:
-                    adv_task_dict = make_swap_attack_task_dict(context_images, context_labels, target_images_small,
-                                                               target_labels_small,
-                                                               adv_context_images, adv_context_indices,
-                                                               adv_target_images, adv_target_indices,
-                                                               self.args.way, self.args.shot, self.args.query_test,
-                                                               eval_images, eval_labels)
-                    if self.args.continue_from_task != 0:
-                        save_partial_pickle(os.path.join(self.args.checkpoint_dir, "adv_task"), t+self.args.continue_from_task, adv_task_dict)
-
-                del adv_context_images, adv_target_images
-
-            self.print_average_accuracy(gen_clean_accuracies, "Gen setting: Clean accuracy", item)
-            self.print_average_accuracy(gen_adv_context_accuracies, "Gen setting: Context attack accuracy", item)
-            self.print_average_accuracy(gen_adv_target_accuracies, "Gen setting: Target attack accuracy", item)
-
-            self.print_average_accuracy(clean_accuracies, "Clean accuracy", item)
-            self.print_average_accuracy(clean_target_as_context_accuracies, "Clean Target as Context accuracy", item)
-            self.print_average_accuracy(adv_context_accuracies, "Context attack accuracy", item)
-            self.print_average_accuracy(adv_target_as_context_accuracies, "Adv Target as Context accuracy", item)
+        return
 
 
     def attack_swap(self, path, session):
-        write_to_log(self.logfile, 'Attacking model {0:}: '.format(path))
-        # Swap attacks only make sense if doing evaluation with independent target sets
-        #
-        self.model = self.init_model()
-        self.model.load_state_dict(torch.load(path), strict=False)
-
-        context_attack = create_attack(self.args.attack_config_path, self.checkpoint_dir)
-        context_attack.set_attack_mode('context')
-        # assert context_attack.get_shot_fraction() == 1.0
-        # assert context_attack.get_class_fraction() == 1.0
-        assert self.args.indep_eval
-
-        target_attack = create_attack(self.args.attack_config_path, self.checkpoint_dir)
-        target_attack.set_attack_mode('target')
-
-        for item in self.test_set:
-            # Accuracies for setting in which we generate attacks.
-            # Useful for debugging attacks
-            gen_clean_accuracies = []
-            gen_adv_context_accuracies = []
-            gen_adv_target_accuracies = []
-
-            # Accuracies for evaluation setting
-            clean_accuracies = []
-            clean_target_as_context_accuracies = []
-            adv_context_accuracies = []
-            adv_target_accuracies = []
-            adv_target_as_context_accuracies = []
-            adv_context_as_target_accuracies = []
-
-            if self.args.save_attack:
-                saved_tasks = []
-
-            for t in tqdm(range(self.args.attack_tasks), dynamic_ncols=True):
-                task_dict = self.dataset.get_test_task(item, session)
-                context_images, target_images, context_labels, target_labels, (target_images_small, target_labels_small, eval_images, eval_labels) = self.prepare_task(task_dict, shuffle=False)
-
-                adv_context_images, adv_context_indices = context_attack.generate(context_images, context_labels,
-                                                                                  target_images,
-                                                                                  target_labels, self.model, self.model,
-                                                                                  self.model.device)
-
-                adv_target_images, adv_target_indices = target_attack.generate(context_images, context_labels,
-                                                                               target_images_small,
-                                                                               target_labels_small, self.model, self.model,
-                                                                               self.model.device)
-                
-                # In general, sanity-check that the target and context sets are the same size
-                if self.args.dataset != "meta-dataset":
-                    assert adv_context_indices == adv_target_indices
-
-                with torch.no_grad():
-                    # Evaluate in normal/generation setting
-                    gen_clean_accuracies.append(self.calc_accuracy(context_images, context_labels, target_images, target_labels))
-                    gen_adv_context_accuracies.append(
-                        self.calc_accuracy(adv_context_images, context_labels, target_images, target_labels))
-                    gen_adv_target_accuracies.append(
-                        self.calc_accuracy(context_images, context_labels, adv_target_images, target_labels_small))
-
-                    # Evaluate on independent target sets
-                    for k in range(len(eval_images)):
-                        eval_imgs_k = eval_images[k].to(self.device)
-                        eval_labels_k = eval_labels[k].to(self.device)
-                        clean_accuracies.append(self.calc_accuracy(context_images, context_labels, eval_imgs_k, eval_labels_k))
-                        clean_target_as_context_accuracies.append(self.calc_accuracy(target_images_small, target_labels_small, eval_imgs_k, eval_labels_k))
-
-                        adv_context_accuracies.append(
-                            self.calc_accuracy(adv_context_images, context_labels, eval_imgs_k, eval_labels_k))
-                        adv_target_accuracies.append(
-                            self.calc_accuracy(eval_imgs_k, eval_labels_k, adv_target_images, target_labels_small))
-
-                        adv_target_as_context_accuracies.append(
-                            self.calc_accuracy(adv_target_images, target_labels_small, eval_imgs_k, eval_labels_k))
-                        adv_context_as_target_accuracies.append(
-                            self.calc_accuracy(eval_imgs_k, eval_labels_k, adv_context_images, context_labels))
-                
-                if self.args.save_attack:
-                    adv_task_dict = make_swap_attack_task_dict(context_images, context_labels, target_images_small, target_labels_small,
-                                                               adv_context_images, adv_context_indices, adv_target_images, adv_target_indices,
-                                                               self.args.way, self.args.shot, self.args.query_test, eval_images, eval_labels)
-                    saved_tasks.append(adv_task_dict)
-
-                del adv_context_images, adv_target_images
-
-            if self.args.save_attack:
-                save_pickle(os.path.join(self.args.checkpoint_dir, "adv_task"), saved_tasks)
-
-            
-            self.print_average_accuracy(gen_clean_accuracies, "Gen setting: Clean accuracy", item)
-            self.print_average_accuracy(gen_adv_context_accuracies, "Gen setting: Context attack accuracy", item)
-            self.print_average_accuracy(gen_adv_target_accuracies, "Gen setting: Target attack accuracy", item)
-
-            self.print_average_accuracy(clean_accuracies, "Clean accuracy", item)
-            self.print_average_accuracy(clean_target_as_context_accuracies, "Clean Target as Context accuracy", item)
-            self.print_average_accuracy(adv_context_accuracies, "Context attack accuracy", item)
-            self.print_average_accuracy(adv_target_as_context_accuracies, "Adv Target as Context accuracy", item)
-            self.print_average_accuracy(adv_target_accuracies, "Target attack accuracy", item)
-            self.print_average_accuracy(adv_context_as_target_accuracies, "Adv Context as Target", item)
-            
+        return
 
 
     def attack_homebrew(self, path, session):
-        print_and_log(self.logfile, 'Attacking model {0:}: '.format(path))
-        self.model = self.init_model()
-        self.model.load_state_dict(torch.load(path), strict=False)
-
-        attack = create_attack(self.args.attack_config_path, self.checkpoint_dir)
-        for item in self.test_set:
-            accuracies_before = []
-            accuracies_after = []
-            indep_eval_accuracies = []
-            if self.args.save_attack:
-                saved_tasks = []
-
-            for t in tqdm(range(self.args.attack_tasks), dynamic_ncols=True):
-                task_dict = self.dataset.get_test_task(item, session)
-                context_images, target_images, context_labels, target_labels, (context_images_np, target_images_np, eval_images, eval_labels) = self.prepare_task(task_dict, shuffle=False)
-
-                acc_before = self.calc_accuracy(context_images, context_labels, target_images, target_labels)
-                accuracies_before.append(acc_before)
-
-                if attack.get_attack_mode() == 'context':
-                    clean_version = context_images_np
-                else:
-                    clean_version = target_images_np
-
-                adv_images, adv_indices = attack.generate(context_images, context_labels, target_images, target_labels,
-                                                          self.model, self.model, self.model.device)
-
-                if self.args.save_samples and t < 10:
-                    for index in adv_indices:
-                        self.save_image_pair(adv_images[index], clean_version[index], t, index)
-
-                if self.args.save_attack:
-                    adv_task_dict = make_adversarial_task_dict(context_images, context_labels, target_images, target_labels,
-                                                               adv_images, adv_indices, attack.get_attack_mode(), self.args.way,
-                                                               self.args.shot, self.args.query_test, eval_images, eval_labels)
-                    saved_tasks.append(adv_task_dict)
-
-
-                with torch.no_grad():
-                    if attack.get_attack_mode() == 'context':
-                        acc_after = self.calc_accuracy(adv_images, context_labels, target_images, target_labels)
-                    else:
-                        acc_after = self.calc_accuracy(context_images, context_labels, adv_images, target_labels)
-                    accuracies_after.append(acc_after)
-
-                    # Eval with indep sets as well, if required:
-                    if self.args.indep_eval:
-                        for k in range(len(eval_images)):
-                            eval_imgs_k = eval_images[k].to(self.device)
-                            eval_labels_k = eval_labels[k].to(self.device)
-                            if attack.get_attack_mode() == 'context':
-                                indep_eval_accuracies.append(self.calc_accuracy(adv_images, context_labels, eval_imgs_k, eval_labels_k))
-                            else:
-                                indep_eval_accuracies.append(self.calc_accuracy(eval_imgs_k, eval_labels_k, adv_images, target_labels))
-
-                del adv_images
-
-            self.print_average_accuracy(accuracies_before, "Before attack", item)
-            self.print_average_accuracy(accuracies_after, "After attack", item)
-            if self.args.indep_eval and len(indep_eval_accuracies) > 0:
-                self.print_average_accuracy(indep_eval_accuracies, "Indep eval after attack:", item)
-
-            if self.args.save_attack:
-                save_pickle(os.path.join(self.args.checkpoint_dir, "adv_task"), saved_tasks)
+        return
 
     def prepare_task(self, task_dict, shuffle=True):
         context_images_np, context_labels_np = task_dict['context_images'], task_dict['context_labels']
@@ -809,46 +528,9 @@ class Learner:
         all_target_labels = torch.from_numpy(all_target_labels_np)
         all_target_labels = all_target_labels.type(torch.LongTensor)
 
-        # Target set size == context set size, no extra pattern requested for eval, no worries.
-        if self.args.target_set_size_multiplier == 1 and not self.args.indep_eval:
-            target_images, target_labels = all_target_images, all_target_labels
-            target_images_np = all_target_images_np
-            extra_datasets = (context_images_np, target_images_np, None, None)
-        else:
-            # Split the larger set of target images/labels up into smaller sets of appropriate shot and way
-            # This is slightly trickier for meta-dataset
-            if self.args.dataset == "meta-dataset":
-                target_set_shot = self.args.query_test
-                task_way = len(torch.unique(context_labels))
-                if self.args.target_set_size_multiplier * target_set_shot * task_way > all_target_images.shape[0]:
-                    # Check the actual target set's shots can be inferred/is what we expect
-                    target_set_shot = infer_num_shots(all_target_labels)
-                    assert target_set_shot != -1
-                    num_target_sets = all_target_images.shape[0] / (task_way * target_set_shot)
-                    print_and_log(self.logfile, "Task had insufficient data for requested number of eval sets. Using what's available: {}".format(num_target_sets))
-            else:
-                target_set_shot = self.args.shot
-                task_way = self.args.way
-                assert self.args.target_set_size_multiplier * target_set_shot * task_way <= all_target_images.shape[0]
-
-            # If this is a swap attack, then we need slightly different results from the target set splitter
-            if not self.args.swap_attack:
-                target_images, target_labels, eval_images, eval_labels, target_images_np = split_target_set(
-                    all_target_images, all_target_labels, self.args.target_set_size_multiplier, target_set_shot,
-                    all_target_images_np=all_target_images_np)
-                extra_datasets = (context_images_np, target_images_np, eval_images, eval_labels)
-            else:
-                target_images, target_labels, eval_images, eval_labels, target_images_small, target_labels_small = split_target_set(
-                    all_target_images, all_target_labels, self.args.target_set_size_multiplier, target_set_shot,
-                    return_first_target_set=True)
-                target_images_small = target_images_small.to(self.device)
-                target_labels_small = target_labels_small.to(self.device)
-                extra_datasets = (target_images_small, target_labels_small, eval_images, eval_labels)
-
-        context_images = context_images.to(self.device)
-        target_images = target_images.to(self.device)
-        context_labels = context_labels.to(self.device)
-        target_labels = target_labels.to(self.device)
+        target_images, target_labels = all_target_images, all_target_labels
+        target_images_np = all_target_images_np
+        extra_datasets = (context_images_np, target_images_np, None, None)
 
         return context_images, target_images, context_labels, target_labels, extra_datasets
 
