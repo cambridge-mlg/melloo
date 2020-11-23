@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import argparse
 import os
+from PIL import Image
 from learners.protonets.src.utils import print_and_log, get_log_files, categorical_accuracy, loss
 from learners.protonets.src.model import ProtoNets
 from learners.protonets.src.data import MiniImageNetData, OmniglotData
@@ -9,6 +10,24 @@ from learners.protonets.src.data import MiniImageNetData, OmniglotData
 NUM_VALIDATION_TASKS = 400
 NUM_TEST_TASKS = 1
 PRINT_FREQUENCY = 100
+
+
+def convert_to_image(image_array, scaling='neg_one_to_one'):
+    image_array = image_array.transpose([1, 2, 0])
+    mode = 'RGB'
+    if image_array.shape[2] == 1:  # single channel image
+        image_array = image_array.squeeze()
+        mode = 'L'
+    if scaling == 'neg_one_to_one':
+        im = Image.fromarray(np.clip((image_array + 1.0) * 127.5 + 0.5, 0, 255).astype(np.uint8), mode=mode)
+    else:
+        im = Image.fromarray(np.clip(image_array * 255.0, 0, 255).astype(np.uint8), mode=mode)
+    return im
+
+
+def save_image(image_array, save_path, scaling='neg_one_to_one'):
+    im = convert_to_image(image_array, scaling)
+    im.save(save_path)
 
 
 def main():
@@ -175,11 +194,14 @@ class Learner:
                                                    self.args.query) # target shot
             context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict, shuffle=False)
 
+            for i in range(len(context_images)):
+                save_image(context_images[i].cpu().detach().numpy(),
+                           os.path.join(self.checkpoint_dir, 'context_{}.png'.format(i)),
+                           scaling='neg_one_to_one')
+
             logits = self.model(context_images, context_labels, target_images)
             true_accuracy = self.accuracy_fn(logits, target_labels)
             print_and_log(self.logfile, 'True accuracy: {0:3.1f}'.format(true_accuracy))
-
-            import pdb; pdb.set_trace()
 
             accuracy_loo = []
             for i, im in enumerate(context_images):
@@ -187,15 +209,21 @@ class Learner:
                     context_images_loo = context_images[i + 1:]
                     context_labels_loo = context_labels[i + 1:]
                 else:
-                    context_images_loo = context_images[0:i] + context_images[i + 1:]
-                    context_labels_loo = context_labels[0:i] + context_labels[i + 1:]
+                    context_images_loo = torch.cat((context_images[0:i], context_images[i + 1:]), 0)
+                    context_labels_loo = torch.cat((context_labels[0:i], context_labels[i + 1:]), 0)
 
                 logits = self.model(context_images_loo, context_labels_loo, target_images)
                 accuracy = self.accuracy_fn(logits, target_labels)
-                print_and_log(self.logfile, 'Loo {} accuracy: {0:3.1f}'.format(i, true_accuracy - accuracy))
+                print_and_log(self.logfile, 'Loo {0:} accuracy: {1:3.5f}'.format(i, true_accuracy - accuracy))
                 accuracy_loo.append(accuracy)
-                del logits
+                for c in range(0, self.args.test_way):
+                    target_images_c = target_images[c*(self.args.query): (c+1)*self.args.query]
+                    target_labels_c = target_labels[c*(self.args.query): (c+1)*self.args.query]
+                    logits = self.model(context_images_loo, context_labels_loo, target_images_c)
+                    accuracy = self.accuracy_fn(logits, target_labels_c)
+                    print_and_log(self.logfile, '\tLoo {0:} class {1:}  accuracy: {2:3.5f}'.format(i, c, true_accuracy - accuracy))
 
+                del logits
 
     def test(self, path):
         print_and_log(self.logfile, "")  # add a blank line
