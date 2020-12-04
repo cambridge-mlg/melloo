@@ -150,6 +150,7 @@ class Learner:
             self.test(self.checkpoint_path_validation)
 
         if self.args.mode == 'test':
+            import pdb; pdb.set_trace()
             if self.args.exp_type == 'test':
                 self.test(self.args.test_model_path)
             elif self.args.exp_type == 'loo':
@@ -237,7 +238,7 @@ class Learner:
                 
                 print_and_log(self.logfile, 
                     '\tDropped point #{0:} Index {1:} (Class {2:})  accuracy: {3:3.5f}'.format(k+1,
-                    most_unhelpful_index, context_labels[most_unhelpful_index] most_unhelpful_effect))
+                    most_unhelpful_index, context_labels[most_unhelpful_index], most_unhelpful_effect))
                 
                 # Drop the most unhelpful point and repeat.
                 if most_unhelpful_index == 0:
