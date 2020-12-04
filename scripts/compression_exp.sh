@@ -1,6 +1,6 @@
 ulimit -n 50000
 export PYTHONPATH=.
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=2
 
 python3 ./learners/protonets/src/main.py \
 	--data_path /scratches/stroustrup/jfb54/adv-fsl \
@@ -9,7 +9,7 @@ python3 ./learners/protonets/src/main.py \
 	--mode test \
 	--test_model_path ./learners/protonets/models/protonets_mini_imagenet_5-way_5-shot.pt  \
 	--test_shot 100 --test_way 5 \
-	--query 100
+	--query 100 \
 	--exp_type compress
 	
 	
