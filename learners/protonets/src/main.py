@@ -207,7 +207,7 @@ class Learner:
                            scaling='neg_one_to_one')
 
             logits = self.model(context_images, context_labels, target_images)
-			# THINK: Should we re-calculate the true accuracy for each omission?
+            # THINK: Should we re-calculate the true accuracy for each omission?
             true_accuracy = self.accuracy_fn(logits, target_labels)
             print_and_log(self.logfile, 'True accuracy: {0:3.1f}'.format(true_accuracy))
             
@@ -218,50 +218,50 @@ class Learner:
             
             # Systematically omit context points until we have only one per class
             for k in range(max_omissions):
-				acc_loo_k, acc_per_class_k = loo(context_images, context_labels, target_images, target_labels)
-				
-				# THINK: Should we select based on acc per class or overall? Let's start with overall.
-				most_unhelpful_index = -1
-				most_unhelpful_effect =  201.0 # Large number (outside max possible range of effect)
-				
-				for i, acc in enumerate(acc_loo_k):
-					effect = (true_accuracy - acc) * 100
-					# If effect > 0, then dropping the point hurt accuracy.
-					# Conversely, if effect < 0, then dropping the point helped accuracy
-					if effect < most_unhelpful_effect or most_unhelpful_index == -1:
-						# THINK: We need to do something if the most unhelpful point is somehow also the last point 
-						# in a particular class.
-						most_unhelpful_effect = effect
-						most_unhelpful_index = i
-						
-				
-				print_and_log(self.logfile, 
-					'\tDropped point #{0:} Index {1:} (Class {2:})  accuracy: {3:3.5f}'.format(k+1,
-					most_unhelpful_index, context_labels[most_unhelpful_index] most_unhelpful_effect))
-				
-				# Drop the most unhelpful point and repeat.
-				if most_unhelpful_index == 0:
-					context_images = context_images[most_unhelpful_index + 1:]
-					context_labels = context_labels[most_unhelpful_index + 1:]
-				else:
-					context_images = torch.cat((context_images[0:most_unhelpful_index], context_images[most_unhelpful_index + 1:]), 0)
-					context_labels = torch.cat((context_labels[0:most_unhelpful_index], context_labels[most_unhelpful_index + 1:]), 0)
-					
-				num_unique = torch.unique(context_labels_loo).shape[0]
-				if num_unique < self.args.test_way:
-					print_and_log(self.logfile, "\tMost unhelpful point was last of class. ")
-					
-					
-				logits = self.model(context_images, context_labels, target_images)
-				accuracy = self.accuracy_fn(logits, target_labels)
-				acc_overall[k] = accuracy
-				for c in range(0, self.args.test_way):
-					target_images_c = target_images[c*(self.args.query): (c+1)*self.args.query]
-					target_labels_c = target_labels[c*(self.args.query): (c+1)*self.args.query]
-					logits = self.model(context_images, context_labels, target_images_c)
-					accuracy = self.accuracy_fn(logits, target_labels_c)
-					acc_per_class[c][k] = accuracy
-				del logits
+                acc_loo_k, acc_per_class_k = loo(context_images, context_labels, target_images, target_labels)
+                
+                # THINK: Should we select based on acc per class or overall? Let's start with overall.
+                most_unhelpful_index = -1
+                most_unhelpful_effect =  201.0 # Large number (outside max possible range of effect)
+                
+                for i, acc in enumerate(acc_loo_k):
+                    effect = (true_accuracy - acc) * 100
+                    # If effect > 0, then dropping the point hurt accuracy.
+                    # Conversely, if effect < 0, then dropping the point helped accuracy
+                    if effect < most_unhelpful_effect or most_unhelpful_index == -1:
+                        # THINK: We need to do something if the most unhelpful point is somehow also the last point 
+                        # in a particular class.
+                        most_unhelpful_effect = effect
+                        most_unhelpful_index = i
+                        
+                
+                print_and_log(self.logfile, 
+                    '\tDropped point #{0:} Index {1:} (Class {2:})  accuracy: {3:3.5f}'.format(k+1,
+                    most_unhelpful_index, context_labels[most_unhelpful_index] most_unhelpful_effect))
+                
+                # Drop the most unhelpful point and repeat.
+                if most_unhelpful_index == 0:
+                    context_images = context_images[most_unhelpful_index + 1:]
+                    context_labels = context_labels[most_unhelpful_index + 1:]
+                else:
+                    context_images = torch.cat((context_images[0:most_unhelpful_index], context_images[most_unhelpful_index + 1:]), 0)
+                    context_labels = torch.cat((context_labels[0:most_unhelpful_index], context_labels[most_unhelpful_index + 1:]), 0)
+                    
+                num_unique = torch.unique(context_labels_loo).shape[0]
+                if num_unique < self.args.test_way:
+                    print_and_log(self.logfile, "\tMost unhelpful point was last of class. ")
+                    
+                    
+                logits = self.model(context_images, context_labels, target_images)
+                accuracy = self.accuracy_fn(logits, target_labels)
+                acc_overall[k] = accuracy
+                for c in range(0, self.args.test_way):
+                    target_images_c = target_images[c*(self.args.query): (c+1)*self.args.query]
+                    target_labels_c = target_labels[c*(self.args.query): (c+1)*self.args.query]
+                    logits = self.model(context_images, context_labels, target_images_c)
+                    accuracy = self.accuracy_fn(logits, target_labels_c)
+                    acc_per_class[c][k] = accuracy
+                del logits
 
 
     def test_leave_one_out(self, path):
@@ -288,8 +288,8 @@ class Learner:
             print_and_log(self.logfile, 'True accuracy: {0:3.1f}'.format(true_accuracy))
             
             accuracy_loo, accuracy_per_class = loo(context_images, context_labels, target_images, target_labels)
-			
-			# Log results
+            
+            # Log results
             for i in range(context_images.shape[0]): 
                 print_and_log(self.logfile, 'Loo {0:} accuracy: {1:3.5f}'.format(i, true_accuracy - accuracy_loo[i]))
                 for c in range(0, self.args.test_way):
@@ -300,13 +300,13 @@ class Learner:
     # each of the context points in turn
     def loo(self, context_images, context_labels, target_images, target_labels):
         # Initialize return values
-		accuracy_loo = np.zeros(context_images.shape[0])
+        accuracy_loo = np.zeros(context_images.shape[0])
         accuracy_per_class = np.zeros(self.args.test_way, context_images.shape[0]) 
-		
-		# Not sure where on the model to grab the loss from.
-		# loss_loo = np.zeros(context_images.shape[0])
-		# loss_per_class = np.zeros(self.args.test_way, context_images.shape[0])
-		
+        
+        # Not sure where on the model to grab the loss from.
+        # loss_loo = np.zeros(context_images.shape[0])
+        # loss_per_class = np.zeros(self.args.test_way, context_images.shape[0])
+        
         for i, im in enumerate(context_images):
             if i == 0:
                 context_images_loo = context_images[i + 1:]
@@ -323,7 +323,7 @@ class Learner:
                 accuracy_loo[i] = np.nan
                 for c in range(0, self.args.test_way):
                     accuracy_per_class[c][i] = np.nan
-				continue
+                continue
 
             logits = self.model(context_images_loo, context_labels_loo, target_images)
             accuracy = self.accuracy_fn(logits, target_labels)
@@ -334,7 +334,7 @@ class Learner:
                 logits = self.model(context_images_loo, context_labels_loo, target_images_c)
                 accuracy = self.accuracy_fn(logits, target_labels_c)
                 accuracy_per_class[c][k] = accuracy
-				del logits
+                del logits
         
         return accuracy_loo, accuracy_per_class #, loss_loo, loss_per_class
 
