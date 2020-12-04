@@ -187,7 +187,49 @@ class Learner:
             print_and_log(self.logfile, 'Validation Accuracy: {0:3.1f}+/-{1:2.1f}'.format(accuracy, confidence))
 
         return accuracy
+     
+    # Loo helper function, returns the overall accuracies as well as per class accuracies when leaving out 
+    # each of the context points in turn
+    def loo(self, context_images, context_labels, target_images, target_labels):
+        # Initialize return values
+        accuracy_loo = np.zeros(context_images.shape[0])
+        accuracy_per_class = np.zeros(self.args.test_way, context_images.shape[0]) 
+        
+        # Not sure where on the model to grab the loss from.
+        # loss_loo = np.zeros(context_images.shape[0])
+        # loss_per_class = np.zeros(self.args.test_way, context_images.shape[0])
+        
+        for i, im in enumerate(context_images):
+            if i == 0:
+                context_images_loo = context_images[i + 1:]
+                context_labels_loo = context_labels[i + 1:]
+            else:
+                context_images_loo = torch.cat((context_images[0:i], context_images[i + 1:]), 0)
+                context_labels_loo = torch.cat((context_labels[0:i], context_labels[i + 1:]), 0)
+                
+            # Check that we leave at least one image per class. We can do this by counting the number of unique labels in the
+            # loo context labels and checking they're equal to the way
+            num_unique = torch.unique(context_labels_loo).shape[0]
+            if num_unique < self.args.test_way:
+                # Skip this image, it doesn't make sense to leave out all a class's images
+                accuracy_loo[i] = np.nan
+                for c in range(0, self.args.test_way):
+                    accuracy_per_class[c][i] = np.nan
+                continue
 
+            logits = self.model(context_images_loo, context_labels_loo, target_images)
+            accuracy = self.accuracy_fn(logits, target_labels)
+            accuracy_loo[i] = accuracy
+            for c in range(0, self.args.test_way):
+                target_images_c = target_images[c*(self.args.query): (c+1)*self.args.query]
+                target_labels_c = target_labels[c*(self.args.query): (c+1)*self.args.query]
+                logits = self.model(context_images_loo, context_labels_loo, target_images_c)
+                accuracy = self.accuracy_fn(logits, target_labels_c)
+                accuracy_per_class[c][k] = accuracy
+                del logits
+        
+        return accuracy_loo, accuracy_per_class #, loss_loo, loss_per_class
+        
     def compress_task(self, path):
         print_and_log(self.logfile, "")  # add a blank line
         print_and_log(self.logfile, 'Compression experiment on model {0:}: '.format(path))
@@ -296,48 +338,7 @@ class Learner:
                 for c in range(0, self.args.test_way):
                     print_and_log(self.logfile, '\tLoo {0:} class {1:}  accuracy: {2:3.5f}'.format(i, c, true_accuracy - accuracy_per_class[c][i]))
                     
-            
-    # Loo helper function, returns the overall accuracies as well as per class accuracies when leaving out 
-    # each of the context points in turn
-    def loo(self, context_images, context_labels, target_images, target_labels):
-        # Initialize return values
-        accuracy_loo = np.zeros(context_images.shape[0])
-        accuracy_per_class = np.zeros(self.args.test_way, context_images.shape[0]) 
-        
-        # Not sure where on the model to grab the loss from.
-        # loss_loo = np.zeros(context_images.shape[0])
-        # loss_per_class = np.zeros(self.args.test_way, context_images.shape[0])
-        
-        for i, im in enumerate(context_images):
-            if i == 0:
-                context_images_loo = context_images[i + 1:]
-                context_labels_loo = context_labels[i + 1:]
-            else:
-                context_images_loo = torch.cat((context_images[0:i], context_images[i + 1:]), 0)
-                context_labels_loo = torch.cat((context_labels[0:i], context_labels[i + 1:]), 0)
-                
-            # Check that we leave at least one image per class. We can do this by counting the number of unique labels in the
-            # loo context labels and checking they're equal to the way
-            num_unique = torch.unique(context_labels_loo).shape[0]
-            if num_unique < self.args.test_way:
-                # Skip this image, it doesn't make sense to leave out all a class's images
-                accuracy_loo[i] = np.nan
-                for c in range(0, self.args.test_way):
-                    accuracy_per_class[c][i] = np.nan
-                continue
-
-            logits = self.model(context_images_loo, context_labels_loo, target_images)
-            accuracy = self.accuracy_fn(logits, target_labels)
-            accuracy_loo[i] = accuracy
-            for c in range(0, self.args.test_way):
-                target_images_c = target_images[c*(self.args.query): (c+1)*self.args.query]
-                target_labels_c = target_labels[c*(self.args.query): (c+1)*self.args.query]
-                logits = self.model(context_images_loo, context_labels_loo, target_images_c)
-                accuracy = self.accuracy_fn(logits, target_labels_c)
-                accuracy_per_class[c][k] = accuracy
-                del logits
-        
-        return accuracy_loo, accuracy_per_class #, loss_loo, loss_per_class
+       
 
     def test(self, path):
         print_and_log(self.logfile, "")  # add a blank line
