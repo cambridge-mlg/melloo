@@ -150,7 +150,6 @@ class Learner:
             self.test(self.checkpoint_path_validation)
 
         if self.args.mode == 'test':
-            import pdb; pdb.set_trace()
             if self.args.exp_type == 'test':
                 self.test(self.args.test_model_path)
             elif self.args.exp_type == 'loo':
@@ -193,7 +192,7 @@ class Learner:
     def loo(self, context_images, context_labels, target_images, target_labels):
         # Initialize return values
         accuracy_loo = np.zeros(context_images.shape[0])
-        accuracy_per_class = np.zeros(self.args.test_way, context_images.shape[0]) 
+        accuracy_per_class = np.zeros((self.args.test_way, context_images.shape[0]))
         
         # Not sure where on the model to grab the loss from.
         # loss_loo = np.zeros(context_images.shape[0])
@@ -225,7 +224,7 @@ class Learner:
                 target_labels_c = target_labels[c*(self.args.query): (c+1)*self.args.query]
                 logits = self.model(context_images_loo, context_labels_loo, target_images_c)
                 accuracy = self.accuracy_fn(logits, target_labels_c)
-                accuracy_per_class[c][k] = accuracy
+                accuracy_per_class[c][i] = accuracy
                 del logits
         
         return accuracy_loo, accuracy_per_class #, loss_loo, loss_per_class
@@ -248,6 +247,7 @@ class Learner:
                 save_image(context_images[i].cpu().detach().numpy(),
                            os.path.join(self.checkpoint_dir, 'context_{}.png'.format(i)),
                            scaling='neg_one_to_one')
+            import pdb; pdb.set_trace()
 
             logits = self.model(context_images, context_labels, target_images)
             # THINK: Should we re-calculate the true accuracy for each omission?
@@ -261,7 +261,7 @@ class Learner:
             
             # Systematically omit context points until we have only one per class
             for k in range(max_omissions):
-                acc_loo_k, acc_per_class_k = loo(context_images, context_labels, target_images, target_labels)
+                acc_loo_k, acc_per_class_k = self.loo(context_images, context_labels, target_images, target_labels)
                 
                 # THINK: Should we select based on acc per class or overall? Let's start with overall.
                 most_unhelpful_index = -1
@@ -290,7 +290,7 @@ class Learner:
                     context_images = torch.cat((context_images[0:most_unhelpful_index], context_images[most_unhelpful_index + 1:]), 0)
                     context_labels = torch.cat((context_labels[0:most_unhelpful_index], context_labels[most_unhelpful_index + 1:]), 0)
                     
-                num_unique = torch.unique(context_labels_loo).shape[0]
+                num_unique = torch.unique(context_labels).shape[0]
                 if num_unique < self.args.test_way:
                     print_and_log(self.logfile, "\tMost unhelpful point was last of class. ")
                     
@@ -329,8 +329,7 @@ class Learner:
             logits = self.model(context_images, context_labels, target_images)
             true_accuracy = self.accuracy_fn(logits, target_labels)
             print_and_log(self.logfile, 'True accuracy: {0:3.1f}'.format(true_accuracy))
-            
-            accuracy_loo, accuracy_per_class = loo(context_images, context_labels, target_images, target_labels)
+            accuracy_loo, accuracy_per_class = self.loo(context_images, context_labels, target_images, target_labels)
             
             # Log results
             for i in range(context_images.shape[0]): 
