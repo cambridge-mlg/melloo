@@ -277,8 +277,8 @@ class Learner:
                         # remaining instance of a class by checking labels one ahead and one prior
                         # If we can find another such instance, then we can remove this one.
                         # Else we should keep searching.
-                        if (i + 1 < context_labels.shape[0] and context_labels[i] == context_labels[i+1]) or 
-                            (i -1 >= 0 and context_labels[i] == context_labels[i-1]):
+                        if ((i + 1 < context_labels.shape[0] and context_labels[i] == context_labels[i+1]) or 
+                            (i -1 >= 0 and context_labels[i] == context_labels[i-1])):
                             most_unhelpful_effect = effect
                             most_unhelpful_index = i
                         else:
