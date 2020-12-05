@@ -247,7 +247,6 @@ class Learner:
                 save_image(context_images[i].cpu().detach().numpy(),
                            os.path.join(self.checkpoint_dir, 'context_{}.png'.format(i)),
                            scaling='neg_one_to_one')
-            import pdb; pdb.set_trace()
 
             logits = self.model(context_images, context_labels, target_images)
             # THINK: Should we re-calculate the true accuracy for each omission?
@@ -258,6 +257,7 @@ class Learner:
             max_omissions = context_images.shape[0] - self.args.test_way
             acc_overall = np.zeros(max_omissions)
             acc_per_class = np.zeros((self.args.test_way, max_omissions))
+            dropped_class = []
             
             # Systematically omit context points until we have only one per class
             for k in range(max_omissions):
@@ -281,12 +281,14 @@ class Learner:
                             (i -1 >= 0 and context_labels[i] == context_labels[i-1])):
                             most_unhelpful_effect = effect
                             most_unhelpful_index = i
+                            dropped_class.append(context_labels[i])
+                            dropped_class_label.append(most_unhelpful_index)
                         else:
                             print_and_log(self.logfile, "\tMost unhelpful point was last of class. ")
                         
                 
                 print_and_log(self.logfile, 
-                    '\tDropped point #{0:} Index {1:} (Class {2:})  accuracy: {3:3.5f}'.format(k+1,
+                    '\tDropped point #{0:} Index {1:} (Class {2:})  effect: {3:3.5f}'.format(k+1,
                     most_unhelpful_index, context_labels[most_unhelpful_index], most_unhelpful_effect))
                 
                 # Drop the most unhelpful point and repeat.
@@ -312,6 +314,35 @@ class Learner:
                     accuracy = self.accuracy_fn(logits, target_labels_c)
                     acc_per_class[c][k] = accuracy
                 del logits
+                
+            self.plot_accuracies(path, true_accuracy, acc_overall, acc_per_class, dropped_class)
+            print_and_log(self.logfile, "{}".format(dropped_class_index))
+            
+               
+               
+    def plot_accuracies(path, true_acc, acc_overall, acc_per_class, dropped_class):
+        import pdb; pdb.set_trace()
+         labels = [
+            'True accuracy',
+            'Overall Acc'
+        ]
+        for i in acc_per_class.shape[0]:
+            labels.append("Class {} Acc".format(i))
+        
+        output_file = os.path.join(path, "accuracies.pdf")
+        
+        #markers = ['.','1', '2', '3', '4']
+        
+        xs = np.arange(1, len(acc_overall))
+        plt.plot(xs [true_acc]*len(acc_overall), label=labels[0])
+        plt.plot(xs, acc_overall, label=labels[1])
+        for c in acc_per_class.shape[0]:
+            plt.plot(xs, acc_per_class[c], '--', label=labels[c])
+        plt.xlabel('# Dropped Points', fontsize='xx-large')
+        plt.ylabel('Model Accuracy (%)', fontsize='xx-large')
+        plt.savefig(output_file, bbox_inches='tight')
+        plt.close()
+        
 
 
     def test_leave_one_out(self, path):
