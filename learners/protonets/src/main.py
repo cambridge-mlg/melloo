@@ -272,10 +272,17 @@ class Learner:
                     # If effect > 0, then dropping the point hurt accuracy.
                     # Conversely, if effect < 0, then dropping the point helped accuracy
                     if effect < most_unhelpful_effect or most_unhelpful_index == -1:
-                        # THINK: We need to do something if the most unhelpful point is somehow also the last point 
-                        # in a particular class.
-                        most_unhelpful_effect = effect
-                        most_unhelpful_index = i
+                        
+                        # Context labels are unshuffled. So we can check whether this is the only 
+                        # remaining instance of a class by checking labels one ahead and one prior
+                        # If we can find another such instance, then we can remove this one.
+                        # Else we should keep searching.
+                        if (i + 1 < context_labels.shape[0] and context_labels[i] == context_labels[i+1]) or 
+                            (i -1 >= 0 and context_labels[i] == context_labels[i-1]):
+                            most_unhelpful_effect = effect
+                            most_unhelpful_index = i
+                        else:
+                            print_and_log(self.logfile, "\tMost unhelpful point was last of class. ")
                         
                 
                 print_and_log(self.logfile, 
