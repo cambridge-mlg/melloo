@@ -259,6 +259,7 @@ class Learner:
             acc_overall = np.zeros(max_omissions)
             acc_per_class = np.zeros((self.args.test_way, max_omissions))
             dropped_class_label = []
+            #Turns out these guys aren't super useful, because they're relative to the already dropped points
             dropped_class_index = []
             
             # Systematically omit context points until we have only one per class
@@ -283,11 +284,11 @@ class Learner:
                             (i -1 >= 0 and context_labels[i] == context_labels[i-1])):
                             most_unhelpful_effect = effect
                             most_unhelpful_index = i
-                            dropped_class_label.append(context_labels[i])
-                            dropped_class_index.append(most_unhelpful_index)
                         else:
                             print_and_log(self.logfile, "\tMost unhelpful point was last of class. ")
                         
+                dropped_class_label.append(context_labels[most_unhelpful_index])
+                dropped_class_index.append(most_unhelpful_index)
                 
                 print_and_log(self.logfile, 
                     '\tDropped point #{0:} Index {1:} (Class {2:})  effect: {3:3.5f}'.format(k+1,
@@ -318,11 +319,12 @@ class Learner:
                 del logits
                 
             self.plot_accuracies(true_accuracy, acc_overall, acc_per_class, dropped_class_label)
-            print_and_log(self.logfile, "{}".format(dropped_class_index))
             
                
                
     def plot_accuracies(self, true_acc, acc_overall, acc_per_class, dropped_class):
+        if acc_per_class.shape[0] > 5:
+            print("Warning: The plotting function currently only supports 5 classes because choosing more colors/markers was hard.")
         labels = [
             'True accuracy',
             'Overall Acc'
@@ -331,17 +333,21 @@ class Learner:
             labels.append("Class {} Acc".format(i))
         
         output_file = os.path.join(self.checkpoint_dir, "accuracies.pdf")
-        
-        #markers = ['.','1', '2', '3', '4']
-        
-        import pdb; pdb.set_trace()
+        # markers = ['.','1', '2', '3', '4']
+        colors = [u'#2ca02c', u'#d62728', u'#9467bd', u'#8c564b', u'#e377c2', u'#7f7f7f', u'#bcbd22', u'#17becf']
+
         xs = np.arange(1, len(acc_overall)+1)
         plt.plot(xs, [true_acc]*len(acc_overall), label=labels[0])
         plt.plot(xs, acc_overall, label=labels[1])
         for c in range(acc_per_class.shape[0]):
-            plt.plot(xs, acc_per_class[c], '--', label=labels[c])
+            plt.plot(xs, acc_per_class[c], '--', label=labels[c+2])
+
+        for x, i in enumerate(dropped_class):
+            plt.plot([x+1], acc_overall[x], color=colors[i], marker='.')
+
         plt.xlabel('# Dropped Points', fontsize='xx-large')
         plt.ylabel('Model Accuracy (%)', fontsize='xx-large')
+        plt.legend(loc='lower left', fontsize='x-large')
         plt.savefig(output_file, bbox_inches='tight')
         plt.close()
         
