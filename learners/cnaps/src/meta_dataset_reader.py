@@ -85,7 +85,8 @@ class MetaDatasetReader:
             use_bilevel_ontology=use_bilevel_ontology,
             split=split,
             episode_descr_config=episode_description,
-            image_size=84)
+            image_size=84,
+            shuffle_buffer_size=1000)
 
         iterator = single_source_pipeline.make_one_shot_iterator()
         return iterator.get_next()
@@ -174,7 +175,8 @@ class SingleDatasetReader:
             use_bilevel_ontology=False,
             split=split,
             episode_descr_config=episode_description,
-            image_size=84)
+            image_size=84,
+            shuffle_buffer_size=1000)
 
         iterator = single_source_pipeline.make_one_shot_iterator()
         return iterator.get_next()
