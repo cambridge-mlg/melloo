@@ -220,6 +220,8 @@ class Learner:
         parser.add_argument("--do_not_freeze_feature_extractor", dest="do_not_freeze_feature_extractor", default=False,
                             action="store_true", help="If True, don't freeze the feature extractor.")
         parser.add_argument("--construct_coreset", default=False)
+        parser.add_argument("--num_reruns", type=int, default=10,
+                            help="Number of times to rerun the covering task when doing coreset construction")
         args = parser.parse_args()
 
         return args
@@ -321,20 +323,43 @@ class Learner:
         self.model = self.init_model()
         self.model.load_state_dict(torch.load(path))
         cifar_dataset = self.dataset 
+        import pdb; pdbset.set_trace()
+        importance_scores = np.ndarray((len(cifar_dataset.train_set), self.args.num_reruns))
         
         with torch.no_grad():
-            tasks = cifar_dataset.get_covering_tasks() # target shot
-            tasks = tasks[0:10]
-            accuracies = []
-            for task in tqdm(tasks):
-                context_images, target_images, context_labels, target_labels = self.prepare_task(task, shuffle=False)
-                
-                logits = self.model(context_images, context_labels, target_images)
-                accuracies.append(self.accuracy_fn(logits, target_labels).item())
-            accuracy = np.array(accuracies).mean() * 100.0
-            accuracy_confidence = (196.0 * np.array(accuracies).std()) / np.sqrt(len(accuracies))
+            for r in range(self.args.num_reruns):
+                tasks = cifar_dataset.get_covering_tasks() # target shot
+                tasks = tasks[0:10]
+                ave_task_acc = 0.0
+                for task in tqdm(tasks):
+                    context_images, target_images, context_labels, target_labels = self.prepare_task(task, shuffle=False)
+                    
+                    logits = self.model(context_images, context_labels, target_images)
+                    task_accuracy = self.accuracy_fn(logits, target_labels).item()
+                    ave_task_acc += task_accuracy
+                    loo_accs = self.leave_one_out_accuracies(context_images, context_labels, target_images, target_labels)
+                    scores = task_accuracy - loo_accs
+                    for i, index in enumerate(task['context_indices']):
+                        assert importance_scores[index][r] == 0
+                        importance_scores[index][r] = scores[i]
+                print_and_log(self.logfile, "Rerun {}, ave task accuracy: {:2.4f}".format(r, ave_task_acc/float(len(tasks))))
+            for i in range(len(cifar_dataset.train_set)):
+                print_and_log(self.logfile, '{}: {:2.4f}+/-{:2.4f}'.format(i, importance_scores[i].mean(), importance_scores[i].std()))
 
-            print_and_log(self.logfile, '{0:}: {1:3.1f}+/-{2:2.1f}'.format("True acc", accuracy, accuracy_confidence))
+    def leave_one_out_accuracies(self, context_images, context_labels, target_images, target_labels):
+        accuracy_loo = np.ndarray((len(context_images)))
+        for i in range(context_images.shape[0]):
+            if i == 0:
+                context_images_loo = context_images[i + 1:]
+                context_labels_loo = context_labels[i + 1:]
+            else:
+                context_images_loo = torch.cat((context_images[0:i], context_images[i + 1:]), 0)
+                context_labels_loo = torch.cat((context_labels[0:i], context_labels[i + 1:]), 0)
+
+            logits = self.model(context_images_loo, context_labels_loo, target_images)
+            accuracy = self.accuracy_fn(logits, target_labels).item()
+            accuracy_loo[i] = accuracy
+        return accuracy_loo
 
     def test_leave_one_out(self, path, session):
         print_and_log(self.logfile, "")  # add a blank line
