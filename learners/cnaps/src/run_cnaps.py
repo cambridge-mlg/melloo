@@ -50,6 +50,7 @@ from normalization_layers import TaskNormI
 from utils import print_and_log, write_to_log, get_log_files, ValidationAccuracies, loss, aggregate_accuracy, verify_checkpoint_dir, SavedDataset
 from model import Cnaps
 from meta_dataset_reader import MetaDatasetReader, SingleDatasetReader
+from cifar_dataset import CIFAR
 
 from tqdm import tqdm
 
@@ -123,6 +124,7 @@ class Learner:
         elif self.args.dataset != "from_file":
             self.dataset = SingleDatasetReader(self.args.data_path, self.args.mode, self.args.dataset, self.args.way,
                                                self.args.shot, self.args.query_train, self.args.query_test)
+            #self.dataset = CIFAR(self.args.way, self.args.shot, self.args.query_test)
         else:
             self.dataset = SavedDataset(self.args.data_path)
 
@@ -267,6 +269,7 @@ class Learner:
                 self.test(self.checkpoint_path_validation, session)
 
             if self.args.mode == 'test':
+                #self.construct_coreset(self.args.test_model_path, session)
                 self.test_leave_one_out(self.args.test_model_path, session)
 
             self.logfile.close()
@@ -309,6 +312,25 @@ class Learner:
 
         return accuracy_dict
 
+    def construct_coreset(self, path, session):
+        print_and_log(self.logfile, "")  # add a blank line
+        print_and_log(self.logfile, 'Constructing coreset with model {0:}: '.format(path))
+        self.model = self.init_model()
+        self.model.load_state_dict(torch.load(path))
+        
+        with torch.no_grad():
+            tasks = self.dataset.get_covering_tasks() # target shot
+            tasks = tasks[0:10]
+            accuracies = []
+            for task in tqdm(tasks):
+                context_images, target_images, context_labels, target_labels = self.prepare_task(task, shuffle=False)
+                
+                logits = self.model(context_images, context_labels, target_images)
+                accuracies.append(self.accuracy_fn(logits, target_labels).item())
+            accuracy = np.array(accuracies).mean() * 100.0
+            accuracy_confidence = (196.0 * np.array(accuracies).std()) / np.sqrt(len(accuracies))
+
+            print_and_log(self.logfile, '{0:}: {1:3.1f}+/-{2:2.1f}'.format("True acc", accuracy, accuracy_confidence))
 
     def test_leave_one_out(self, path, session):
         print_and_log(self.logfile, "")  # add a blank line
