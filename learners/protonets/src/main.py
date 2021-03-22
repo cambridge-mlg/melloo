@@ -261,10 +261,11 @@ class Learner:
             dropped_class_label = []
             #Turns out these guys aren't super useful, because they're relative to the already dropped points
             dropped_class_index = []
+
+            acc_loo_k, acc_per_class_k = self.loo(context_images, context_labels, target_images, target_labels)
             
             # Systematically omit context points until we have only one per class
             for k in range(max_omissions):
-                acc_loo_k, acc_per_class_k = self.loo(context_images, context_labels, target_images, target_labels)
                 
                 # THINK: Should we select based on acc per class or overall? Let's start with overall.
                 most_unhelpful_index = -1
