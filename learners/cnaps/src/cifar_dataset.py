@@ -88,21 +88,21 @@ class CIFAR(tv.datasets.CIFAR10):
                     available_classes.remove(c)
                 images, labels, indices = [], [], []
                 test_images, test_labels, test_indices = [], [], []
-                for c in selected_classes:
+                for ic, c in enumerate(selected_classes):
                     image_indices = shuffled_indices_by_class[c][0:self.train_shot]
                     for im in image_indices:
                         images.append(self.train_set.train_data[im])
 
                     indices.extend(image_indices)
                     shuffled_indices_by_class[c] = shuffled_indices_by_class[c][self.train_shot:]
-                    labels.extend([c]*self.train_shot)
+                    labels.extend([ic]*self.train_shot)
 
                     test_image_indices = random.sample(self.test_indices_by_class[c], self.test_shot)
                     for im in test_image_indices:
                         test_images.append(self.test_set.test_data[im])
 
                     test_indices.extend(test_image_indices)
-                    test_labels.extend([c]*self.test_shot)
+                    test_labels.extend([ic]*self.test_shot)
 
                 images = np.array(images, dtype="float32")
                 #images = (images / 255.0)*2.0 - 1
