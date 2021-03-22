@@ -50,7 +50,7 @@ from normalization_layers import TaskNormI
 from utils import print_and_log, write_to_log, get_log_files, ValidationAccuracies, loss, aggregate_accuracy, verify_checkpoint_dir, SavedDataset
 from model import Cnaps
 from meta_dataset_reader import MetaDatasetReader, SingleDatasetReader
-from cifar_dataset import CIFAR
+from cifar_dataset import CIFAR, dataset_from_metdataset_task_dict
 
 from tqdm import tqdm
 
@@ -122,9 +122,13 @@ class Learner:
                                              self.test_set, self.args.max_way_train, self.args.max_way_test,
                                              self.args.max_support_train, self.args.max_support_test, self.args.query_test)
         elif self.args.dataset != "from_file":
-            self.dataset = SingleDatasetReader(self.args.data_path, self.args.mode, self.args.dataset, self.args.way,
-                                               self.args.shot, self.args.query_train, self.args.query_test)
-            #self.dataset = CIFAR(self.args.way, self.args.shot, self.args.query_test)
+            if self.args.construct_coreset:
+                assert self.args.dataset == 'cifar10'
+                self.dataset = SingleDatasetReader(self.args.data_path, self.args.mode, self.args.dataset, 10,
+                                                   5000, 1000, 1000)
+            else:
+                self.dataset = SingleDatasetReader(self.args.data_path, self.args.mode, self.args.dataset, self.args.way,
+                                                   self.args.shot, self.args.query_train, self.args.query_test)
         else:
             self.dataset = SavedDataset(self.args.data_path)
 
@@ -217,6 +221,8 @@ class Learner:
                             help="Save all the tasks and adversarial images to a pickle file. Currently only applicable to non-swap attacks.")
         parser.add_argument("--do_not_freeze_feature_extractor", dest="do_not_freeze_feature_extractor", default=False,
                             action="store_true", help="If True, don't freeze the feature extractor.")
+                            help="Shots per class for target  of single dataset task.")
+        parser.add_argument("--construct_coreset", default=False,
         args = parser.parse_args()
 
         return args
@@ -269,8 +275,8 @@ class Learner:
                 self.test(self.checkpoint_path_validation, session)
 
             if self.args.mode == 'test':
-                #self.construct_coreset(self.args.test_model_path, session)
-                self.test_leave_one_out(self.args.test_model_path, session)
+                self.construct_coreset(self.args.test_model_path, session)
+                #self.test_leave_one_out(self.args.test_model_path, session)
 
             self.logfile.close()
 
@@ -317,9 +323,11 @@ class Learner:
         print_and_log(self.logfile, 'Constructing coreset with model {0:}: '.format(path))
         self.model = self.init_model()
         self.model.load_state_dict(torch.load(path))
+        task_dict = self.dataset.get_test_task(0, session)
+        cifar_dataset = CIFAR(self.args.way, self.args.shot, self.args.query_test, dataset=dataset_from_metdataset_task_dict(task_dict))
         
         with torch.no_grad():
-            tasks = self.dataset.get_covering_tasks() # target shot
+            tasks = cifar_dataset.get_covering_tasks() # target shot
             tasks = tasks[0:10]
             accuracies = []
             for task in tqdm(tasks):

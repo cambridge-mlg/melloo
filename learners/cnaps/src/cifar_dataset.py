@@ -5,22 +5,31 @@ import numpy as np
 import random
 #import utils
 
+def dataset_from_metdataset_task_dict(task_dict):
+    return {train_set: {train_data: task_dict['context_images'], train_labels: task_dict['context_labels']},
+                test_set: {task_dict['target_images'], test_labels: task_dict['target_labels']}}
+
 class CIFAR(tv.datasets.CIFAR10):
     """Wrapper around the MNIST dataset to ensure compatibility with our
     implementation.
     """
 
-    def __init__(self, way, train_shot, test_shot, *args, **kwargs):
-        self.trainset = tv.datasets.CIFAR10(root='./data', train=True,
-                                            download=True, transform=transforms.ToTensor())
-        self.testset = tv.datasets.CIFAR10(root='./data', train=False,
-                                       download=True, transform=transforms.ToTensor())
+    def __init__(self, way, train_shot, test_shot, dataset=None):
+        if dataset is None:
+            self.train_set = tv.datasets.CIFAR10(root='./data', train=True,
+                                                download=True, transform=transforms.ToTensor())
+            self.test_set = tv.datasets.CIFAR10(root='./data', train=False,
+                                           download=True, transform=transforms.ToTensor())
+        else:
+            self.train_set = dataset.train_set
+            self.test_set = dataset.test_set
+        
         self.way = way
         self.train_shot = train_shot
         self.test_shot = test_shot
 
-        self.train_indices_by_class = self.get_indices_by_class(self.trainset.train_labels)
-        self.test_indices_by_class = self.get_indices_by_class(self.testset.test_labels)
+        self.train_indices_by_class = self.get_indices_by_class(self.train_set.train_labels)
+        self.test_indices_by_class = self.get_indices_by_class(self.test_set.test_labels)
         
     def get_indices_by_class(self, labels):
         indices_by_class = {}
@@ -51,17 +60,10 @@ class CIFAR(tv.datasets.CIFAR10):
         # So we're going to divie the 5000 training images up into 1000 shot-sets
         # And then we're going to form random tasks using those 1000 shot-sets
 
-        indices_by_class = {}
-        class_labels = np.unique(self.trainset.train_labels)
-        for i in class_labels:
-            indices_by_class[i] = []
-        for i in range(len(self.trainset)):
-            label = self.trainset.train_labels[i]
-            indices_by_class[label].append(i)
-
+        class_labels = np.unique(self.train_set.train_labels)
         shuffled_indices_by_class = self.shuffle_dictionary(self.train_indices_by_class)
 
-        num_tasks = len(self.trainset)/(self.train_shot * self.way)
+        num_tasks = len(self.train_set.train_data)/(self.train_shot * self.way)
         tasks = []
         
         while len(tasks) < num_tasks:
@@ -75,7 +77,7 @@ class CIFAR(tv.datasets.CIFAR10):
                 for c in selected_classes:
                     image_indices = shuffled_indices_by_class[c][0:self.train_shot]
                     for im in image_indices:
-                        images.append(self.trainset.train_data[im])
+                        images.append(self.train_set.train_data[im])
 
                     indices.extend(image_indices)
                     shuffled_indices_by_class[c] = shuffled_indices_by_class[c][self.train_shot:]
@@ -83,7 +85,7 @@ class CIFAR(tv.datasets.CIFAR10):
 
                     test_image_indices = random.sample(self.test_indices_by_class[c], self.test_shot)
                     for im in test_image_indices:
-                        test_images.append(self.testset.test_data[im])
+                        test_images.append(self.test_set.test_data[im])
 
                     test_indices.extend(test_image_indices)
                     test_labels.extend([c]*self.test_shot)
