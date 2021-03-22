@@ -123,9 +123,10 @@ class Learner:
                                              self.args.max_support_train, self.args.max_support_test, self.args.query_test)
         elif self.args.dataset != "from_file":
             if self.args.construct_coreset:
-                assert self.args.dataset == 'cifar10'
-                self.dataset = SingleDatasetReader(self.args.data_path, self.args.mode, self.args.dataset, 10,
-                                                   5000, 1000, 1000)
+                #assert self.args.dataset == 'cifar10'
+                #self.dataset = SingleDatasetReader(self.args.data_path, self.args.mode, self.args.dataset, 10,
+                #                                   1000, self.args.query_train, 1000)
+                self.dataset = CIFAR(self.args.way, self.args.shot, self.args.query_test)
             else:
                 self.dataset = SingleDatasetReader(self.args.data_path, self.args.mode, self.args.dataset, self.args.way,
                                                    self.args.shot, self.args.query_train, self.args.query_test)
@@ -221,8 +222,7 @@ class Learner:
                             help="Save all the tasks and adversarial images to a pickle file. Currently only applicable to non-swap attacks.")
         parser.add_argument("--do_not_freeze_feature_extractor", dest="do_not_freeze_feature_extractor", default=False,
                             action="store_true", help="If True, don't freeze the feature extractor.")
-                            help="Shots per class for target  of single dataset task.")
-        parser.add_argument("--construct_coreset", default=False,
+        parser.add_argument("--construct_coreset", default=False)
         args = parser.parse_args()
 
         return args
@@ -323,8 +323,10 @@ class Learner:
         print_and_log(self.logfile, 'Constructing coreset with model {0:}: '.format(path))
         self.model = self.init_model()
         self.model.load_state_dict(torch.load(path))
-        task_dict = self.dataset.get_test_task(0, session)
-        cifar_dataset = CIFAR(self.args.way, self.args.shot, self.args.query_test, dataset=dataset_from_metdataset_task_dict(task_dict))
+        import pdb; pdb.set_trace()
+        #task_dict = self.dataset.get_test_task(0, session)
+        cifar_dataset = self.dataset 
+        #CIFAR(self.args.way, self.args.shot, self.args.query_test, dataset=dataset_from_metdataset_task_dict(task_dict))
         
         with torch.no_grad():
             tasks = cifar_dataset.get_covering_tasks() # target shot

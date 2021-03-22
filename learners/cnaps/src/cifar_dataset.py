@@ -7,7 +7,7 @@ import random
 
 def dataset_from_metdataset_task_dict(task_dict):
     return {train_set: {train_data: task_dict['context_images'], train_labels: task_dict['context_labels']},
-                test_set: {task_dict['target_images'], test_labels: task_dict['target_labels']}}
+                test_set: {test_data: task_dict['target_images'], test_labels: task_dict['target_labels']}}
 
 class CIFAR(tv.datasets.CIFAR10):
     """Wrapper around the MNIST dataset to ensure compatibility with our
@@ -16,10 +16,11 @@ class CIFAR(tv.datasets.CIFAR10):
 
     def __init__(self, way, train_shot, test_shot, dataset=None):
         if dataset is None:
+            #tr = transforms.Compose([transforms.Resize((84, 84)), transforms.ToTensor()])
             self.train_set = tv.datasets.CIFAR10(root='./data', train=True,
-                                                download=True, transform=transforms.ToTensor())
+                                                download=True, transform=None)
             self.test_set = tv.datasets.CIFAR10(root='./data', train=False,
-                                           download=True, transform=transforms.ToTensor())
+                                           download=True, transform=None)
         else:
             self.train_set = dataset.train_set
             self.test_set = dataset.test_set

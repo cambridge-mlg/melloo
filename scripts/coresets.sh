@@ -21,4 +21,4 @@ python3 ./learners/cnaps/src/run_cnaps.py \
 	-m learners/cnaps/models/meta-trained_meta-dataset_film.pt \
 	--shot 5 --way 5 \
 	--query_test 5 \
-    --construct_coreset
+	--construct_coreset True
