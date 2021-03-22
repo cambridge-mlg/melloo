@@ -3,6 +3,7 @@ import torchvision as tv
 import torchvision.transforms as transforms
 import numpy as np
 import random
+from PIL import Image
 #import utils
 
 def dataset_from_metdataset_task_dict(task_dict):
@@ -21,6 +22,8 @@ class CIFAR(tv.datasets.CIFAR10):
                                                 download=True, transform=None)
             self.test_set = tv.datasets.CIFAR10(root='./data', train=False,
                                            download=True, transform=None)
+            self.test_set.test_data = self.preprocess_images(self.test_set.test_data)
+            self.train_set.train_data = self.preprocess_images(self.train_set.train_data)
         else:
             self.train_set = dataset.train_set
             self.test_set = dataset.test_set
@@ -31,7 +34,17 @@ class CIFAR(tv.datasets.CIFAR10):
 
         self.train_indices_by_class = self.get_indices_by_class(self.train_set.train_labels)
         self.test_indices_by_class = self.get_indices_by_class(self.test_set.test_labels)
-        
+
+    def preprocess_images(self, images):
+        result_images = np.ndarray((len(images), 84,84,3), dtype="float32")
+        for i in range(len(images)):
+            pil_image = Image.fromarray(images[i])
+            resized_image = pil_image.resize((84,84), Image.BICUBIC)
+            result_images[i] = np.array(resized_image)
+        result_images = (result_images / 255.0)*2.0 - 1
+
+        return result_images
+
     def get_indices_by_class(self, labels):
         indices_by_class = {}
         class_labels = np.unique(labels)
@@ -92,10 +105,10 @@ class CIFAR(tv.datasets.CIFAR10):
                     test_labels.extend([c]*self.test_shot)
 
                 images = np.array(images, dtype="float32")
-                images = (images / 255.0)*2.0 - 1
+                #images = (images / 255.0)*2.0 - 1
 
                 test_images = np.array(test_images, dtype="float32")
-                test_images = (test_images / 255.0)*2.0 - 1
+                #test_images = (test_images / 255.0)*2.0 - 1
 
                 labels = np.array(labels, dtype="int32")
                 test_labels = np.array(test_labels, dtype="int32")
