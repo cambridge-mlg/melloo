@@ -247,9 +247,15 @@ class Learner:
                     context_features, target_features, attention_weights = self.model.context_features, self.model.target_features, self.model.attention_weights
                     
                     import pdb; pdb.set_trace()
-                    
-                    
-                    
+                    weights_per_context_point = torch.zeros((len(target_labels), len(context_labels)), device=self.device)
+                    for c in torch.unique(context_labels):
+                        c_indices = extract_class_indices(context_labels, c)
+                        c_weights = attention_weights[c].squeeze()
+                        for q in range(c_weights.shape[0]):
+                            weights_per_context_point[q][c_indices] = c_weights[q]
+                    import pdb; pdb.set_trace()
+
+                    rankings = torch.argsort(weights_per_context_point, dim=1, descending=True)
 
                 del target_logits
 
