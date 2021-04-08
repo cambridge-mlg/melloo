@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The Meta-Dataset Authors.
+# Copyright 2021 The Meta-Dataset Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -115,6 +115,12 @@ tf.flags.DEFINE_integer(
     'applied before the best model selection. '
     'Set 1 for no smoothing.')
 
+VALIDATION_ACCURACY_TAGS = (
+    'valid_acc/mean',
+    'mean valid acc',
+    'mean acc',  # TODO(doersch): rather unclear tag written by trainer.py
+)
+
 
 def get_value_from_params_dir(params_dir, param_names):
   """Gets the first found value from `param_names` in `params_dir`."""
@@ -170,6 +176,8 @@ def get_paths_to_events(root_dir,
   """
   params_dir = os.path.join(root_dir, 'params')
   summary_dir = os.path.join(root_dir, 'summaries')
+  logging.info('Looking for parameters in params_dir: %s', params_dir)
+  logging.info('Looking for summaries in summary_dir: %s', summary_dir)
 
   def get_variant_architecture(name):
     """Return the architecture of the given variant if recorded; o/w None."""
@@ -304,14 +312,15 @@ def extract_best_from_event_file(event_path, smooth_window, log_details=False):
     smooth_window: An integer that defines the neighborhood to be used in
       smoothing before the argmax (use <=1 for no smoothing)
     log_details: A boolean. Whether to log details regarding skipped event paths
-      in which locating the tag "mean valid acc" failed.
+      in which locating the validation accuracy tag failed.
   """
   steps, valid_accs = [], []
   try:
     for event in tf.train.summary_iterator(event_path):
       step = event.step
       for value in event.summary.value:
-        if value.tag == 'mean valid acc':
+        if any(
+            valid_tag in value.tag for valid_tag in VALIDATION_ACCURACY_TAGS):
           steps.append(step)
           valid_accs.append(value.simple_value)
   except tf.errors.DataLossError:
@@ -322,10 +331,10 @@ def extract_best_from_event_file(event_path, smooth_window, log_details=False):
     return 0, 0
   if not valid_accs:
     # Could happen if there is no DataLossError above but for some reason
-    # there is no 'mean valid acc' tag found in the summary values.
+    # there is no validation accuracy tag found in the summary values.
     tf.logging.info(
-        'Did not find any "mean valid acc" tags in event_path {}'.format(
-            event_path))
+        'Did not find any validation accuracy tags ({}) in event_path {}'
+        .format(' or '.join(VALIDATION_ACCURACY_TAGS), event_path))
     return 0, 0
   if smooth_window > 1:
     valid_accs = moving_average(valid_accs, smooth_window)
@@ -348,7 +357,7 @@ def extract_best_from_variant(event_paths, smooth_window):
 
   Raises:
     RuntimeError: No 'valid' event file for the given variant ('valid' here
-      refers to an event file that has a "mean valid acc" tag).
+      refers to an event file that has a validation accuracy tag).
   """
   best_step = best_acc = -1
   for event_path in event_paths:
@@ -370,7 +379,7 @@ def main(argv):
   ]
   # Perform model selection for each provided experiment root.
   for root_experiment_dir in experiment_paths:
-    stars_string = '**************************************\n'
+    stars_string = '\n**************************************\n'
     architecture_string = ''
     if FLAGS.restrict_to_architectures:
       architecture_string = ' out of the {} variants'.format(

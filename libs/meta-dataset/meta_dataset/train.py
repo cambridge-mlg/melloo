@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The Meta-Dataset Authors.
+# Copyright 2021 The Meta-Dataset Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,12 +42,18 @@ import os
 
 from absl import app
 from absl import logging
-import gin
 import gin.tf
+# TODO(lamblinp): Better organize module imports for exposure of Gin
+# configurables.
 from meta_dataset import data
+from meta_dataset import learners  # pylint: disable=unused-import
 from meta_dataset import trainer
 from meta_dataset.data import config  # pylint: disable=unused-import
+from meta_dataset.learners import experimental as experimental_learners  # pylint: disable=unused-import
+from meta_dataset.models.experimental import parameter_adapter  # pylint: disable=unused-import
+
 import tensorflow.compat.v1 as tf
+tf.disable_eager_execution()
 
 DEFAULT_SAVING_DIRECTORY = '/tmp/metadataset'
 

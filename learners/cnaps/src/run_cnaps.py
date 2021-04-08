@@ -323,13 +323,12 @@ class Learner:
         self.model = self.init_model()
         self.model.load_state_dict(torch.load(path))
         cifar_dataset = self.dataset 
-        import pdb; pdbset.set_trace()
-        importance_scores = np.ndarray((len(cifar_dataset.train_set), self.args.num_reruns))
+        importance_scores = np.zeros((len(cifar_dataset.train_set), self.args.num_reruns))
         
         with torch.no_grad():
             for r in range(self.args.num_reruns):
                 tasks = cifar_dataset.get_covering_tasks() # target shot
-                tasks = tasks[0:10]
+                import pdb; pdb.set_trace()
                 ave_task_acc = 0.0
                 for task in tqdm(tasks):
                     context_images, target_images, context_labels, target_labels = self.prepare_task(task, shuffle=False)
@@ -340,11 +339,15 @@ class Learner:
                     loo_accs = self.leave_one_out_accuracies(context_images, context_labels, target_images, target_labels)
                     scores = task_accuracy - loo_accs
                     for i, index in enumerate(task['context_indices']):
-                        assert importance_scores[index][r] == 0
+                        assert abs(importance_scores[index][r] - 0) < 1.0e-15
                         importance_scores[index][r] = scores[i]
                 print_and_log(self.logfile, "Rerun {}, ave task accuracy: {:2.4f}".format(r, ave_task_acc/float(len(tasks))))
             for i in range(len(cifar_dataset.train_set)):
-                print_and_log(self.logfile, '{}: {:2.4f}+/-{:2.4f}'.format(i, importance_scores[i].mean(), importance_scores[i].std()))
+                if abs(importance_scores[i].mean()) > 1.0e-10:
+                    print_and_log(self.logfile, '{}: {:2.4f}+/-{:2.4f}'.format(i, importance_scores[i].mean(), importance_scores[i].std()))
+        np.save(os.path.join(self.args.checkpoint_dir, 'importance_scores.npy'), importance_scores)
+        import pdb; pdb.set_trace()
+
 
     def leave_one_out_accuracies(self, context_images, context_labels, target_images, target_labels):
         accuracy_loo = np.ndarray((len(context_images)))

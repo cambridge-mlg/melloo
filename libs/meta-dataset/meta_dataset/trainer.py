@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The Meta-Dataset Authors.
+# Copyright 2021 The Meta-Dataset Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,27 +27,27 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
+import copy
 import functools
 import os
 import re
 
 from absl import logging
 import gin.tf
-from meta_dataset import learner as learner_lib
+from meta_dataset import distribute_utils
+from meta_dataset import learners
 from meta_dataset.data import dataset_spec as dataset_spec_lib
 from meta_dataset.data import learning_spec
 from meta_dataset.data import pipeline
 from meta_dataset.data import providers
-
+from meta_dataset.learners import experimental as experimental_learners
+from meta_dataset.models import functional_backbones
 import numpy as np
 import six
 from six.moves import range
 from six.moves import zip
 import tensorflow.compat.v1 as tf
 
-# Enable TensorFlow optimizations. It can add a few minutes to the first
-# calls to session.run(), but decrease memory usage.
-ENABLE_TF_OPTIMIZATIONS = True
 # Enable tf.data optimizations, which are applied to the input data pipeline.
 # It may be helpful to disable them when investigating regressions due to
 # changes in tf.data (see b/121130181 for instance), but they seem to be helpful
@@ -61,6 +61,9 @@ if not ENABLE_DATA_OPTIMIZATIONS:
   # optimizations to apply.
   TF_DATA_OPTIONS.experimental_optimization.apply_default_optimizations = False
 
+# Objective labels for hyperparameter optimization.
+ACC_MEAN_FORMAT_STRING = '%s_acc/mean'
+ACC_CI95_FORMAT_STRING = '%s_acc/ci95'
 
 # TODO(eringrant): Use `learning_spec.Split.TRAIN`, `learning_spec.Split.VALID`,
 # and `learning_spec.Split.TEST` instead of string constants, and replace all
@@ -197,48 +200,16 @@ def get_split_enum(split):
   return split_enum
 
 
-OPTIMIZER_KEYWORDS = ('Adam:', 'Adam_1:')
-EMBEDDING_KEYWORDS = ('conv', 'resnet')
-
-
-def is_backbone_variable(variable, only_if=lambda x: True):
-  """Returns True if `variable` is a backbone (embedding function) variable.
-
-  Args:
-    variable: A `tf.Variable` whose `name` attribute will be checked to
-      determine whether it belongs to the backbone (embedding function) of a
-      `Learner`.
-    only_if: A callable that returns `True` when a `tf.Variable` satisfies some
-      condition; by default `only_if` returns `True` for any argument.
-
-  Returns:
-    `True` if `variable` belongs to a backbone (embedding function) and
-    `only_if(variable)` is also satisfied.
-  """
-
-  # We restore all embedding variables.
-  is_embedding_var = any(
-      keyword in variable.name for keyword in EMBEDDING_KEYWORDS)
-
-  # We exclude 'relationnet*' variables as they are not present in a pretrained
-  # checkpoint.
-  is_relationnet_var = variable.name.startswith('relationnet')
-
-  # We exclude optimizer variables, as the episodic finetuning procedure is a
-  # different optimization problem than the original training objective.
-  is_optimizer_var = any(
-      keyword in variable.name for keyword in OPTIMIZER_KEYWORDS)
-
-  if (only_if(variable) and is_embedding_var and not is_relationnet_var and
-      not is_optimizer_var):
-    if 'adam' in variable.name.lower():
-      logging.error(
-          'Variable name unexpectedly indicates it is both related '
-          'to an embedding, and to the `AdamOptimizer`: %s', variable.name)
-    else:
-      return True
-
-  return False
+def restore_or_log_informative_error(saver, sess, checkpoint_to_restore):
+  """Attempt to restore from `checkpoint_to_restore` in `sess` using `saver`."""
+  try:
+    saver.restore(sess, checkpoint_to_restore)
+  except tf.errors.NotFoundError as e:
+    logging.error('Tried to restore from checkpoint %s but failed.',
+                  checkpoint_to_restore)
+    raise e
+  else:
+    logging.info('Restored from checkpoint %s.', checkpoint_to_restore)
 
 
 # TODO(eringrant): Split the current `Trainer` class into `Trainer` and
@@ -269,6 +240,7 @@ class Trainer(object):
       decay_learning_rate,
       decay_every,
       decay_rate,
+      normalized_gradient_descent,
       experiment_name,
       pretrained_source,
       train_dataset_list,
@@ -286,7 +258,8 @@ class Trainer(object):
       train_episode_config,
       eval_episode_config,
       data_config,
-  ):
+      distribute,
+      enable_tf_optimizations):
     # pyformat: disable
     """Initializes a Trainer.
 
@@ -310,6 +283,9 @@ class Trainer(object):
       decay_every: An integer, the learning rate is decayed for every multiple
         of this value.
       decay_rate: A float, the decay to apply to the learning rate.
+      normalized_gradient_descent: A boolean, whether to use normalized
+        gradient descent in addition to ADAM; improves stability for
+        crosstransformers.
       experiment_name: A string, a name for the experiment.
       pretrained_source: A string, the pretraining setup to use.
       train_dataset_list: A list of names of datasets to train on. This can be
@@ -351,8 +327,20 @@ class Trainer(object):
       eval_episode_config: An instance of EpisodeDescriptionConfig. Analogous to
         train_episode_config but used for eval episodes (validation or testing).
       data_config: A DataConfig, the data configuration.
+      distribute: (Experimental) use tf.distribute to distribute computation
+        across multiple GPUs using a MirroredStrategy.  This has been tested
+        with CrossTransformers, and may work with other episodic learners.
+        It will split Episodes into multiple EpisodePieces before passing them
+        to the learners, where each EpisodePiece contains a portion of the
+        original episode's query and support-set images.  Batch learners are
+        not currently supported.
+      enable_tf_optimizations: Enable TensorFlow optimizations. It can add a
+        few minutes to the first calls to session.run(), but decrease memory
+        usage.
 
     Raises:
+      RuntimeError: If requested to meta-learn the initialization of the linear
+          layer weights but they are unexpectedly omitted from saving/restoring.
       UnexpectedSplitError: If split configuration is not as expected.
     """
     # pyformat: enable
@@ -376,6 +364,8 @@ class Trainer(object):
     self.is_training = is_training
     self.train_dataset_list = train_dataset_list
     self.eval_dataset_list = eval_dataset_list
+    self.normalized_gradient_descent = normalized_gradient_descent
+    self.enable_tf_optimizations = enable_tf_optimizations
     self.restrict_classes = restrict_classes
     self.restrict_num_per_class = restrict_num_per_class
     self.checkpoint_dir = checkpoint_dir
@@ -385,6 +375,8 @@ class Trainer(object):
     self.eval_finegrainedness_split = eval_finegrainedness_split
     self.eval_imbalance_dataset = eval_imbalance_dataset
     self.omit_from_saving_and_reloading = omit_from_saving_and_reloading
+
+    self.data_initializeable_iterators = []
 
     if eval_finegrainedness:
       # The fine- vs coarse- grained evaluation may potentially be performed on
@@ -410,8 +402,8 @@ class Trainer(object):
       else:
         eval_episode_config.num_ways = 2
 
-    self.num_train_classes = train_episode_config.num_ways
-    self.num_test_classes = eval_episode_config.num_ways
+    self.num_classes_train = train_episode_config.num_ways
+    self.num_classes_eval = eval_episode_config.num_ways
     self.num_support_train = train_episode_config.num_support
     self.num_query_train = train_episode_config.num_query
     self.num_support_eval = eval_episode_config.num_support
@@ -421,9 +413,10 @@ class Trainer(object):
     self.eval_episode_config = eval_episode_config
 
     self.data_config = data_config
-    # Get the image shape.
-    self.image_shape = [data_config.image_height] * 2 + [3]
 
+    # TODO(eringrant): Adapt these image-specific expectations to feature
+    # inputs.
+    self.image_shape = [data_config.image_height] * 2 + [3]
     # Create the benchmark specification.
     self.benchmark_spec = self.get_benchmark_specification()
 
@@ -444,8 +437,29 @@ class Trainer(object):
     self.next_data = dict(
         zip(self.required_splits, map(self.build_data, self.required_splits)))
 
+    self.distribute = distribute
+    if self.distribute:
+      self.strategy = tf.distribute.MirroredStrategy()
+    else:
+      self.strategy = None
+
     # Create the global step to pass to the learners.
     global_step = tf.train.get_or_create_global_step()
+
+    if len(self.required_splits) > 1:
+      if issubclass(self.train_learner_class,
+                    experimental_learners.ExperimentalLearner):
+        assert issubclass(
+            self.eval_learner_class, experimental_learners.ExperimentalLearner
+        ), ('If the `Learner` for the train split is an `ExperimentalLearner`,'
+            ' the `Learner` for the evaluation split must be as well, since '
+            'otherwise parameters cannot be shared.')
+      else:
+        assert not issubclass(
+            self.eval_learner_class, experimental_learners.ExperimentalLearner
+        ), ('If the `Learner` for the evaluation split is not an '
+            '`ExperimentalLearner`, the `Learner` for the train split must not'
+            ' be either, since otherwise parameters cannot be shared.')
 
     # Initialize the learners.
     self.learners = {}
@@ -455,25 +469,43 @@ class Trainer(object):
         # the evaluation split is not the training split.
         learner_is_training = self.eval_split != TRAIN_SPLIT
         learner_class = self.train_learner_class
+        tied_learner = None
       else:
         learner_is_training = False
         learner_class = self.eval_learner_class
-      self.learners[split] = self.create_learner(
+        # Share parameters between the training and evaluation `Learner`s.
+        tied_learner = (
+            self.learners[TRAIN_SPLIT]
+            if TRAIN_SPLIT in self.required_splits else None)
+
+      learner = self.create_learner(
           is_training=learner_is_training,
           learner_class=learner_class,
-          split=get_split_enum(split))
+          split=get_split_enum(split),
+          tied_learner=tied_learner)
 
-    # Build the prediction, loss and accuracy graphs for each learner.
-    predictions, losses, accuracies = zip(*[
-        self.build_learner(split, global_step) for split in self.required_splits
-    ])
-    self.predictions = dict(zip(self.required_splits, predictions))
-    self.losses = dict(zip(self.required_splits, losses))
-    self.accuracies = dict(zip(self.required_splits, accuracies))
+      if (isinstance(learner, learners.MAMLLearner) and
+          not learner.zero_fc_layer and not learner.proto_maml_fc_layer_init):
+        if 'linear_classifier' in FLAGS.omit_from_saving_and_reloading:
+          raise ValueError('The linear layer is requested to be meta-learned '
+                           'since both `MAMLLearner.zero_fc_layer` and '
+                           '`MAMLLearner.proto_maml_fc_layer_init` are False, '
+                           'but the `linear_classifier` tags is found in '
+                           'FLAGS.omit_from_saving_and_reloading so they will '
+                           'not be properly restored. Please exclude these '
+                           'weights from omit_from_saving_and_reloading for '
+                           'this setting to work as expected.')
 
-    # Set self.way, self.shots to Tensors for the way/shots of the next episode.
-    self.set_way_shots_classes_logits_targets()
+      self.learners[split] = learner
 
+    # Build the data-dependent functions (run_fn returns prediction,
+    # un-regularized loss,  accuracy, and episode statistics), the iterators
+    # producing data (data_fn), and regularizer, for each learner.
+    run_fn, data_fn, regularizer = zip(
+        *[self.build_learner(split) for split in self.required_splits])
+    self.run_fns = dict(zip(self.required_splits, run_fn))
+    self.data_fns = dict(zip(self.required_splits, data_fn))
+    self.regularizers = dict(zip(self.required_splits, regularizer))
     # Get an optimizer and the operation for meta-training.
     self.train_op = None
     if self.is_training:
@@ -486,83 +518,230 @@ class Trainer(object):
             decay_rate=self.decay_rate,
             staircase=True)
       tf.summary.scalar('learning_rate', learning_rate)
-      self.optimizer = tf.train.AdamOptimizer(learning_rate)
-      self.train_op = self.get_train_op(global_step)
+      if self.distribute:
+        self.optimizer = tf.keras.optimizers.Adam(learning_rate)
+      else:
+        self.optimizer = tf.train.AdamOptimizer(learning_rate)
+
+      self.run_fns[TRAIN_SPLIT] = self.get_run_fn_with_train_op(
+          self.run_fns[TRAIN_SPLIT], self.regularizers[TRAIN_SPLIT],
+          global_step)
+    self.predictions = {}
+    self.losses = {}
+    self.accuracies = {}
+    self.episode_info = {}
+    for split in self.required_splits:
+      if self.distribute:
+        with self.strategy.scope():
+          output = self.strategy.experimental_run(self.run_fns[split],
+                                                  self.data_fns[split])
+          if self.strategy.num_replicas_in_sync > 1:
+            output['predictions'] = tf.concat(
+                output['predictions'].values, axis=0)
+            output['loss'] = tf.concat(output['loss'].values, axis=0)
+            output['accuracy'] = tf.concat(output['accuracy'].values, axis=0)
+            if split == TRAIN_SPLIT and self.is_training:
+              output['train_op'] = tf.group(output['train_op'].values)
+
+            # The computed episode_info should be identical for all replicas.
+            episode_info = {}
+            for key, val in output['episode_info'].items():
+              if val is not None:
+                # This control_dependencies is required or the call to
+                # session.run() gets deadlocked.
+                with tf.control_dependencies(val.values):
+                  episode_info[key] = tf.identity(val.values[0])
+              else:
+                episode_info[key] = None
+            output['episode_info'] = episode_info
+
+      else:
+        data_tensors = tf.data.make_one_shot_iterator(
+            self.data_fns[split]()).get_next()
+        output = self.run_fns[split](data_tensors)
+
+      loss = tf.reduce_mean(output['loss'])
+      loss += self.regularizers[split]
+
+      self.losses[split] = loss
+      self.accuracies[split] = tf.reduce_mean(output['accuracy'])
+      self.predictions[split] = output['predictions']
+      self.episode_info[split] = output['episode_info']
+
+      if split == TRAIN_SPLIT and self.is_training:
+        self.train_op = output['train_op']
+
 
     if self.checkpoint_dir is not None:
       if not tf.io.gfile.exists(self.checkpoint_dir):
         tf.io.gfile.makedirs(self.checkpoint_dir)
 
-    # Initialize a Session.
+    # Meaningless values so that logging works even if called before evaluation.
+    self.valid_acc = np.nan
+    self.valid_ci = np.nan
+
     self.initialize_session()
     self.initialize_saver()
     self.create_summary_writer()
 
-  def build_learner(self, split, global_step):
-    """Compute predictions, losses and accuracies of the learner for split."""
+  def build_learner(self, split):
+    """Return predictions, losses and accuracies for the learner on split.
 
-    # TODO(eringrant): Pass `global_step` and `summaries_collection` to
-    # `Learner.forward_pass` when the new interface is in use.
-    summaries_collection = '{}/learner_summaries'.format(split)
-    del global_step
-    del summaries_collection
+    Args:
+      split: A `learning_spec.Split` that identifies the data split for which
+        the learner is to be built.
+
+    Returns:
+      run_fn: a function which, when called on data, will run the network
+        forward pass in split mode `split` and return:
+          predictions: A `tf.Tensor`; the predictions of the learner on `split`.
+          losses: A `tf.Tensor`; the losses of the learner on `split`.
+          accuracies: A `tf.Tensor`; the accuracies of the learner on `split`.
+          episode_info: A map of string to `tf.Tensor`, which has statistics
+            about the input data.
+      data_fn: a function which returns a `tf.Dataset` which can be used to
+        provide input to run_fn
+      regularizer: a `tf.Tensor` which computes a data-independent regularizer
+        (e.g. weight decay) that is to be applied at every iteration.
+
+
+    """
+    learner = self.learners[split]
+
+    # Build the learner and its variables outside the name scope.
+    learner.build()
 
     with tf.name_scope(split):
-      data = self.next_data[split]
-      predictions = self.learners[split].forward_pass(data=data)
-      loss = self.learners[split].compute_loss(
-          predictions=predictions, onehot_labels=data.onehot_labels)
-      accuracy = self.learners[split].compute_accuracy(
-          predictions=predictions, labels=data.labels)
-      return predictions, loss, accuracy
+      data_src = self.next_data[split]
+      if self.distribute:
+        with self.strategy.scope():
+          # We need to split both support and query sets across GPUs, and
+          # tf.data doesn't make this straightforward, as there are few
+          # functions for splitting up datasets.  We use unbatch to accomplish
+          # this, but unbatch splits the first dimension and creates one
+          # example for every possible index along that dimension.
+          #
+          # Therefore, the strategy is to first compute the chunk boundaries
+          # for the support and query sets (chunk_bounds), pad the last
+          # chunks to match the earlier chunks along the first axis,
+          # and then stack all chunks along a new first axis.
+          # unbatch() then correctly splits the episode across gpus.  We then
+          # trim the padding from later chunks (trim_extra). The result is a
+          # single dataset with chunks for each GPU interleaved with one
+          # another.  We use shard() to split this single dataset into one
+          # dataset per gpu.
 
-  def set_way_shots_classes_logits_targets(self):
+          def chunk_bounds(x, num_gpu, idx):
+            num_per_gpu = tf.cast(
+                tf.ceil(
+                    tf.cast(tf.shape(x)[0], tf.float32) /
+                    tf.cast(num_gpu, tf.float32)), tf.int32)
+            lb = tf.minimum(idx * num_per_gpu, tf.shape(x)[0])
+            ub = tf.minimum((idx + 1) * num_per_gpu, tf.shape(x)[0])
+            return lb, ub, tf.minimum((idx + 1) * num_per_gpu - ub, num_per_gpu)
+
+          def chunk_array(arr):
+            """Deterministically chunk the arrays across devices."""
+            num_gpu = self.strategy.num_replicas_in_sync
+            chunks = []
+            num = []
+            for idx in range(num_gpu):
+              lb, ub, num_extra = chunk_bounds(arr, num_gpu, idx)
+              pad = tf.tile(arr[0:1], [num_extra] + [1] *
+                            (len(arr.shape) - 1)) * 0 - 1
+              chunks.append(tf.concat([arr[lb:ub], pad], axis=0))
+              num.append(ub - lb)
+            return tf.stack(chunks), tf.stack(num)
+
+          def chunk_episode(episode):
+            way_tiled = episode.way + tf.zeros(
+                [self.strategy.num_replicas_in_sync], dtype=tf.int32)
+            return ((way_tiled, chunk_array(episode.support_images)[0],
+                     chunk_array(episode.support_labels)[0]) +
+                    chunk_array(episode.support_class_ids) +
+                    (chunk_array(episode.query_images)[0],
+                     chunk_array(episode.query_labels)[0]) +
+                    chunk_array(episode.query_class_ids))
+
+          def trim_extra(way, support_images, support_labels, support_class_ids,
+                         support_num, query_images, query_labels,
+                         query_class_ids, query_num):
+            return providers.EpisodePiece(support_images[:support_num],
+                                          query_images[:query_num],
+                                          support_labels[:support_num],
+                                          query_labels[:query_num],
+                                          support_class_ids[:support_num],
+                                          query_class_ids[:query_num], way)
+
+          chunked_data = data_src.map(chunk_episode).unbatch().map(trim_extra)
+
+          def input_fn(input_context):
+            return chunked_data.shard(input_context.num_input_pipelines,
+                                      input_context.input_pipeline_id)
+
+          data = self.strategy.make_input_fn_iterator(input_fn)
+          regularizer = self.learners[split].compute_regularizer()
+          self.data_initializeable_iterators.append(data)
+      else:
+        data = lambda: data_src
+        regularizer = self.learners[split].compute_regularizer()
+
+      def run(data_local):
+        """Run the forward pass of the model."""
+        predictions_dist = self.learners[split].forward_pass(data_local)
+
+        loss_dist = self.learners[split].compute_loss(
+            predictions=predictions_dist,
+            onehot_labels=data_local.onehot_labels)
+        accuracy_dist = self.learners[split].compute_accuracy(
+            predictions=predictions_dist,
+            onehot_labels=data_local.onehot_labels)
+        episode_info = self.get_episode_info(data_local)
+        return {
+            'predictions': predictions_dist,
+            'loss': loss_dist,
+            'accuracy': accuracy_dist,
+            'episode_info': episode_info,
+        }
+
+      return run, data, regularizer
+
+  def get_episode_info(self, data):
     """Sets the Tensors for the info about the learner's next episode."""
+    res = {}
     # The batch trainer receives episodes only for the valid and test splits.
     # Therefore for the train split there is no defined way and shots.
-    (way, shots, class_props, class_ids, test_logits,
-     test_targets) = [], [], [], [], [], []
-    for split in self.required_splits:
-
-      if isinstance(self.next_data[split], providers.Batch):
-        (way_, shots_, class_props_, class_ids_, test_logits_,
-         test_targets_) = [None] * 6
-      else:
-        data = self.next_data[split]
-        way_ = data.way
-        shots_ = data.train_shots
-        class_ids_ = data.unique_class_ids
-        class_props_ = None
-        if self.eval_imbalance_dataset:
-          class_props_ = compute_class_proportions(
-              class_ids_, shots_, self.eval_imbalance_dataset_spec)
-        test_logits_ = self.predictions[split]
-        test_targets_ = self.next_data[split].test_labels
-      way.append(way_)
-      shots.append(shots_)
-      class_props.append(class_props_)
-      class_ids.append(class_ids_)
-      test_logits.append(test_logits_)
-      test_targets.append(test_targets_)
-
-    self.way = dict(zip(self.required_splits, way))
-    self.shots = dict(zip(self.required_splits, shots))
-    self.class_props = dict(zip(self.required_splits, class_props))
-    self.class_ids = dict(zip(self.required_splits, class_ids))
-    self.test_logits = dict(zip(self.required_splits, test_logits))
-    self.test_targets = dict(zip(self.required_splits, test_targets))
+    if isinstance(data, providers.Batch):
+      (way_, shots_, class_props_, class_ids_, query_targets_) = [None] * 5
+    else:
+      way_ = data.way
+      shots_ = data.support_shots
+      class_ids_ = data.unique_class_ids
+      class_props_ = None
+      if self.eval_imbalance_dataset:
+        class_props_ = compute_class_proportions(
+            class_ids_, shots_, self.eval_imbalance_dataset_spec)
+      query_targets_ = data.query_labels
+    res['way'] = way_
+    res['shots'] = shots_
+    res['class_props'] = class_props_
+    res['class_ids'] = class_ids_
+    res['query_targets'] = query_targets_
+    return res
 
   def create_summary_writer(self):
     """Create summaries and writer."""
     # Add summaries for the losses / accuracies of the different learners.
     standard_summaries = []
     for split in self.required_splits:
-      loss_summary = tf.summary.scalar('%s_loss' % split, self.losses[split])
-      acc_summary = tf.summary.scalar('%s_acc' % split, self.accuracies[split])
+      with tf.name_scope(split):
+        loss_summary = tf.summary.scalar('loss', self.losses[split])
+        acc_summary = tf.summary.scalar('acc',
+                                        tf.reduce_mean(self.accuracies[split]))
       standard_summaries.append(loss_summary)
       standard_summaries.append(acc_summary)
 
-    # Add summaries for the way / shot / logits / targets of the learners.
+    # Add summaries for the way / shot / logits / targets of the learner.
     evaluation_summaries = self.add_eval_summaries()
 
     # All summaries.
@@ -576,23 +755,37 @@ class Trainer(object):
       if not tf.io.gfile.exists(self.summary_dir):
         tf.io.gfile.makedirs(self.summary_dir)
 
-  def create_learner(self, is_training, learner_class, split):
-    """Instantiates a `Learner`."""
-    if issubclass(learner_class, learner_lib.BatchLearner):
-      logit_dim = self._get_num_total_classes(split)
-    elif issubclass(learner_class, learner_lib.EpisodicLearner):
-      logit_dim = (
-          self.train_episode_config.max_ways
-          if is_training else self.eval_episode_config.max_ways)
+  def create_learner(self,
+                     is_training,
+                     learner_class,
+                     split,
+                     tied_learner=None):
+    """Instantiates `learner_class`, tying weights to `tied_learner`."""
+    if issubclass(learner_class, learners.BatchLearner):
+      logit_dim = self._get_logit_dim(
+          split, is_batch_learner=True, is_training=is_training)
+    elif issubclass(learner_class, learners.EpisodicLearner):
+      logit_dim = self._get_logit_dim(
+          split, is_batch_learner=False, is_training=is_training)
     else:
-      raise ValueError(
-          'The specified `learner_class` should be a subclass of '
-          '`learner_lib.BatchLearner` or `learner_lib.EpisodicLearner`, '
-          'but received {}.'.format(learner_class))
-    return learner_class(
-        is_training=is_training,
-        logit_dim=logit_dim,
-    )
+      raise ValueError('The specified `learner_class` should be a subclass of '
+                       '`learners.BatchLearner` or `learners.EpisodicLearner`, '
+                       'but received {}.'.format(learner_class))
+
+    if (issubclass(learner_class, experimental_learners.ExperimentalLearner) and
+        tied_learner is not None):
+      return learner_class(
+          is_training=is_training,
+          logit_dim=logit_dim,
+          input_shape=self.image_shape,
+          embedding_fn=tied_learner.embedding_fn,
+      )
+    else:
+      return learner_class(
+          is_training=is_training,
+          logit_dim=logit_dim,
+          input_shape=self.image_shape,
+      )
 
   def get_benchmark_specification(self, records_root_dir=None):
     """Returns a BenchmarkSpecification.
@@ -725,7 +918,7 @@ class Trainer(object):
 
   def initialize_session(self):
     """Initializes a tf.Session."""
-    if ENABLE_TF_OPTIMIZATIONS:
+    if self.enable_tf_optimizations:
       self.sess = tf.Session()
     else:
       session_config = tf.ConfigProto()
@@ -745,9 +938,13 @@ class Trainer(object):
     # Restore or initialize the variables.
     self.sess.run(tf.global_variables_initializer())
     self.sess.run(tf.local_variables_initializer())
+    for it in self.data_initializeable_iterators:
+      self.sess.run(it.initialize())
 
   def initialize_saver(self):
     """Initializes a tf.train.Saver and possibly restores parameters."""
+    # TODO(eringrant): Implement saving and restoring for
+    # `ExperimentalLearner`s.
 
     # We omit from saving and restoring any variables that contains as a
     # substring anything in the list `self.omit_from_saving_and_reloading.
@@ -757,15 +954,21 @@ class Trainer(object):
         'contains any of the following substrings: %s',
         self.omit_from_saving_and_reloading)
 
-    def is_not_requested_to_omit(var):
+    def is_not_requested_to_omit(variable_name):
       return all([
-          substring not in var.name
+          substring not in variable_name
           for substring in self.omit_from_saving_and_reloading
       ])
 
-    var_list = list(filter(is_not_requested_to_omit, tf.global_variables()))
+    # TODO(doersch): the replica_ variables are created by the keras
+    # distributed optimizer, and are copies of the optimizer (e.g. Adam)
+    # variables.  There's probably a smarter way to avoid saving them.
+    var_list = list([
+        var for var in tf.global_variables()
+        if is_not_requested_to_omit(var.name) and 'replica_' not in var.name
+    ])
     if var_list:
-      self.saver = tf.train.Saver(var_list=var_list, max_to_keep=500)
+      self.saver = tf.train.Saver(var_list=var_list, max_to_keep=1200)
     else:
       self.saver = None
       logging.info('Variables not being saved since no variables left after '
@@ -791,11 +994,8 @@ class Trainer(object):
           raise ValueError(
               'Checkpoint not restored, since there is no Saver created. This '
               'is likely due to no parameters being available. ')
-        self.saver.restore(self.sess, latest_checkpoint)
-        logging.info('Restored latest checkpoint from training: %s',
-                     latest_checkpoint)
-        logging.info('(Provided `checkpoint_to_restore` overriden: %s)',
-                     self.checkpoint_to_restore)
+        restore_or_log_informative_error(self.saver, self.sess,
+                                         latest_checkpoint)
 
       elif self.checkpoint_to_restore:
         logging.info('No training checkpoints found.')
@@ -803,11 +1003,13 @@ class Trainer(object):
         # backbone weights but omit other (e.g., optimizer) parameters.
         backbone_vars_to_reload = [
             var for var in tf.global_variables()
-            if is_backbone_variable(var, only_if=is_not_requested_to_omit)
+            if functional_backbones.is_backbone_variable(
+                var.name, only_if=is_not_requested_to_omit)
         ]
         backbone_saver = tf.train.Saver(
             var_list=backbone_vars_to_reload, max_to_keep=1)
-        backbone_saver.restore(self.sess, self.checkpoint_to_restore)
+        restore_or_log_informative_error(backbone_saver, self.sess,
+                                         self.checkpoint_to_restore)
         logging.info(
             'Restored only vars %s from provided `checkpoint_to_restore`: %s',
             [var.name for var in backbone_vars_to_reload],
@@ -817,12 +1019,11 @@ class Trainer(object):
         logging.info(
             'No checkpoints found; training from random initialization.')
 
-    elif self.checkpoint_to_restore:
+    elif self.checkpoint_to_restore is not None:
       # For evaluation, we restore more than the backbone (embedding function)
-      # variables from the provided checkpoint.
-      self.saver.restore(self.sess, self.checkpoint_to_restore)
-      logging.info('Restored checkpoint for evaluation: %s',
-                   self.checkpoint_to_restore)
+      # variables from the provided checkpoint, so we use `self.saver`.
+      restore_or_log_informative_error(self.saver, self.sess,
+                                       self.checkpoint_to_restore)
 
     else:
       logging.info(
@@ -832,42 +1033,41 @@ class Trainer(object):
     if split == TRAIN_SPLIT:
       return self._create_train_specification()
     else:
-      return self._create_held_out_specification(split)
+      return self._create_eval_specification(split)
 
   def _create_train_specification(self):
-    """Returns an EpisodeSpecification or BatchSpecification for training."""
-    if (issubclass(self.train_learner_class, learner_lib.EpisodicLearner) or
+    """Returns a `BatchSpecification` or `EpisodeSpecification` for training."""
+    if (issubclass(self.train_learner_class, learners.EpisodicLearner) or
         self.eval_split == TRAIN_SPLIT):
       return learning_spec.EpisodeSpecification(learning_spec.Split.TRAIN,
-                                                self.num_train_classes,
+                                                self.num_classes_train,
                                                 self.num_support_train,
                                                 self.num_query_train)
-    elif issubclass(self.train_learner_class, learner_lib.BatchLearner):
+    elif issubclass(self.train_learner_class, learners.BatchLearner):
       return learning_spec.BatchSpecification(learning_spec.Split.TRAIN,
                                               self.batch_size)
     else:
-      raise ValueError(
-          'The specified `learner_class` should be a subclass of '
-          '`learner_lib.BatchLearner` or `learner_lib.EpisodicLearner`, '
-          'but received {}.'.format(self.train_learner_class))
+      raise ValueError('The specified `learner_class` should be a subclass of '
+                       '`learners.BatchLearner` or `learners.EpisodicLearner`, '
+                       'but received {}.'.format(self.train_learner_class))
 
-  def _create_held_out_specification(self, split=TEST_SPLIT):
-    """Create an EpisodeSpecification for either validation or testing.
-
-    Note that testing is done episodically whether or not training was episodic.
-    This is why the different subclasses should not override this method.
+  def _create_eval_specification(self, split=TEST_SPLIT):
+    """Create an `EpisodeSpecification` for episodic evaluation.
 
     Args:
-      split: one of VALID_SPLIT or TEST_SPLIT
+      split: The split from which to generate the `EpisodeSpecification`.
 
     Returns:
-      an EpisodeSpecification.
+      An `EpisodeSpecification`.
 
     Raises:
-      ValueError: Invalid split.
+      ValueError: Invalid `split`.
     """
+    if split not in (VALID_SPLIT, TEST_SPLIT):
+      raise UnexpectedSplitError(
+          split, expected_splits=(VALID_SPLIT, TEST_SPLIT))
     split_enum = get_split_enum(split)
-    return learning_spec.EpisodeSpecification(split_enum, self.num_test_classes,
+    return learning_spec.EpisodeSpecification(split_enum, self.num_classes_eval,
                                               self.num_support_eval,
                                               self.num_query_eval)
 
@@ -901,31 +1101,30 @@ class Trainer(object):
     return num_to_take
 
   def build_data(self, split):
-    """Builds the data for the learner for `split`."""
+    """Builds a `tf.Dataset` of episodes or batches from `split`."""
     learner_class = (
         self.train_learner_class
         if split == TRAIN_SPLIT else self.eval_learner_class)
-    if (issubclass(learner_class, learner_lib.BatchLearner) and
+    if (issubclass(learner_class, learners.BatchLearner) and
         split != self.eval_split):
       return self._build_batch(split)
-    elif (issubclass(learner_class, learner_lib.EpisodicLearner) or
+    elif (issubclass(learner_class, learners.EpisodicLearner) or
           split == self.eval_split):
       return self._build_episode(split)
     else:
-      raise ValueError(
-          'The `Learner` for `split` should be a subclass of '
-          '`learner_lib.BatchLearner` or `learner_lib.EpisodicLearner`, '
-          'but received {}.'.format(learner_class))
+      raise ValueError('The `Learner` for `split` should be a subclass of '
+                       '`learners.BatchLearner` or `learners.EpisodicLearner`, '
+                       'but received {}.'.format(learner_class))
 
 
   def _build_episode(self, split):
-    """Builds an EpisodeDataset containing the next data for "split".
+    """Builds a `tf.Dataset` containing Episodes for "split".
 
     Args:
       split: A string, either TRAIN_SPLIT, VALID_SPLIT, or TEST_SPLIT.
 
     Returns:
-      An EpisodeDataset.
+      An `tf.Dataset` with Episodes.
 
     Raises:
       UnexpectedSplitError: If split not as expected for this episode build.
@@ -966,6 +1165,20 @@ class Trainer(object):
     for dataset_spec in dataset_spec_list:
       num_per_class.append(self.get_num_to_take(dataset_spec.name, split))
 
+    if split == TRAIN_SPLIT:
+      # The learner for the training split should only be in training mode if
+      # the evaluation split is not the training split.
+      gin_scope_name = ('train'
+                        if self.eval_split != TRAIN_SPLIT else 'evaluation')
+    else:
+      gin_scope_name = 'evaluation'
+
+    ignore_hierarchy_prob = episode_descr_config.ignore_hierarchy_probability
+    simclr_episode_fraction = episode_descr_config.simclr_episode_fraction
+    if simclr_episode_fraction > 0:
+      assert not self.enable_tf_optimizations, (
+          'Must set enable_tf_optimizations=False or SimCLR will fail; see '
+          'https://github.com/tensorflow/tensorflow/issues/22145')
     # TODO(lamblinp): pass specs directly to the pipeline builder.
     # TODO(lamblinp): move the special case directly in make_..._pipeline
     if len(dataset_spec_list) == 1:
@@ -973,52 +1186,63 @@ class Trainer(object):
       use_dag_ontology = has_dag_ontology[0]
       if self.eval_finegrainedness or self.eval_imbalance_dataset:
         use_dag_ontology = False
-      data_pipeline = pipeline.make_one_source_episode_pipeline(
-          dataset_spec_list[0],
-          use_dag_ontology=use_dag_ontology,
-          use_bilevel_ontology=has_bilevel_ontology[0],
-          split=dataset_split,
-          episode_descr_config=episode_descr_config,
-          shuffle_buffer_size=shuffle_buffer_size,
-          read_buffer_size_bytes=read_buffer_size_bytes,
-          num_prefetch=num_prefetch,
-          image_size=image_size,
-          num_to_take=num_per_class[0])
+
+      with gin.config_scope(gin_scope_name):
+        data_pipeline = pipeline.make_one_source_episode_pipeline(
+            dataset_spec_list[0],
+            use_dag_ontology=use_dag_ontology,
+            use_bilevel_ontology=has_bilevel_ontology[0],
+            split=dataset_split,
+            episode_descr_config=episode_descr_config,
+            shuffle_buffer_size=shuffle_buffer_size,
+            read_buffer_size_bytes=read_buffer_size_bytes,
+            num_prefetch=num_prefetch,
+            image_size=image_size,
+            num_to_take=num_per_class[0],
+            simclr_episode_fraction=simclr_episode_fraction,
+            ignore_hierarchy_probability=ignore_hierarchy_prob)
+
     else:
-      data_pipeline = pipeline.make_multisource_episode_pipeline(
-          dataset_spec_list,
-          use_dag_ontology_list=has_dag_ontology,
-          use_bilevel_ontology_list=has_bilevel_ontology,
-          split=dataset_split,
-          episode_descr_config=episode_descr_config,
-          shuffle_buffer_size=shuffle_buffer_size,
-          read_buffer_size_bytes=read_buffer_size_bytes,
-          num_prefetch=num_prefetch,
-          image_size=image_size,
-          num_to_take=num_per_class)
+      if ignore_hierarchy_prob > 0.0:
+        raise ValueError(
+            'ignore_hierarchy_probability not supported with multisource pipelines'
+        )
+      with gin.config_scope(gin_scope_name):
+        data_pipeline = pipeline.make_multisource_episode_pipeline(
+            dataset_spec_list,
+            use_dag_ontology_list=has_dag_ontology,
+            use_bilevel_ontology_list=has_bilevel_ontology,
+            split=dataset_split,
+            episode_descr_config=episode_descr_config,
+            shuffle_buffer_size=shuffle_buffer_size,
+            read_buffer_size_bytes=read_buffer_size_bytes,
+            num_prefetch=num_prefetch,
+            image_size=image_size,
+            num_to_take=num_per_class,
+            simclr_episode_fraction=simclr_episode_fraction)
+
     data_pipeline = apply_dataset_options(data_pipeline)
 
-    iterator = data_pipeline.make_one_shot_iterator()
-    episode, _ = iterator.get_next()
-    (support_images, support_labels, support_class_ids, query_images,
-     query_labels, query_class_ids) = episode
+    def create_episode_struct(support_images, support_labels, support_class_ids,
+                              query_images, query_labels, query_class_ids):
+      return providers.Episode(
+          support_images=support_images,
+          query_images=query_images,
+          support_labels=support_labels,
+          query_labels=query_labels,
+          support_class_ids=support_class_ids,
+          query_class_ids=query_class_ids)
 
-    return providers.EpisodeDataset(
-        train_images=support_images,
-        test_images=query_images,
-        train_labels=support_labels,
-        test_labels=query_labels,
-        train_class_ids=support_class_ids,
-        test_class_ids=query_class_ids)
+    return data_pipeline.map(lambda x, y: x).map(create_episode_struct)
 
   def _build_batch(self, split):
-    """Builds a Batch object containing the next data for "split".
+    """Builds a `tf.Dataset` of Batch objects containing data for "split".
 
     Args:
       split: A string, either TRAIN_SPLIT, VALID_SPLIT, or TEST_SPLIT.
 
     Returns:
-      An EpisodeDataset.
+      A `tf.Dataset` containing Batches
     """
     shuffle_buffer_size = self.data_config.shuffle_buffer_size
     read_buffer_size_bytes = self.data_config.read_buffer_size_bytes
@@ -1067,32 +1291,84 @@ class Trainer(object):
           num_to_take=num_per_class)
 
     data_pipeline = apply_dataset_options(data_pipeline)
-    iterator = data_pipeline.make_one_shot_iterator()
-    (images, class_ids), dataset_index = iterator.get_next()
 
-    # The number of available classes for each dataset
-    all_n_classes = [
-        len(dataset_spec.get_classes(get_split_enum(split)))
-        for dataset_spec in dataset_spec_list
-    ]
-    if len(dataset_spec_list) == 1:
-      n_classes = all_n_classes[0]
-    elif gin.query_parameter('BatchSplitReaderGetReader.add_dataset_offset'):
-      # The total number of classes is the sum for all datasets
-      n_classes = sum(all_n_classes)
-    else:
-      # The number of classes is the one of the current dataset
-      n_classes = tf.convert_to_tensor(all_n_classes)[dataset_index]
-    return providers.Batch(images=images, labels=class_ids, n_classes=n_classes)
+    def create_batch_structure(data, dataset_index):
+      (images, class_ids) = data
 
-  def get_train_op(self, global_step):
+      # The number of available classes for each dataset
+      all_n_classes = [
+          len(dataset_spec.get_classes(get_split_enum(split)))
+          for dataset_spec in dataset_spec_list
+      ]
+      if len(dataset_spec_list) == 1:
+        n_classes = all_n_classes[0]
+      elif gin.query_parameter('BatchSplitReaderGetReader.add_dataset_offset'):
+        # The total number of classes is the sum for all datasets
+        n_classes = sum(all_n_classes)
+      else:
+        # The number of classes is the one of the current dataset
+        n_classes = tf.convert_to_tensor(all_n_classes)[dataset_index]
+      return providers.Batch(
+          images=images, labels=class_ids, n_classes=n_classes)
+
+    return data_pipeline.map(create_batch_structure)
+
+  def get_run_fn_with_train_op(self, run_fn, regularizer, global_step):
     """Returns the operation that performs a training update."""
-    # UPDATE_OPS picks up batch_norm updates.
-    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-    with tf.control_dependencies(update_ops):
-      train_op = self.optimizer.minimize(
-          self.losses[TRAIN_SPLIT], global_step=global_step)
-    return train_op
+
+    def run_fn_with_train_op(data):
+      """Run and train the model."""
+      res = run_fn(data)
+      update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+      loss = distribute_utils.aggregate(res['loss'])
+      # note: every worker computes the same loss.  This is because the
+      # reduce_mean needs to be computed globally.
+      loss = tf.reduce_mean(loss)
+      loss += regularizer
+      replica_ctx = tf.distribute.get_replica_context()
+      if replica_ctx:
+        loss /= replica_ctx.num_replicas_in_sync
+      # TODO(doersch): there's probably a better way to do EMA updates. EMAs
+      # are MirroredVariables, which means the assign needs to happen on every
+      # replica.  I think what's happening is that the update from replica 1
+      # is getting run on every replica for a different copy of the mirrored
+      # variable.  Only running the assign ops from the first replica doesn't
+      # work.
+      with tf.control_dependencies([tf.group(update_ops)]):
+
+        if self.normalized_gradient_descent:
+          opt_vars = tf.trainable_variables()
+          if self.distribute:
+            grads = self.optimizer.get_gradients(loss, opt_vars)
+            grads_and_vars = list(zip(grads, opt_vars))
+          else:
+            grads_and_vars = self.optimizer.compute_gradients(loss, opt_vars)
+          global_norm = 0
+          # We reverse the order of grads_and_vars because they're computed in
+          # reverse order; this way, the network can begin aggregating the
+          # global norm before the backwards pass is complete.
+          for g, v in grads_and_vars[::-1]:
+            if replica_ctx:
+              g = replica_ctx.all_reduce('sum', g)
+            sumsq = tf.reduce_sum(tf.square(g))
+            global_norm += sumsq
+          nrm = tf.sqrt(tf.maximum(global_norm, 1e-5))
+
+          grads_and_vars2 = []
+          for g, v in grads_and_vars:
+            grads_and_vars2.append((g / nrm, v))
+
+          train_op = self.optimizer.apply_gradients(grads_and_vars2)
+
+          with tf.control_dependencies([train_op]):
+            train_op = tf.assign(global_step, global_step + 1)
+        else:
+          train_op = self.optimizer.minimize(
+              loss, global_step=global_step, var_list=tf.trainable_variables())
+      res['train_op'] = train_op
+      return res
+
+    return run_fn_with_train_op
 
   def get_updated_global_step(self):
     with tf.control_dependencies([self.train_op]):
@@ -1105,10 +1381,6 @@ class Trainer(object):
     logging.info('Starting training from global_step: %d', global_step)
     updated_global_step = self.get_updated_global_step()
 
-    # Dummy variables so that logging works even if called before evaluation.
-    self.valid_acc = np.nan
-    self.valid_ci = np.nan
-
     should_save = self.checkpoint_dir is not None
     if should_save and global_step == 0:
       # Save the initialization weights.
@@ -1116,8 +1388,10 @@ class Trainer(object):
           self.sess, os.path.join(self.checkpoint_dir, 'model_0.ckpt'))
       logging.info('Model initialization saved: %s', save_path)
 
-    # Compute the initial validation performance before starting the training.
-    self.maybe_evaluate(global_step)
+    # Compute the initial validation performance before starting the training,
+    # unless train() has already been called on this object.
+    if np.isnan([self.valid_acc, self.valid_ci]).any():
+      self.maybe_evaluate(global_step)
 
     while global_step < self.num_updates:
       # Perform the next update.
@@ -1125,6 +1399,7 @@ class Trainer(object):
           self.train_op, self.losses[TRAIN_SPLIT], self.accuracies[TRAIN_SPLIT],
           updated_global_step
       ])
+      train_acc = np.mean(train_acc)
 
       # Maybe validate, depending on the global step's value.
       self.maybe_evaluate(global_step)
@@ -1138,8 +1413,8 @@ class Trainer(object):
         logging.info(message)
 
         # Update summaries.
-        summaries = self.sess.run(self.standard_summaries)
         if self.summary_writer:
+          summaries = self.sess.run(self.standard_summaries)
           self.summary_writer.add_summary(summaries, global_step)
 
       if should_save and global_step % self.checkpoint_every == 0:
@@ -1163,74 +1438,98 @@ class Trainer(object):
       self.valid_acc = valid_acc
       self.valid_ci = valid_ci
 
-
-# TODO(evcu) Improve this so that if the eval_only loads a global_step, it is
-# used at logging instead of value 0.
-
+  # TODO(evcu) Improve this so that if the eval_only loads a global_step, it is
+  # used at logging instead of value 0.
   def evaluate(self, split, step=0):
     """Returns performance metrics across num_eval_trials episodes / batches."""
     num_eval_trials = self.num_eval_episodes
     logging.info('Performing evaluation of the %s split using %d episodes...',
                  split, num_eval_trials)
     accuracies = []
+    total_samples = 0
     for eval_trial_num in range(num_eval_trials):
+      # Following is used to normalize accuracies.
       acc, summaries = self.sess.run(
           [self.accuracies[split], self.evaluation_summaries])
-      accuracies.append(acc)
       # Write complete summaries during evaluation, but not training.
-      # Otherwise, validaation summaries become too big.
+      # Otherwise, validation summaries become too big.
       if not self.is_training and self.summary_writer:
         self.summary_writer.add_summary(summaries, eval_trial_num)
-    logging.info('Done.')
+      accuracies.append(np.mean(acc))
+      total_samples += 1
 
-    mean_acc = np.mean(accuracies)
+    logging.info('Finished evaluation.')
+
+    mean_acc = np.sum(accuracies) / total_samples
     ci_acc = np.std(accuracies) * 1.96 / np.sqrt(len(accuracies))  # confidence
+
     if not self.is_training:
       # Logging during training is handled by self.train() instead.
       logging.info('Accuracy on the meta-%s split: %f, +/- %f.\n', split,
                    mean_acc, ci_acc)
 
-    mean_acc_summary = tf.Summary()
-    mean_acc_summary.value.add(tag='mean %s acc' % split, simple_value=mean_acc)
-    ci_acc_summary = tf.Summary()
-    ci_acc_summary.value.add(tag='%s acc CI' % split, simple_value=ci_acc)
+    with tf.name_scope('trainer_metrics'):
+      with tf.name_scope(split):
+        mean_acc_summary = tf.Summary()
+        mean_acc_summary.value.add(tag='mean acc', simple_value=mean_acc)
+        ci_acc_summary = tf.Summary()
+        ci_acc_summary.value.add(tag='acc CI', simple_value=ci_acc)
 
     return mean_acc, ci_acc, mean_acc_summary, ci_acc_summary
 
   def add_eval_summaries(self):
     """Returns summaries of way / shot / classes/ logits / targets."""
-    evaluation_summaries = []
+    evaluation_summaries = [
+        tf.summary.scalar('global_step', tf.train.get_global_step())
+    ]
     for split in self.required_splits:
-      if isinstance(self.next_data[split], providers.EpisodeDataset):
-        evaluation_summaries.extend(self._add_eval_summaries_split(split))
+      evaluation_summaries.extend(self._add_eval_summaries_split(split))
     return evaluation_summaries
 
   def _add_eval_summaries_split(self, split):
     """Returns split's summaries of way / shot / classes / logits / targets."""
     split_eval_summaries = []
-    way_summary = tf.summary.scalar('%s_way' % split, self.way[split])
-    shots_summary = tf.summary.tensor_summary('%s_shots' % split,
-                                              self.shots[split])
-    classes_summary = tf.summary.tensor_summary('%s_class_ids' % split,
-                                                self.class_ids[split])
-    logits_summary = tf.summary.tensor_summary('%s_test_logits' % split,
-                                               self.test_logits[split])
-    targets_summary = tf.summary.tensor_summary('%s_test_targets' % split,
-                                                self.test_targets[split])
+    episode_info = copy.copy(self.episode_info[split])
+    episode_info['query_logits'] = self.predictions[split]
+    summary_labels = [
+        'way', 'shots', 'class_ids', 'query_logits', 'query_targets'
+    ]
     if self.eval_imbalance_dataset:
-      class_props_summary = tf.summary.tensor_summary('%s_class_props' % split,
-                                                      self.class_props[split])
-      split_eval_summaries.append(class_props_summary)
-    split_eval_summaries.append(way_summary)
-    split_eval_summaries.append(shots_summary)
-    split_eval_summaries.append(classes_summary)
-    split_eval_summaries.append(logits_summary)
-    split_eval_summaries.append(targets_summary)
+      summary_labels += ['class_props']
+    for label in summary_labels:
+      if episode_info[label] is not None:
+        if episode_info[label].shape:
+          summary_fn = tf.summary.tensor_summary
+        else:
+          summary_fn = tf.summary.scalar
+        summary = summary_fn('%s_%s' % (split, label), episode_info[label])
+        split_eval_summaries.append(summary)
     return split_eval_summaries
 
-  def _get_num_total_classes(self, split):
-    """Returns the total number of classes in a split of the benchmark."""
-    total_classes = 0
-    for dataset_spec in self.benchmark_spec.dataset_spec_list:
-      total_classes += len(dataset_spec.get_classes(split))
+  def _get_logit_dim(self, split, is_batch_learner, is_training):
+    """Returns the total number of logits needed.
+
+    Args:
+      split: string, one of TRAIN_SPLIT, VALID_SPLIT, TEST_SPLIT.
+      is_batch_learner: bool, if True the logit count is obtained from dataset
+        spec. If False, `max_ways` is used for episodic dataset.
+      is_training: bool, used to decide number of logits.
+
+    Returns:
+      int, total number of logits needed.
+    """
+    if is_batch_learner:
+      # Get the total number of classes in this split, across all datasets
+      # contributing to this split.
+      total_classes = 0
+      for dataset_spec, dataset_splits in zip(
+          self.benchmark_spec.dataset_spec_list,
+          self.benchmark_spec.splits_to_contribute):
+        if any(
+            get_split_enum(ds_split) == split for ds_split in dataset_splits):
+          total_classes += len(dataset_spec.get_classes(split))
+    else:
+      total_classes = (
+          self.train_episode_config.max_ways
+          if is_training else self.eval_episode_config.max_ways)
     return total_classes

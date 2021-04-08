@@ -8,13 +8,13 @@ export CUDA_VISIBLE_DEVICES=0
 #	--mode test \
 #	--test_model_path ./learners/protonets/models/protonets_mini_imagenet_5-way_5-shot.pt  \
 #	--test_shot 5 --test_way 5 \
-#	--query 5 
+#	--query 5
 
 
 
 python3 ./learners/cnaps/src/run_cnaps.py \
 	--data_path /scratches/stroustrup/jfb54/tf-meta-dataset/records \
-	--checkpoint_dir /scratch/etv21/coresets \
+	--checkpoint_dir /scratch/etv21/debug \
 	--feature_adaptation film \
 	--dataset cifar10 \
 	--mode test \
@@ -22,4 +22,4 @@ python3 ./learners/cnaps/src/run_cnaps.py \
 	--shot 5 --way 5 \
 	--query_test 5 \
 	--construct_coreset True \
-    --num_reruns 2
+	--num_reruns 10
