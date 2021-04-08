@@ -5,7 +5,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Quiet the TensorFlow warnings
 import tensorflow as tf
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)  # Quiet the TensorFlow warnings
 import sys
-sys.path.append(os.path.abspath(os.environ['META_DATASET_ROOT']))
+sys.path.append(os.path.abspath('libs/meta-dataset'))
 from meta_dataset.data import dataset_spec as dataset_spec_lib
 from meta_dataset.data import learning_spec
 from meta_dataset.data import pipeline
@@ -30,7 +30,7 @@ class MetaDatasetReader:
         self.test_set_dict = {}
         tf.compat.v1.disable_eager_execution()
         self.session = tf.compat.v1.Session()
-        gin.parse_config_file('./meta_dataset_config.gin')
+        gin.parse_config_file('learners/protonets_attention/src/meta_dataset_config.gin')
 
         if mode == 'train' or mode == 'train_test':
             train_episode_description = self._get_train_episode_description(max_way_train, max_support_train,

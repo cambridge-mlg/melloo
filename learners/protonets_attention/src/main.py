@@ -3,6 +3,7 @@ import torchvision.transforms.functional as tvf
 import numpy as np
 import argparse
 import os
+from tqdm import tqdm
 from utils import Logger, LogFiles, ValidationAccuracies, cross_entropy_loss, categorical_accuracy, MetaLearningState, \
     coalesce_labels, merge_logits, mode_accuracy, extract_class_indices
 from model import FewShotClassifier
@@ -139,7 +140,7 @@ class Learner:
             train_accuracies = []
             losses = []
             total_iterations = self.args.training_iterations
-            for iteration in range(self.start_iteration, total_iterations):
+            for iteration in tqdm(range(self.start_iteration, total_iterations), dynamic_ncols=True):
                 torch.set_grad_enabled(True)
                 task_dict = self.dataset.get_train_task()
                 task_loss, task_accuracy = self.train_task(task_dict)

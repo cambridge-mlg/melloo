@@ -204,7 +204,7 @@ class FewShotClassifier(nn.Module):
             class_representations.append(class_prototype.squeeze())
             attention_weights.append(attn_weights)
 
-        return torch.stack(class_representations), torch.stack(attention_weights)
+        return torch.stack(class_representations), attention_weights
 
     def get_feature_extractor_params(self):
         return self.feature_extractor_params
