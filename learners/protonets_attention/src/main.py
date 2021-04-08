@@ -231,38 +231,45 @@ class Learner:
         if path != 'None':
             self.model.load_state_dict(torch.load(path))
 
-        with torch.no_grad():
-            for item in self.test_set:
-                accuracies = []
-                protonets_accuracies = []
+        for item in self.test_set:
+            accuracies = []
+            protonets_accuracies = []
 
-                for _ in range(NUM_TEST_TASKS):
-                    task_dict = self.dataset.get_test_task(item)
-                    context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
-                    target_logits = self.model(context_images, context_labels, target_images, target_labels,
-                                               MetaLearningState.META_TEST)
-                    accuracy = self.accuracy_fn(target_logits, target_labels)
-                    accuracies.append(accuracy.item())
+            for _ in range(NUM_TEST_TASKS):
+                task_dict = self.dataset.get_test_task(item)
+                context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                target_logits = self.model(context_images, context_labels, target_images, target_labels,
+                                           MetaLearningState.META_TEST)
+                
+                task_loss = self.loss(target_logits, target_labels)
+                regularization_term = (self.model.feature_adaptation_network.regularization_term())
+                regularizer_scaling = 0.001
+                task_loss += regularizer_scaling * regularization_term
+                torch.autograd.grad(task_loss, self.model.context_features, retain_graph=True)
+                                           
+                                           
+                accuracy = self.accuracy_fn(target_logits, target_labels)
+                accuracies.append(accuracy.item())
 
-                    context_features, target_features, attention_weights = self.model.context_features, self.model.target_features, self.model.attention_weights
-                    
-                    import pdb; pdb.set_trace()
-                    weights_per_context_point = torch.zeros((len(target_labels), len(context_labels)), device=self.device)
-                    for c in torch.unique(context_labels):
-                        c_indices = extract_class_indices(context_labels, c)
-                        c_weights = attention_weights[c].squeeze()
-                        for q in range(c_weights.shape[0]):
-                            weights_per_context_point[q][c_indices] = c_weights[q]
-                    import pdb; pdb.set_trace()
+                context_features, target_features, attention_weights = self.model.context_features, self.model.target_features, self.model.attention_weights
+                
+                import pdb; pdb.set_trace()
+                weights_per_context_point = torch.zeros((len(target_labels), len(context_labels)), device=self.device)
+                for c in torch.unique(context_labels):
+                    c_indices = extract_class_indices(context_labels, c)
+                    c_weights = attention_weights[c].squeeze()
+                    for q in range(c_weights.shape[0]):
+                        weights_per_context_point[q][c_indices] = c_weights[q]
+                import pdb; pdb.set_trace()
 
-                    rankings = torch.argsort(weights_per_context_point, dim=1, descending=True)
+                rankings = torch.argsort(weights_per_context_point, dim=1, descending=True)
 
-                del target_logits
+            del target_logits
 
-                accuracy = np.array(accuracies).mean() * 100.0
-                accuracy_confidence = (196.0 * np.array(accuracies).std()) / np.sqrt(len(accuracies))
+            accuracy = np.array(accuracies).mean() * 100.0
+            accuracy_confidence = (196.0 * np.array(accuracies).std()) / np.sqrt(len(accuracies))
 
-                self.logger.print_and_log('{0:}: {1:3.1f}+/-{2:2.1f}'.format(item, accuracy, accuracy_confidence))
+            self.logger.print_and_log('{0:}: {1:3.1f}+/-{2:2.1f}'.format(item, accuracy, accuracy_confidence))
 
     def prepare_task(self, task_dict):
         if self.args.dataset_reader == "pytorch":
