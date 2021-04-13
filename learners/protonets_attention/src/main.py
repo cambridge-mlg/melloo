@@ -208,7 +208,7 @@ class Learner:
             
         if self.args.l2_regularize_classifier:
             regularization_term = self.get_from_gpu(self.model.classifer_regularization_term())
-            task_loss += self.args.l2_lamba * regularization_term
+            task_loss += self.args.l2_lambda * regularization_term
         task_accuracy = self.accuracy_fn(target_logits, target_labels)
 
         task_loss.backward(retain_graph=False)
@@ -245,7 +245,6 @@ class Learner:
         for item in self.test_set:
             accuracies = []
             protonets_accuracies = []
-
             for _ in range(NUM_TEST_TASKS):
                 task_dict = self.dataset.get_test_task(item)
                 context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
@@ -256,10 +255,10 @@ class Learner:
                 regularization_term = (self.model.feature_adaptation_network.regularization_term())
                 regularizer_scaling = 0.001
                 task_loss += regularizer_scaling * regularization_term
-                
-                if self.args.l2_regularize_classifier
+
+                if self.args.l2_regularize_classifier:
                     classifier_regularization_term = self.model.classifer_regularization_term()
-                    task_loss += self.args.l2_lamba * classifier_regularization_term
+                    task_loss += self.args.l2_lambda * classifier_regularization_term
                 torch.autograd.grad(task_loss, self.model.context_features, retain_graph=True)
                                            
                                            
@@ -268,7 +267,6 @@ class Learner:
 
                 context_features, target_features, attention_weights = self.model.context_features, self.model.target_features, self.model.attention_weights
                 
-                import pdb; pdb.set_trace()
                 weights_per_context_point = torch.zeros((len(target_labels), len(context_labels)), device=self.device)
                 for c in torch.unique(context_labels):
                     c_indices = extract_class_indices(context_labels, c)

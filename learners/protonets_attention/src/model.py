@@ -142,7 +142,7 @@ class FewShotClassifier(nn.Module):
         euclidean_dist = ((target_embeddings - prototypes) ** 2).sum(dim = -1) / (h * w)
         return -euclidean_dist
 
-    def get_classifier_regularization_term():
+    def classifer_regularization_term(self):
         if self.prototypes is None:
             print("Classifier has no prototypes saved. Either no forward pass has happened yet, or the regularization term is being calculated out of sync")
             return None
@@ -150,8 +150,8 @@ class FewShotClassifier(nn.Module):
         if self.args.classifier == "protonets_cross_transformer":
             print("Though it makes sense to support this, we don't yet")
             return None
-        else:
-            print("Classifier regularization term not available for selected classifer: {}".format(self.args.classfier))
+        elif self.args.classifier != "protonets_attention" and self.args.classifier != "protonets_euclidean":
+            print("Classifier regularization term not available for selected classifer: {}".format(self.args.classifier))
             return None
         
         # In all cases, the most recently calculated prototypes are saved on the model
