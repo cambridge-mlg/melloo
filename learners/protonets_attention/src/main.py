@@ -131,6 +131,10 @@ class Learner:
         parser.add_argument("--num_attention_heads", type=int, default=8, help="Number of heads in multi-head attention.")
         parser.add_argument("--attention_temperature", type=float, default=1.0,
                             help="Temperature used in dot-product attention softmax.")
+        parser.add_argument("--l2_lambda", type=float, default=0.0001,
+                            help="Value of lambda when doing L2 regularization on the classifier head")
+        parser.add_argument("--l2_regularize_classifier", dest="l2_regularize_classifier", default=False,
+                            action="store_true", help="If True, perform l2 regularization on the classifier head.")
 
         args = parser.parse_args()
         return args
@@ -186,18 +190,25 @@ class Learner:
         if self.args.mode == 'test':
             self.test(self.args.test_model_path)
 
+    def get_from_gpu(value):
+        if self.use_two_gpus():
+            return value.cuda(0)
+        else:
+            return value
+
     def train_task(self, task_dict):
         context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
 
         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TRAIN)
         task_loss = self.loss(target_logits, target_labels)
         if self.args.feature_adaptation == 'film':
-            if self.use_two_gpus():
-                regularization_term = (self.model.feature_adaptation_network.regularization_term()).cuda(0)
-            else:
-                regularization_term = (self.model.feature_adaptation_network.regularization_term())
+            regularization_term = self.get_from_gpu(self.model.feature_adaptation_network.regularization_term())
             regularizer_scaling = 0.001
             task_loss += regularizer_scaling * regularization_term
+            
+        if self.args.l2_regularize_classifier:
+            regularization_term = self.get_from_gpu(self.model.classifer_regularization_term())
+            task_loss += self.args.l2_lamba * regularization_term
         task_accuracy = self.accuracy_fn(target_logits, target_labels)
 
         task_loss.backward(retain_graph=False)
@@ -245,6 +256,10 @@ class Learner:
                 regularization_term = (self.model.feature_adaptation_network.regularization_term())
                 regularizer_scaling = 0.001
                 task_loss += regularizer_scaling * regularization_term
+                
+                if self.args.l2_regularize_classifier
+                    classifier_regularization_term = self.model.classifer_regularization_term()
+                    task_loss += self.args.l2_lamba * classifier_regularization_term
                 torch.autograd.grad(task_loss, self.model.context_features, retain_graph=True)
                                            
                                            

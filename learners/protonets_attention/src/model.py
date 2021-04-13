@@ -7,6 +7,7 @@ from set_encoder import mean_pooling
 from utils import MetaLearningState, extract_class_indices
 from attention import DotProdAttention, MultiHeadAttention, CrossTransformer
 from einops import rearrange
+from torch.linalg import norm
 
 
 class FewShotClassifier(nn.Module):
@@ -68,14 +69,116 @@ class FewShotClassifier(nn.Module):
             self.attention_weights = attention_weights
 
         elif self.args.classifier == "protonets_cross_transformer":
-            prototypes, target_embeddings, h, w = self.cross_attention(self.context_features, self.target_features, context_labels)
-            logits = self._cross_transformer_euclidiean_distances(prototypes, target_embeddings, h, w)
+            self.prototypes, target_embeddings, h, w = self.cross_attention(self.context_features, self.target_features, context_labels)
+            logits = self._cross_transformer_euclidiean_distances(self.prototypes, target_embeddings, h, w)
 
         else:
             print("Unsupported model type requested")
             return
 
         return logits
+        
+    def _protonets_euclidean_classifier(self, context_features, target_features, context_labels):
+        self.prototypes = self._compute_class_prototypes(context_features, context_labels)
+        logits = self._euclidean_distances(target_features, self.prototypes)
+        return logits
+
+    def _compute_class_prototypes(self, context_features, context_labels):
+        means = []
+        for c in torch.unique(context_labels):
+            # filter out feature vectors which have class c
+            class_features = torch.index_select(context_features, 0, extract_class_indices(context_labels, c))
+            means.append(torch.mean(class_features, dim=0))
+        return torch.stack(means)
+
+    def _euclidean_distances(self, target_features, class_prototypes):
+        num_target_features = target_features.shape[0]
+        num_prototypes = class_prototypes.shape[0]
+
+        distances = (target_features.unsqueeze(1).expand(num_target_features, num_prototypes, -1) -
+                     class_prototypes.unsqueeze(0).expand(num_target_features, num_prototypes, -1)).pow(2).sum(dim=2)
+
+        return -distances
+
+    def _protonets_euclidean_attention_classifier(self, context_features, target_features, context_labels):
+        self.prototypes, attention_weights = self._compute_class_prototypes_with_attention(context_features, target_features,
+                                                                         context_labels)
+        logits = self._euclidean_distances_with_attention(target_features, self.prototypes)
+        return logits, attention_weights
+
+    def _compute_class_prototypes_with_attention(self, context_features, target_features, context_labels):
+        dk = context_features.size(1)
+        target_set_size = target_features.size(0)
+        class_representations = []
+        attention_weights = []
+        for c in torch.unique(context_labels):
+            # filter out feature vectors which have class c
+            class_features = torch.index_select(context_features, 0, extract_class_indices(context_labels, c))
+
+            # replicate the class features x target_set_size
+            class_keys = torch.unsqueeze(class_features, dim=0)
+            class_keys = class_keys.repeat(target_set_size, 1, 1)
+
+            # unsqueeze targets at dim = 1
+            class_queries = target_features.unsqueeze(1)
+
+            class_prototype, attn_weights = self.cross_attention(keys=class_keys, queries=class_queries, values=class_keys)
+    
+            class_representations.append(class_prototype.squeeze())
+            attention_weights.append(attn_weights)
+
+        return torch.stack(class_representations), attention_weights
+
+    def _euclidean_distances_with_attention(self, target_features, class_prototypes):
+        num_target_features = target_features.shape[0]
+        num_prototypes = class_prototypes.shape[0]
+
+        distances = (target_features.unsqueeze(1).expand(num_target_features, num_prototypes, -1) -
+                     class_prototypes.permute(1, 0, 2)).pow(2).sum(dim=2)
+
+        return -distances
+        
+    def _cross_transformer_euclidiean_distances(self, prototypes, target_embeddings, h, w):
+        euclidean_dist = ((target_embeddings - prototypes) ** 2).sum(dim = -1) / (h * w)
+        return -euclidean_dist
+
+    def get_classifier_regularization_term():
+        if self.prototypes is None:
+            print("Classifier has no prototypes saved. Either no forward pass has happened yet, or the regularization term is being calculated out of sync")
+            return None
+        
+        if self.args.classifier == "protonets_cross_transformer":
+            print("Though it makes sense to support this, we don't yet")
+            return None
+        else:
+            print("Classifier regularization term not available for selected classifer: {}".format(self.args.classfier))
+            return None
+        
+        # In all cases, the most recently calculated prototypes are saved on the model
+        # The classifier head's parameters are wk and bk with wk = 2ck, bk = -ck^Tck
+        # where ck denotes the k-th class's prototype
+        # So if we want to write this as a matrix, we have W = 2 [c1 c2 ... cK] (with each ck a row vector)
+        # so that W has dim (K x embedding_dim) and
+        # b = -[c1^Tc1 c2^tc2 ... cK^TcK], having dim (K x 1)
+        # Rewriting W f + b again so that we only have one matrix of parameters, we
+        # augment W to have an extra column containing b, and f is augmented to have an extra dimension = 1 
+        
+        normalize_denom = 1.0
+        if self.args.classifier == "protonets_attention":
+            # permute the embedding so that we have the prototypes per target point
+            self.prototypes = self.prototypes.permute(1, 0, 2)
+            normalize_denom = self.prototypes.shape[0]
+            
+        cs_per_target_pt = 2 * self.prototypes
+        bs = -(self.prototypes * self.prototypes).sum(dim=-1)
+        params = torch.cat((cs_per_target_pt, bs.unsqueeze(-1)), dim=-1)
+        
+        # Clear the reference to our own prototypes for now, so that if we accidentally call this function out of sync, we will notice        
+        self.prototypes = None
+        
+        # Calculate the L2 norm of the params, which is either the entire param matrix for protonets_euclidean
+        # or over the classifier heads for each target point, in the dot product attention case
+        return norm(params, dim=(-2, -1)).sum()/float(normalize_denom)
 
     def get_context_features(self):
         return self.context_features
@@ -120,6 +223,7 @@ class FewShotClassifier(nn.Module):
         return context_features, target_features
 
     def _get_classifier_params(self):
+        # This is None for the protonets_attention and protonets_euclidean
         classifier_params = self.classifier_adaptation_network(self.class_representations)
         return classifier_params
 
@@ -142,69 +246,7 @@ class FewShotClassifier(nn.Module):
             else:
                 self.feature_extractor.eval()
 
-    def _protonets_euclidean_classifier(self, context_features, target_features, context_labels):
-        class_prototypes = self._compute_class_prototypes(context_features, context_labels)
-        logits = self._euclidean_distances(target_features, class_prototypes)
-        return logits
-
-    def _compute_class_prototypes(self, context_features, context_labels):
-        means = []
-        for c in torch.unique(context_labels):
-            # filter out feature vectors which have class c
-            class_features = torch.index_select(context_features, 0, extract_class_indices(context_labels, c))
-            means.append(torch.mean(class_features, dim=0))
-        return torch.stack(means)
-
-    def _euclidean_distances(self, target_features, class_prototypes):
-        num_target_features = target_features.shape[0]
-        num_prototypes = class_prototypes.shape[0]
-
-        distances = (target_features.unsqueeze(1).expand(num_target_features, num_prototypes, -1) -
-                     class_prototypes.unsqueeze(0).expand(num_target_features, num_prototypes, -1)).pow(2).sum(dim=2)
-
-        return -distances
-
-    def _cross_transformer_euclidiean_distances(self, prototypes, target_embeddings, h, w):
-        euclidean_dist = ((target_embeddings - prototypes) ** 2).sum(dim = -1) / (h * w)
-        return -euclidean_dist
-
-    def _protonets_euclidean_attention_classifier(self, context_features, target_features, context_labels):
-        class_prototypes, attention_weights = self._compute_class_prototypes_with_attention(context_features, target_features,
-                                                                         context_labels)
-        logits = self._euclidean_distances_with_attention(target_features, class_prototypes)
-        return logits, attention_weights
-        
-    def _euclidean_distances_with_attention(self, target_features, class_prototypes):
-        num_target_features = target_features.shape[0]
-        num_prototypes = class_prototypes.shape[0]
-
-        distances = (target_features.unsqueeze(1).expand(num_target_features, num_prototypes, -1) -
-                     class_prototypes.permute(1, 0, 2)).pow(2).sum(dim=2)
-
-        return -distances
-
-    def _compute_class_prototypes_with_attention(self, context_features, target_features, context_labels):
-        dk = context_features.size(1)
-        target_set_size = target_features.size(0)
-        class_representations = []
-        attention_weights = []
-        for c in torch.unique(context_labels):
-            # filter out feature vectors which have class c
-            class_features = torch.index_select(context_features, 0, extract_class_indices(context_labels, c))
-
-            # replicate the class features x target_set_size
-            class_keys = torch.unsqueeze(class_features, dim=0)
-            class_keys = class_keys.repeat(target_set_size, 1, 1)
-
-            # unsqueeze targets at dim = 1
-            class_queries = target_features.unsqueeze(1)
-
-            class_prototype, attn_weights = self.cross_attention(keys=class_keys, queries=class_queries, values=class_keys)
     
-            class_representations.append(class_prototype.squeeze())
-            attention_weights.append(attn_weights)
-
-        return torch.stack(class_representations), attention_weights
 
     def get_feature_extractor_params(self):
         return self.feature_extractor_params
