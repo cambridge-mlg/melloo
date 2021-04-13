@@ -1,6 +1,6 @@
 ulimit -n 50000
 export PYTHONPATH=.
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=4
 
 
 python3 ./learners/protonets_attention/src/main.py \
@@ -14,5 +14,6 @@ python3 ./learners/protonets_attention/src/main.py \
     --feature_adaptation film \
     --max_support_test 50 \
     --max_way_test 5 \
-    --dataset meta-dataset_ilsvrc_only 
+    --dataset meta-dataset_ilsvrc_only \    
+    --l2_regularize_classifier True 
 
