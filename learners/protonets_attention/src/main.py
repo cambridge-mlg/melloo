@@ -248,10 +248,17 @@ class Learner:
             for _ in range(NUM_TEST_TASKS):
                 task_dict = self.dataset.get_test_task(item)
                 context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
-                target_logits = self.model(context_images, context_labels, target_images, target_labels,
-                                           MetaLearningState.META_TEST)
+                # Do the forward pass with the target set so that we can get the feature embeddings
+                with torch.no_grad():
+                    self.model(context_images, context_labels, target_images, target_labels,
+                                               MetaLearningState.META_TEST)
+                                               
+                context_features, target_features, attention_weights = self.model.context_features, self.model.target_features, self.model.attention_weights
                 
-                task_loss = self.loss(target_logits, target_labels)
+                # Now do the forward pass with the context set for the representer points:
+                context_logits = self.model(context_images, context_labels, context_images, context_labels,
+                                           MetaLearningState.META_TEST)
+                task_loss = self.loss(context_logits, context_labels)
                 regularization_term = (self.model.feature_adaptation_network.regularization_term())
                 regularizer_scaling = 0.001
                 task_loss += regularizer_scaling * regularization_term
@@ -259,14 +266,14 @@ class Learner:
                 if self.args.l2_regularize_classifier:
                     classifier_regularization_term = self.model.classifer_regularization_term()
                     task_loss += self.args.l2_lambda * classifier_regularization_term
-                torch.autograd.grad(task_loss, self.model.context_features, retain_graph=True)
-                                           
-                                           
-                accuracy = self.accuracy_fn(target_logits, target_labels)
-                accuracies.append(accuracy.item())
-
-                context_features, target_features, attention_weights = self.model.context_features, self.model.target_features, self.model.attention_weights
+                    
+                # Representer values calculation    
+                dl_dphi = torch.autograd.grad(task_loss, context_logits, retain_graph=True)
+                alphas = dl_dphi/(-2.0 * self.args.l2_lambda * float(len(context_labels)))
                 
+                representer_values = alphas * (context_features.transpose() * target_features)
+                
+                # Attention weights
                 weights_per_context_point = torch.zeros((len(target_labels), len(context_labels)), device=self.device)
                 for c in torch.unique(context_labels):
                     c_indices = extract_class_indices(context_labels, c)
