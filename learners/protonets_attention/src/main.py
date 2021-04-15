@@ -190,7 +190,7 @@ class Learner:
         if self.args.mode == 'test':
             self.test(self.args.test_model_path)
 
-    def get_from_gpu(value):
+    def get_from_gpu(self, value):
         if self.use_two_gpus():
             return value.cuda(0)
         else:
