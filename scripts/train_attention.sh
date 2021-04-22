@@ -1,6 +1,6 @@
 ulimit -n 50000
 export PYTHONPATH=.
-export CUDA_VISIBLE_DEVICES=4
+export CUDA_VISIBLE_DEVICES=5
 
 
 python3 ./learners/protonets_attention/src/main.py \

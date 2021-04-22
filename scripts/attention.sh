@@ -8,7 +8,7 @@ python3 ./learners/protonets_attention/src/main.py \
     --mode test \
     --test_datasets ilsvrc_2012 \
     --data_path /scratch/jfb54/tf-meta-dataset/records \
-    --test_model_path /scratch/etv21/protonets_attention/checkpoints_1/fully_trained.pt \
+    --test_model_path /scratch/etv21/protonets_attention/checkpoints_l2/fully_trained.pt \
     --pretrained_resnet_path learners/protonets_attention/models/pretrained_resnet.pt.tar \
     --batch_normalization basic \
     --feature_adaptation film \

@@ -246,6 +246,7 @@ class Learner:
             accuracies = []
             protonets_accuracies = []
             for _ in range(NUM_TEST_TASKS):
+                import pdb; pdb.set_trace()
                 task_dict = self.dataset.get_test_task(item)
                 context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
                 # Do the forward pass with the target set so that we can get the feature embeddings
@@ -268,10 +269,11 @@ class Learner:
                     task_loss += self.args.l2_lambda * classifier_regularization_term
                     
                 # Representer values calculation    
-                dl_dphi = torch.autograd.grad(task_loss, context_logits, retain_graph=True)
+                dl_dphi = torch.autograd.grad(task_loss, context_logits, retain_graph=True)[0]
                 alphas = dl_dphi/(-2.0 * self.args.l2_lambda * float(len(context_labels)))
                 
-                representer_values = alphas * (context_features.transpose() * target_features)
+                import pdb; pdb.set_trace()
+                representer_values = torch.matmul(alphas.transpose(1,0), torch.matmul(context_features, target_features.transpose(1,0)))
                 
                 # Attention weights
                 weights_per_context_point = torch.zeros((len(target_labels), len(context_labels)), device=self.device)
@@ -311,7 +313,7 @@ class Learner:
 
             context_images = context_images.to(self.device)
             target_images = target_images.to(self.device)
-            context_labels = context_labels.to(self.device)
+            context_labels = context_labels.type(torch.LongTensor).to(self.device)
             target_labels = target_labels.type(torch.LongTensor).to(self.device)
 
             return context_images, target_images, context_labels, target_labels
