@@ -303,12 +303,12 @@ class Learner:
                 representer_abs_sum = representers.abs().sum(dim=0).transpose(1,0).cpu()
                 import pdb; pdb.set_trace()
                 
-                ave_corr, ave_num_intersected = compare_rankings(weights_per_query_point, representer_per_query_point, "Attention vs Representer")
-                ave_corr_mag, ave_num_intersected_mag = compare_rankings(rankings_attention_abs, rankings_representer, "Attention vs Representer", abs=True)
-                ave_corr_s, ave_num_intersected_s = compare_rankings(rankings_attention, representer_summed, "Attention vs Representer Summed")
-                ave_corr_mag_s, ave_num_intersected_mag_s = compare_rankings(rankings_attention_abs, representer_summed, "Attention vs Representer Summed", abs=True)
-                ave_corr_abs_s, ave_num_intersected_abs_s = compare_rankings(rankings_attention, representer_abs_sum, "Attention vs Representer Sum Abs")
-                ave_corr_mag_abs_s, ave_num_intersected_mag_abs_s = compare_rankings(rankings_attention_abs, representer_abs_sum, "Attention vs Representer Sum Abs", abs=True)
+                ave_corr, ave_num_intersected = self.compare_rankings(weights_per_query_point, representer_per_query_point, "Attention vs Representer")
+                ave_corr_mag, ave_num_intersected_mag = self.compare_rankings(rankings_attention_abs, rankings_representer, "Attention vs Representer", abs=True)
+                ave_corr_s, ave_num_intersected_s = self.compare_rankings(rankings_attention, representer_summed, "Attention vs Representer Summed")
+                ave_corr_mag_s, ave_num_intersected_mag_s = self.compare_rankings(rankings_attention_abs, representer_summed, "Attention vs Representer Summed", abs=True)
+                ave_corr_abs_s, ave_num_intersected_abs_s = self.compare_rankings(rankings_attention, representer_abs_sum, "Attention vs Representer Sum Abs")
+                ave_corr_mag_abs_s, ave_num_intersected_mag_abs_s = self.compare_rankings(rankings_attention_abs, representer_abs_sum, "Attention vs Representer Sum Abs", abs=True)
                 
             del target_logits
 
