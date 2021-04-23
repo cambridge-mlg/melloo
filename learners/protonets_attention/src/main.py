@@ -258,7 +258,7 @@ class Learner:
                 # Make a copy of the attention weights and the target features, otherwise we get a reference to what the model is storing
                 # (and we're about to send another task through it, so that's not what we want)
                 context_features, target_features, attention_weights = self.model.context_features, self.model.target_features.clone(), self.model.attention_weights
-                weights_per_query_point = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels))
+                weights_per_query_point = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
                 
                 # Now do the forward pass with the context set for the representer points:
                 context_logits = self.model(context_images, context_labels, context_images, context_labels,
@@ -280,6 +280,8 @@ class Learner:
                 feature_prod = torch.matmul(context_features, target_features.transpose(1,0))
 
                 kernels_by_class = []
+                kernels_sum_abs = []
+                kernels_sum = []
                 for k in range(alphas.shape[1]):
                     alphas_k = alphas_t[k]
                     tmp_mat = alphas_k.unsqueeze(1).expand(len(context_labels), len(target_labels))
@@ -287,40 +289,63 @@ class Learner:
                     kernels_by_class.append(kernels_k.unsqueeze(0))
 
                 representers = torch.cat(kernels_by_class, dim=0)
-                import pdb; pdb.set_trace()
                 
-                representer_value_by_class = []
+                representer_tmp = []
                 for c in torch.unique(context_labels):
                     c_indices = extract_class_indices(context_labels, c)
                     for i in c_indices:    
-                        representer_value_by_class.append(representers[c][i])
-                representer_per_query_point = torch.stack(representer_value_by_class).transpose(1,0)
+                        representer_tmp.append(representers[c][i])
+                representer_per_query_point = torch.stack(representer_tmp).transpose(1,0)
                 representer_approx = torch.matmul(alphas.transpose(1,0), torch.matmul(context_features, target_features.transpose(1,0)))
+                representer_per_query_point = representer_per_query_point.cpu()
                 
+                representer_summed = representers.sum(dim=0).transpose(1,0).cpu()
+                representer_abs_sum = representers.abs().sum(dim=0).transpose(1,0).cpu()
                 import pdb; pdb.set_trace()
-
-                rankings_representer = torch.argsort(representer_per_query_point, dim=1, descending=True).cpu()
-                rankings_attention = torch.argsort(weights_per_query_point, dim=1, descending=True).cpu()
-                corr_sum = 0.0
-                num_intersected_sum = 0.0
-                for t in range(len(target_labels)):
-                    # Calculate rankings of context points for this target point
-                    corr, p_value = kendalltau(rankings_representer[t], rankings_attention[t])
-                    corr_sum = corr_sum + corr
-                    # Top 10 overlap
-                    rep_top_10 = set(np.array(rankings_representer[t][1:10]))
-                    att_top_10 = set(np.array(rankings_attention[t][1:10]))
-                    intersected = sorted(rep_top_10 & att_top_10)
-                    num_intersected_sum =  num_intersected_sum + len(intersected)
-
-                print("Ave num intersected: {}".format(num_intersected_sum/float(len(target_labels))))
-                print("Ave corr: {}".format(corr_sum/float(len(target_labels))))
+                
+                ave_corr, ave_num_intersected = compare_rankings(weights_per_query_point, representer_per_query_point, "Attention vs Representer")
+                ave_corr_mag, ave_num_intersected_mag = compare_rankings(rankings_attention_abs, rankings_representer, "Attention vs Representer", abs=True)
+                ave_corr_s, ave_num_intersected_s = compare_rankings(rankings_attention, representer_summed, "Attention vs Representer Summed")
+                ave_corr_mag_s, ave_num_intersected_mag_s = compare_rankings(rankings_attention_abs, representer_summed, "Attention vs Representer Summed", abs=True)
+                ave_corr_abs_s, ave_num_intersected_abs_s = compare_rankings(rankings_attention, representer_abs_sum, "Attention vs Representer Sum Abs")
+                ave_corr_mag_abs_s, ave_num_intersected_mag_abs_s = compare_rankings(rankings_attention_abs, representer_abs_sum, "Attention vs Representer Sum Abs", abs=True)
+                
             del target_logits
 
             accuracy = np.array(accuracies).mean() * 100.0
             accuracy_confidence = (196.0 * np.array(accuracies).std()) / np.sqrt(len(accuracies))
 
             self.logger.print_and_log('{0:}: {1:3.1f}+/-{2:2.1f}'.format(item, accuracy, accuracy_confidence))
+
+    def compare_rankings(self, series1, series2, descriptor="", abs=False):
+        assert ranking1.shape == ranking2.shape
+        if abs:
+            s1, s2 = np.abs(series1), np.abs(series2)
+            descriptor = descriptor + " (Mag)"
+        else:
+            s1, s2 = series1, series2
+        ranking1 = torch.argsort(series1, dim=1, descending=True)
+        ranking2 = torch.argsort(series2, dim=1, descending=True)
+        
+        ave_corr = 0.0
+        ave_intersected = 0.0
+        
+        for t in range(ranking1.shape[0]):
+            corr, p_value = kendalltau(ranking1[t], ranking2[t])
+            ave_corr = ave_corr + corr
+            
+            top_10_1 = set(np.array(ranking1[t][1:10]))
+            top_10_2 = set(np.array(ranking2[t][1:10]))
+            intersected = sorted(top_10_1 & top_10_2)
+            ave_intersected =  ave_intersected + len(intersected)
+            
+        ave_corr = ave_corr/ranking1.shape[0]
+        ave_intersected = ave_intersected/ranking1.shape[0]
+        
+        print("Ave num intersected {}: {}".format(descriptor, ave_intersected))
+        print("Ave corr {}: {}".format(descriptor, ave_intersected))
+        
+        return ave_corr, ave_intersected
 
     def reshape_attention_weights(self, attention_weights, context_labels, num_target_points):
         weights_per_query_point = torch.zeros((num_target_points, len(context_labels)), device=self.device)
