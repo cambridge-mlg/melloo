@@ -9,6 +9,7 @@ from utils import Logger, LogFiles, ValidationAccuracies, cross_entropy_loss, ca
 from model import FewShotClassifier
 from normalization_layers import TaskNormI
 from dataset import get_dataset_reader
+from scipy.stats import kendalltau
 
 NUM_VALIDATION_TASKS = 200
 NUM_TEST_TASKS = 600
@@ -246,15 +247,18 @@ class Learner:
             accuracies = []
             protonets_accuracies = []
             for _ in range(NUM_TEST_TASKS):
-                import pdb; pdb.set_trace()
                 task_dict = self.dataset.get_test_task(item)
                 context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
                 # Do the forward pass with the target set so that we can get the feature embeddings
                 with torch.no_grad():
-                    self.model(context_images, context_labels, target_images, target_labels,
+                    target_logits = self.model(context_images, context_labels, target_images, target_labels,
                                                MetaLearningState.META_TEST)
                                                
-                context_features, target_features, attention_weights = self.model.context_features, self.model.target_features, self.model.attention_weights
+                import pdb; pdb.set_trace()
+                # Make a copy of the attention weights and the target features, otherwise we get a reference to what the model is storing
+                # (and we're about to send another task through it, so that's not what we want)
+                context_features, target_features, attention_weights = self.model.context_features, self.model.target_features.clone(), self.model.attention_weights
+                weights_per_query_point = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels))
                 
                 # Now do the forward pass with the context set for the representer points:
                 context_logits = self.model(context_images, context_labels, context_images, context_labels,
@@ -271,27 +275,62 @@ class Learner:
                 # Representer values calculation    
                 dl_dphi = torch.autograd.grad(task_loss, context_logits, retain_graph=True)[0]
                 alphas = dl_dphi/(-2.0 * self.args.l2_lambda * float(len(context_labels)))
+                alphas_t = alphas.transpose(1,0)
                 
+                feature_prod = torch.matmul(context_features, target_features.transpose(1,0))
+
+                kernels_by_class = []
+                for k in range(alphas.shape[1]):
+                    alphas_k = alphas_t[k]
+                    tmp_mat = alphas_k.unsqueeze(1).expand(len(context_labels), len(target_labels))
+                    kernels_k = tmp_mat * feature_prod
+                    kernels_by_class.append(kernels_k.unsqueeze(0))
+
+                representers = torch.cat(kernels_by_class, dim=0)
                 import pdb; pdb.set_trace()
-                representer_values = torch.matmul(alphas.transpose(1,0), torch.matmul(context_features, target_features.transpose(1,0)))
                 
-                # Attention weights
-                weights_per_context_point = torch.zeros((len(target_labels), len(context_labels)), device=self.device)
+                representer_value_by_class = []
                 for c in torch.unique(context_labels):
                     c_indices = extract_class_indices(context_labels, c)
-                    c_weights = attention_weights[c].squeeze()
-                    for q in range(c_weights.shape[0]):
-                        weights_per_context_point[q][c_indices] = c_weights[q]
+                    for i in c_indices:    
+                        representer_value_by_class.append(representers[c][i])
+                representer_per_query_point = torch.stack(representer_value_by_class).transpose(1,0)
+                representer_approx = torch.matmul(alphas.transpose(1,0), torch.matmul(context_features, target_features.transpose(1,0)))
+                
                 import pdb; pdb.set_trace()
 
-                rankings = torch.argsort(weights_per_context_point, dim=1, descending=True)
+                rankings_representer = torch.argsort(representer_per_query_point, dim=1, descending=True).cpu()
+                rankings_attention = torch.argsort(weights_per_query_point, dim=1, descending=True).cpu()
+                corr_sum = 0.0
+                num_intersected_sum = 0.0
+                for t in range(len(target_labels)):
+                    # Calculate rankings of context points for this target point
+                    corr, p_value = kendalltau(rankings_representer[t], rankings_attention[t])
+                    corr_sum = corr_sum + corr
+                    # Top 10 overlap
+                    rep_top_10 = set(np.array(rankings_representer[t][1:10]))
+                    att_top_10 = set(np.array(rankings_attention[t][1:10]))
+                    intersected = sorted(rep_top_10 & att_top_10)
+                    num_intersected_sum =  num_intersected_sum + len(intersected)
 
+                print("Ave num intersected: {}".format(num_intersected_sum/float(len(target_labels))))
+                print("Ave corr: {}".format(corr_sum/float(len(target_labels))))
             del target_logits
 
             accuracy = np.array(accuracies).mean() * 100.0
             accuracy_confidence = (196.0 * np.array(accuracies).std()) / np.sqrt(len(accuracies))
 
             self.logger.print_and_log('{0:}: {1:3.1f}+/-{2:2.1f}'.format(item, accuracy, accuracy_confidence))
+
+    def reshape_attention_weights(self, attention_weights, context_labels, num_target_points):
+        weights_per_query_point = torch.zeros((num_target_points, len(context_labels)), device=self.device)
+        for c in torch.unique(context_labels):
+            c_indices = extract_class_indices(context_labels, c)
+            c_weights = attention_weights[c].squeeze().clone()
+            for q in range(c_weights.shape[0]):
+                weights_per_query_point[q][c_indices] = c_weights[q]
+                
+        return weights_per_query_point
 
     def prepare_task(self, task_dict):
         if self.args.dataset_reader == "pytorch":
