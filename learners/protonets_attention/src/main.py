@@ -10,6 +10,7 @@ from model import FewShotClassifier
 from normalization_layers import TaskNormI
 from dataset import get_dataset_reader
 from scipy.stats import kendalltau
+import matplotlib.pyplot as plt
 
 NUM_VALIDATION_TASKS = 200
 NUM_TEST_TASKS = 600
@@ -303,12 +304,30 @@ class Learner:
                 representer_abs_sum = representers.abs().sum(dim=0).transpose(1,0).cpu()
                 import pdb; pdb.set_trace()
                 
+                plt.scatter(weights_per_query_point, representer_per_query_point)
+                plt.xlabel("attention weights")
+                plt.ylabel("representer weights")
+                plt.savefig(os.path.join(self.args.checkpoint_dir, "attention_vs_representer.png"))
+                plt.close()
+
+                plt.scatter(weights_per_query_point, representer_abs_sum)
+                plt.xlabel("attention weights")
+                plt.ylabel("representer weights (sum abs)")
+                plt.savefig(os.path.join(self.args.checkpoint_dir, "attention_vs_representer_sum_abs.png"))
+                plt.close()
+
+                plt.scatter(weights_per_query_point, representer_summed)
+                plt.xlabel("attention weights")
+                plt.ylabel("representer weights (sum)")
+                plt.savefig(os.path.join(self.args.checkpoint_dir, "attention_vs_representer_summed.png"))
+                plt.close()
+
                 ave_corr, ave_num_intersected = self.compare_rankings(weights_per_query_point, representer_per_query_point, "Attention vs Representer")
-                ave_corr_mag, ave_num_intersected_mag = self.compare_rankings(rankings_attention_abs, rankings_representer, "Attention vs Representer", abs=True)
-                ave_corr_s, ave_num_intersected_s = self.compare_rankings(rankings_attention, representer_summed, "Attention vs Representer Summed")
-                ave_corr_mag_s, ave_num_intersected_mag_s = self.compare_rankings(rankings_attention_abs, representer_summed, "Attention vs Representer Summed", abs=True)
-                ave_corr_abs_s, ave_num_intersected_abs_s = self.compare_rankings(rankings_attention, representer_abs_sum, "Attention vs Representer Sum Abs")
-                ave_corr_mag_abs_s, ave_num_intersected_mag_abs_s = self.compare_rankings(rankings_attention_abs, representer_abs_sum, "Attention vs Representer Sum Abs", abs=True)
+                ave_corr_mag, ave_num_intersected_mag = self.compare_rankings(weights_per_query_point, representer_per_query_point, "Attention vs Representer", abs=True)
+                ave_corr_s, ave_num_intersected_s = self.compare_rankings(weights_per_query_point, representer_summed, "Attention vs Representer Summed")
+                ave_corr_mag_s, ave_num_intersected_mag_s = self.compare_rankings(weights_per_query_point, representer_summed, "Attention vs Representer Summed", abs=True)
+                ave_corr_abs_s, ave_num_intersected_abs_s = self.compare_rankings(weights_per_query_point, representer_abs_sum, "Attention vs Representer Sum Abs")
+                ave_corr_mag_abs_s, ave_num_intersected_mag_abs_s = self.compare_rankings(weights_per_query_point, representer_abs_sum, "Attention vs Representer Sum Abs", abs=True)
                 
             del target_logits
 
@@ -318,7 +337,7 @@ class Learner:
             self.logger.print_and_log('{0:}: {1:3.1f}+/-{2:2.1f}'.format(item, accuracy, accuracy_confidence))
 
     def compare_rankings(self, series1, series2, descriptor="", abs=False):
-        assert ranking1.shape == ranking2.shape
+        assert series1.shape == series2.shape
         if abs:
             s1, s2 = np.abs(series1), np.abs(series2)
             descriptor = descriptor + " (Mag)"
@@ -342,8 +361,8 @@ class Learner:
         ave_corr = ave_corr/ranking1.shape[0]
         ave_intersected = ave_intersected/ranking1.shape[0]
         
-        print("Ave num intersected {}: {}".format(descriptor, ave_intersected))
-        print("Ave corr {}: {}".format(descriptor, ave_intersected))
+        self.logger.print_and_log("Ave num intersected {}: {}".format(descriptor, ave_intersected))
+        self.logger.print_and_log("Ave corr {}: {}".format(descriptor, ave_corr))
         
         return ave_corr, ave_intersected
 
