@@ -49,6 +49,8 @@ class Learner:
         if self.args.resume_from_checkpoint:
             self.load_checkpoint()
         self.optimizer.zero_grad()
+        # Not sure whether to use shot or max_support_test
+        self.top_k = min(self.args.top_k, self.args.shot)
 
     def init_model(self):
         use_two_gpus = self.use_two_gpus()
@@ -137,6 +139,14 @@ class Learner:
                             help="Value of lambda when doing L2 regularization on the classifier head")
         parser.add_argument("--l2_regularize_classifier", dest="l2_regularize_classifier", default=False,
                             action="store_true", help="If True, perform l2 regularization on the classifier head.")
+        parser.add_argument("--top_k", type=int, default=2, help="How many points to retain from each class")
+        parser.add_argument("--selection_mode", choices=["top_k", "multinomial"], default="top_k",
+                            help="How to select the candidates from the importance weights")
+        parser.add_argument("--importance_mode", choices=["attention", "loo", "representer", "all"], default="all",
+                            help="How to calculate candidate importance")
+        parser.add_argument("--kernel_agg", choices=["sum", "sum_abs", "class"], default="class",
+                            help="When using representer importance, how to aggregate kernel information")
+        
 
         args = parser.parse_args()
         return args
@@ -190,7 +200,7 @@ class Learner:
             self.test(self.log_files.best_validation_model_path)
 
         if self.args.mode == 'test':
-            self.test(self.args.test_model_path)
+            self.generate_coreset(self.args.test_model_path)
 
     def get_from_gpu(self, value):
         if self.use_two_gpus():
@@ -322,12 +332,12 @@ class Learner:
                 plt.savefig(os.path.join(self.args.checkpoint_dir, "attention_vs_representer_summed.png"))
                 plt.close()
 
-                ave_corr, ave_num_intersected = self.compare_rankings(weights_per_query_point, representer_per_query_point, "Attention vs Representer")
-                ave_corr_mag, ave_num_intersected_mag = self.compare_rankings(weights_per_query_point, representer_per_query_point, "Attention vs Representer", abs=True)
-                ave_corr_s, ave_num_intersected_s = self.compare_rankings(weights_per_query_point, representer_summed, "Attention vs Representer Summed")
-                ave_corr_mag_s, ave_num_intersected_mag_s = self.compare_rankings(weights_per_query_point, representer_summed, "Attention vs Representer Summed", abs=True)
-                ave_corr_abs_s, ave_num_intersected_abs_s = self.compare_rankings(weights_per_query_point, representer_abs_sum, "Attention vs Representer Sum Abs")
-                ave_corr_mag_abs_s, ave_num_intersected_mag_abs_s = self.compare_rankings(weights_per_query_point, representer_abs_sum, "Attention vs Representer Sum Abs", abs=True)
+                ave_corr, ave_num_intersected = self.compare_rankings(weights_per_query_point, representer_per_query_point, "Attention vs Representer", weights=True)
+                #ave_corr_mag, ave_num_intersected_mag = self.compare_rankings(weights_per_query_point, representer_per_query_point, "Attention vs Representer", weights=True)
+                ave_corr_s, ave_num_intersected_s = self.compare_rankings(weights_per_query_point, representer_summed, "Attention vs Representer Summed", weights=True)
+                #ave_corr_mag_s, ave_num_intersected_mag_s = self.compare_rankings(weights_per_query_point, representer_summed, "Attention vs Representer Summed", weights=True)
+                ave_corr_abs_s, ave_num_intersected_abs_s = self.compare_rankings(weights_per_query_point, representer_abs_sum, "Attention vs Representer Sum Abs", weights=True)
+                #ave_corr_mag_abs_s, ave_num_intersected_mag_abs_s = self.compare_rankings(weights_per_query_point, representer_abs_sum, "Attention vs Representer Sum Abs", weights=True)
                 
             del target_logits
 
@@ -336,16 +346,161 @@ class Learner:
 
             self.logger.print_and_log('{0:}: {1:3.1f}+/-{2:2.1f}'.format(item, accuracy, accuracy_confidence))
 
-    def compare_rankings(self, series1, series2, descriptor="", abs=False):
-        assert series1.shape == series2.shape
-        if abs:
-            s1, s2 = np.abs(series1), np.abs(series2)
-            descriptor = descriptor + " (Mag)"
-        else:
-            s1, s2 = series1, series2
-        ranking1 = torch.argsort(series1, dim=1, descending=True)
-        ranking2 = torch.argsort(series2, dim=1, descending=True)
+    def calculate_representer_values(self, context_images, context_labels, context_features, target_labels, target_features):
+        # Do the forward pass with the context set for the representer points:
+        context_logits = self.model(context_images, context_labels, context_images, context_labels, MetaLearningState.META_TEST)
+        task_loss = self.loss(context_logits, context_labels)
+        regularization_term = (self.model.feature_adaptation_network.regularization_term())
+        regularizer_scaling = 0.001
+        task_loss += regularizer_scaling * regularization_term
+
+        if self.args.l2_regularize_classifier:
+            classifier_regularization_term = self.model.classifer_regularization_term()
+            task_loss += self.args.l2_lambda * classifier_regularization_term
+            
+        # Representer values calculation    
+        dl_dphi = torch.autograd.grad(task_loss, context_logits, retain_graph=True)[0]
+        alphas = dl_dphi/(-2.0 * self.args.l2_lambda * float(len(context_labels)))
+        alphas_t = alphas.transpose(1,0)
+        feature_prod = torch.matmul(context_features, target_features.transpose(1,0))
         
+        kernels_agg = []
+        for k in range(alphas.shape[1]):
+            alphas_k = alphas_t[k]
+            tmp_mat = alphas_k.unsqueeze(1).expand(len(context_labels), len(target_labels))
+            kernels_k = tmp_mat * feature_prod
+            kernels_agg.append(kernels_k.unsqueeze(0))
+        representers = torch.cat(kernels_agg, dim=0)
+        
+        if self.args.kernel_agg == 'sum':
+            representers_agg = representers.sum(dim=0).transpose(1,0).cpu()
+        
+        elif self.args.kernel_agg == 'sum_abs':
+            representers_agg = representers.abs().sum(dim=0).transpose(1,0).cpu()
+        
+        elif self.args.kernel_agg == 'class':
+            representer_tmp = []
+            for c in torch.unique(context_labels):
+                c_indices = extract_class_indices(context_labels, c)
+                for i in c_indices:    
+                    representer_tmp.append(representers[c][i])
+            representers_agg = torch.stack(representer_tmp).transpose(1,0).cpu()
+            
+        else:
+            print("Unsupported kernel aggregation method specified")
+            return None
+        return representers_agg
+
+    def calculate_loo(self, context_images, context_labels, target_images, target_labels):
+        return np.rand(len(target_labels), len(context_labels))
+
+    def generate_coreset(self, path):
+        self.logger.print_and_log("")  # add a blank line
+        self.logger.print_and_log('Generating coreset using model {0:}: '.format(path))
+        self.model = self.init_model()
+        if path != 'None':
+            self.model.load_state_dict(torch.load(path))
+
+        for item in self.test_set:
+            accuracies_full = []
+            
+            if self.args.importance_mode == 'all':
+                ranking_modes = ['loo', 'attention', 'representer']
+                correlations = {'attention_representer':[], 'attention_loo': [], 'representer_loo': []}
+                intersections = {'attention_representer':[], 'attention_loo': [], 'representer_loo': []}
+            else:
+                ranking_modes = [self.args.importance_mode]
+                
+            for mode in ranking_modes:
+                accuracies[mode] = []
+            
+            
+            for _ in range(NUM_TEST_TASKS):
+                task_dict = self.dataset.get_test_task(item)
+                context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                import pdb; pdb.set_trace()
+                rankings = {}
+                
+                #Both attention and representer require a forward pass with the context and target set to access the attention weights/feature embeddings
+                # We also need to calculate the full task accuracy anyway
+                with torch.no_grad():
+                    target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    task_accuracy = self.accuracy_fn(target_logits, target_labels)
+                    accuracies_full.append(task_accuracy)
+                    del target_logits
+                
+                for mode in ranking_modes:
+                    if mode == 'loo':
+                        rankings['loo'] = calculate_loo()
+                    elif mode == 'attention' 
+                        # Make a copy of the attention weights otherwise we get a reference to what the model is storing
+                        attention_weights = self.model.attention_weights.clone()
+                        rankings['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
+                        
+                    elif mode == 'representer':
+                        # Make a copy of the target features, otherwise we get a reference to what the model is storing
+                        # (and we're about to send another task through it, so that's not what we want)
+                        context_features, target_features = self.model.context_features.clone(), self.model.target_features.clone()
+                        rankings['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
+                    rankings[mode] = torch.argsort(rankings[mode], dim=1, descending=True)
+                    
+                # Great, now we have the importance weights. Now what to do with them
+                if self.args.importance_mode == 'all':
+                    correlations['attention_representer'], intersections['attention_representer'] = compare_rankings(rankings['attention'], 
+                                rankings['representer'], "Attention vs Representer")
+                    correlations['attention_loo'], intersections['attention_representer'] = compare_rankings(rankings['attention'], 
+                                rankings['loo'], "Attention vs Meta-LOO")
+                    correlations['representer_loo'], intersections['attention_representer'] = compare_rankings(rankings['representer'], 
+                                rankings['loo'], "Representer vs Meta-LOO")
+                
+                for key in rankings.keys():
+                    if self.args.selection_mode == "top_k"
+                        candidate_indices = self.select_top_k(rankings[key], context_labels)
+                    elif self.args.selection_mode == "multinomial":
+                        candidate_indices = self.select_multinomial(rankings[key], context_labels)
+                    candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
+                    
+                    # Calculate accuracy on task using only selected candidates as context points
+                    with torch.no_grad():
+                        target_logits = self.model(candidate_images, candidate_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                        task_accuracy = self.accuracy_fn(target_logits, target_labels)
+                        accuracies[key].append(task_accuracy)
+                        
+                    # Save out the selected candidates (?)
+
+            self.print_and_log_metric(accuracies_full, item, 'Accuracy')
+            for key in rankings.keys():
+                self.print_and_log_metric(accuracies[key], item, 'Accuracy')
+            if self.args.importance_mode == 'all':
+                for key in correlations:
+                    self.print_and_log_metric(correlations[key], item, 'Correlation')
+                for key in intersections:
+                    self.print_and_log_metric(intersections[key], item, 'Intersections')
+
+    def select_top_k(self, ranking, class_labels):
+        return ranking[0:self.args.topk]
+
+    def select_multinomial(self, ranking, class_labels):
+        import pdb; pdb.set_trace()
+        
+        
+        return torch.multinomial(ranking, 2, replacement=False)
+
+
+    def print_and_log_metric(self, values, item, metric_name="Accuracy"):
+        metric = np.array(values).mean() * 100.0
+        metric_confidence = (196.0 * np.array(values).std()) / np.sqrt(len(values))
+
+        self.logger.print_and_log('{} {}: {:3.1f}+/-{:2.1f}'.format(metric_name, item, metric, metric_confidence))
+    
+
+    def compare_rankings(self, series1, series2, descriptor="", weights=False):
+        if weights:
+            ranking1 = torch.argsort(series1, dim=1, descending=True)
+            ranking2 = torch.argsort(series2, dim=1, descending=True)
+        else:
+            ranking1, ranking2 = series1, series2
+            
         ave_corr = 0.0
         ave_intersected = 0.0
         
@@ -353,16 +508,16 @@ class Learner:
             corr, p_value = kendalltau(ranking1[t], ranking2[t])
             ave_corr = ave_corr + corr
             
-            top_10_1 = set(np.array(ranking1[t][1:10]))
-            top_10_2 = set(np.array(ranking2[t][1:10]))
-            intersected = sorted(top_10_1 & top_10_2)
+            top_k_1 = set(np.array(ranking1[t][1:self.args.topk]))
+            top_k_2 = set(np.array(ranking2[t][1:self.args.topk]))
+            intersected = sorted(top_k_1 & top_k_2)
             ave_intersected =  ave_intersected + len(intersected)
             
         ave_corr = ave_corr/ranking1.shape[0]
         ave_intersected = ave_intersected/ranking1.shape[0]
         
-        self.logger.print_and_log("Ave num intersected {}: {}".format(descriptor, ave_intersected))
-        self.logger.print_and_log("Ave corr {}: {}".format(descriptor, ave_corr))
+        #self.logger.print_and_log("Ave num intersected {}: {}".format(descriptor, ave_intersected))
+        #self.logger.print_and_log("Ave corr {}: {}".format(descriptor, ave_corr))
         
         return ave_corr, ave_intersected
 
