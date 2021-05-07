@@ -13,8 +13,14 @@ from scipy.stats import kendalltau
 import matplotlib.pyplot as plt
 
 NUM_VALIDATION_TASKS = 200
-NUM_TEST_TASKS = 10
 PRINT_FREQUENCY = 1000
+
+def save_image(image_array, save_path):
+    image_array = image_array.squeeze()
+    image_array = image_array.transpose([1, 2, 0])
+    im = Image.fromarray(np.clip((image_array + 1.0) * 127.5 + 0.5, 0, 255).astype(np.uint8), mode='RGB')
+    im.save(save_path)
+    
 
 
 def main():
@@ -146,6 +152,7 @@ class Learner:
                             help="How to calculate candidate importance")
         parser.add_argument("--kernel_agg", choices=["sum", "sum_abs", "class"], default="class",
                             help="When using representer importance, how to aggregate kernel information")
+        parser.add_argument("--tasks", type=int, default=10, help="Number of test tasks to do")
         
 
         args = parser.parse_args()
@@ -257,7 +264,7 @@ class Learner:
         for item in self.test_set:
             accuracies = []
             protonets_accuracies = []
-            for _ in range(NUM_TEST_TASKS):
+            for _ in range(self.args.tasks):
                 task_dict = self.dataset.get_test_task(item)
                 context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
                 # Do the forward pass with the target set so that we can get the feature embeddings
@@ -390,8 +397,39 @@ class Learner:
             return None
         return representers_agg
 
-    def calculate_loo(self, context_images, context_labels, target_images, target_labels):
+    def calculate_loo(self,  context_images, context_labels, target_images, target_labels):
+        import pdb; pdb.set_trace()
+        loss_per_qp = torch.zeros((len(target_labels), len(context_labels)))
+        with torch.no_grad():
+            for i in range(context_images.shape[0]):
+                if i == 0:
+                    context_images_loo = context_images[i + 1:]
+                    context_labels_loo = context_labels[i + 1:]
+                else:
+                    context_images_loo = torch.cat((context_images[0:i], context_images[i + 1:]), 0)
+                    context_labels_loo = torch.cat((context_labels[0:i], context_labels[i + 1:]), 0)
+
+                logits = self.model(context_images_loo, context_labels_loo, target_images)
+                for t in range(len(target_labels)):
+                    loo_loss =  self.loss(logits[t], target_labels[t])
+                    loss_per_query[t][i] = loo_loss
+        #Somehow turn the loss into a weight:
+        weight_per_qp = 1.0 - loss_per_qp/loss_per_qp.max()
+        return loss_per_qp
+
+
+    def random_weights(self, context_images, context_labels, target_images, target_labels):
         return torch.tensor(np.random.rand(len(target_labels), len(context_labels)))
+
+    def save_image_set(self, task_num, images, descrip):
+        path = os.path.join(self.checkpoint_dir, str(task_num))
+        if not os.path.exists(path):
+            os.makedirs(path)
+            
+        for i in range(len(images)):
+            save_image(images.cpu().detach().numpy(), 
+                    os.path.join(path, '{}_index_{}.png'.format(descrip, index)))
+            
 
     def generate_coreset(self, path):
         self.logger.print_and_log("")  # add a blank line
@@ -404,9 +442,11 @@ class Learner:
             accuracies_full = []
             accuracies = {}
             if self.args.importance_mode == 'all':
-                ranking_modes = ['loo', 'attention', 'representer']
-                correlations = {'attention_representer':[], 'attention_loo': [], 'representer_loo': []}
-                intersections = {'attention_representer':[], 'attention_loo': [], 'representer_loo': []}
+                ranking_modes = ['loo', 'attention', 'representer', 'random']
+                correlations = {'attention_representer':[], 'attention_loo': [], 'representer_loo': [], 
+                                    'attention_random': [], 'loo_random': [], 'representer_random': []}
+                intersections = {'attention_representer':[], 'attention_loo': [], 'representer_loo': [], 
+                                    'attention_random': [], 'loo_random': [], 'representer_random': []}
             else:
                 ranking_modes = [self.args.importance_mode]
                 
@@ -414,13 +454,17 @@ class Learner:
                 accuracies[mode] = []
             
             
-            for _ in range(NUM_TEST_TASKS):
+            for ti in range(self.args.tasks):
                 task_dict = self.dataset.get_test_task(item)
                 context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
                 rankings_per_qp = {}
                 weights_per_qp = {}
                 rankings = {}
                 weights = {}
+                
+                if ti < 10:
+                    save_image_set(ti, context_images, "context")
+                    save_image_set(ti, target_images, "target")
                 
                 #Both attention and representer require a forward pass with the context and target set to access the attention weights/feature embeddings
                 # We also need to calculate the full task accuracy anyway
@@ -444,10 +488,13 @@ class Learner:
                         # (and we're about to send another task through it, so that's not what we want)
                         context_features, target_features = self.model.context_features.clone(), self.model.target_features.clone()
                         weights_per_qp['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
+                    elif mode == 'random_weights':
+                        weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
                     rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
                     # May want to normalize here:
                     weights[mode] = weights_per_qp[mode].sum(dim=0)
                     rankings[mode] = torch.argsort(weights[mode], descending=True)
+                    
                     
                 # Great, now we have the importance weights. Now what to do with them
                 if self.args.importance_mode == 'all':
@@ -460,6 +507,15 @@ class Learner:
                     corr, inters = self.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['loo'], "Representer vs Meta-LOO")
                     correlations['representer_loo'].append(corr) 
                     intersections['representer_loo'].append(inters)
+                    corr, inters = self.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['random'], "Attention vs Random")
+                    correlations['attention_random'].append(corr)
+                    intersections['attention_random'].append(inters)
+                    corr, inters = self.compare_rankings(rankings_per_qp['loo'], rankings_per_qp['random'], "Meta-LOO vs Random")
+                    correlations['loo_random'].append(corr)
+                    intersections['loo_random'].append(inters)
+                    corr, inters = self.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['random'], "Representer vs Random")
+                    correlations['representer_random'].append(corr) 
+                    intersections['representer_random'].append(inters)
                 
                 for key in rankings.keys():
                     if self.args.selection_mode == "top_k":
@@ -467,6 +523,9 @@ class Learner:
                     elif self.args.selection_mode == "multinomial":
                         candidate_indices = self.select_multinomial(weights[key], context_labels)
                     candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
+                    
+                    if ti < 10:
+                        save_image_set(ti, candidate_images, "{} ({})".format(key, self.args.selection_mode))
                     
                     # Calculate accuracy on task using only selected candidates as context points
                     with torch.no_grad():
@@ -476,7 +535,6 @@ class Learner:
                         
                     # Save out the selected candidates (?)
 
-            import pdb; pdb.set_trace()
             self.print_and_log_metric(accuracies_full, item, 'Accuracy')
             for key in rankings.keys():
                 self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
