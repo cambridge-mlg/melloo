@@ -11,6 +11,7 @@ from normalization_layers import TaskNormI
 from dataset import get_dataset_reader
 from scipy.stats import kendalltau
 import matplotlib.pyplot as plt
+from PIL import Image
 
 NUM_VALIDATION_TASKS = 200
 PRINT_FREQUENCY = 1000
@@ -398,7 +399,6 @@ class Learner:
         return representers_agg
 
     def calculate_loo(self,  context_images, context_labels, target_images, target_labels):
-        import pdb; pdb.set_trace()
         loss_per_qp = torch.zeros((len(target_labels), len(context_labels)))
         with torch.no_grad():
             for i in range(context_images.shape[0]):
@@ -409,10 +409,10 @@ class Learner:
                     context_images_loo = torch.cat((context_images[0:i], context_images[i + 1:]), 0)
                     context_labels_loo = torch.cat((context_labels[0:i], context_labels[i + 1:]), 0)
 
-                logits = self.model(context_images_loo, context_labels_loo, target_images)
+                logits = self.model(context_images_loo, context_labels_loo, target_images, target_labels, MetaLearningState.META_TEST)
                 for t in range(len(target_labels)):
-                    loo_loss =  self.loss(logits[t], target_labels[t])
-                    loss_per_query[t][i] = loo_loss
+                    loo_loss =  self.loss(logits[t].unsqueeze(0), target_labels[t].unsqueeze(0))
+                    loss_per_qp[t][i] = loo_loss
         #Somehow turn the loss into a weight:
         weight_per_qp = 1.0 - loss_per_qp/loss_per_qp.max()
         return loss_per_qp
@@ -422,13 +422,13 @@ class Learner:
         return torch.tensor(np.random.rand(len(target_labels), len(context_labels)))
 
     def save_image_set(self, task_num, images, descrip):
-        path = os.path.join(self.checkpoint_dir, str(task_num))
+        path = os.path.join(self.args.checkpoint_dir, str(task_num))
         if not os.path.exists(path):
             os.makedirs(path)
-            
+        tmp_images = images.cpu().detach().numpy()
         for i in range(len(images)):
-            save_image(images.cpu().detach().numpy(), 
-                    os.path.join(path, '{}_index_{}.png'.format(descrip, index)))
+            save_image(tmp_images[i], 
+                    os.path.join(path, '{}_index_{}.png'.format(descrip, i)))
             
 
     def generate_coreset(self, path):
@@ -454,7 +454,7 @@ class Learner:
                 accuracies[mode] = []
             
             
-            for ti in range(self.args.tasks):
+            for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
                 context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
                 rankings_per_qp = {}
@@ -463,11 +463,9 @@ class Learner:
                 weights = {}
                 
                 if ti < 10:
-                    save_image_set(ti, context_images, "context")
-                    save_image_set(ti, target_images, "target")
+                    self.save_image_set(ti, context_images, "context")
+                    self.save_image_set(ti, target_images, "target")
                 
-                #Both attention and representer require a forward pass with the context and target set to access the attention weights/feature embeddings
-                # We also need to calculate the full task accuracy anyway
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
@@ -480,15 +478,19 @@ class Learner:
                         weights_per_qp['loo'] = self.calculate_loo(context_images, context_labels, target_images, target_labels)
                     elif mode == 'attention':
                         # Make a copy of the attention weights otherwise we get a reference to what the model is storing
+                        with torch.no_grad():
+                            self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                         attention_weights = self.model.attention_weights.copy()
                         weights_per_qp['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
                         
                     elif mode == 'representer':
+                        with torch.no_grad():
+                            self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                         # Make a copy of the target features, otherwise we get a reference to what the model is storing
                         # (and we're about to send another task through it, so that's not what we want)
                         context_features, target_features = self.model.context_features.clone(), self.model.target_features.clone()
                         weights_per_qp['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
-                    elif mode == 'random_weights':
+                    elif mode == 'random':
                         weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
                     rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
                     # May want to normalize here:
@@ -525,7 +527,7 @@ class Learner:
                     candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
                     
                     if ti < 10:
-                        save_image_set(ti, candidate_images, "{} ({})".format(key, self.args.selection_mode))
+                        self.save_image_set(ti, candidate_images, "{} ({})".format(key, self.args.selection_mode))
                     
                     # Calculate accuracy on task using only selected candidates as context points
                     with torch.no_grad():

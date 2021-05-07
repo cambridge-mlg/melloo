@@ -22,5 +22,6 @@ python3 ./learners/protonets_attention/src/main.py \
     --top_k 2 \
     --selection_mode top_k \
     --importance_mode all \
-    --kernel_agg class 
+    --kernel_agg class  \
+    --tasks 200
 
