@@ -13,7 +13,7 @@ from scipy.stats import kendalltau
 import matplotlib.pyplot as plt
 
 NUM_VALIDATION_TASKS = 200
-NUM_TEST_TASKS = 600
+NUM_TEST_TASKS = 10
 PRINT_FREQUENCY = 1000
 
 
@@ -265,7 +265,6 @@ class Learner:
                     target_logits = self.model(context_images, context_labels, target_images, target_labels,
                                                MetaLearningState.META_TEST)
                                                
-                import pdb; pdb.set_trace()
                 # Make a copy of the attention weights and the target features, otherwise we get a reference to what the model is storing
                 # (and we're about to send another task through it, so that's not what we want)
                 context_features, target_features, attention_weights = self.model.context_features, self.model.target_features.clone(), self.model.attention_weights
@@ -392,7 +391,7 @@ class Learner:
         return representers_agg
 
     def calculate_loo(self, context_images, context_labels, target_images, target_labels):
-        return np.rand(len(target_labels), len(context_labels))
+        return torch.tensor(np.random.rand(len(target_labels), len(context_labels)))
 
     def generate_coreset(self, path):
         self.logger.print_and_log("")  # add a blank line
@@ -403,7 +402,7 @@ class Learner:
 
         for item in self.test_set:
             accuracies_full = []
-            
+            accuracies = {}
             if self.args.importance_mode == 'all':
                 ranking_modes = ['loo', 'attention', 'representer']
                 correlations = {'attention_representer':[], 'attention_loo': [], 'representer_loo': []}
@@ -418,73 +417,95 @@ class Learner:
             for _ in range(NUM_TEST_TASKS):
                 task_dict = self.dataset.get_test_task(item)
                 context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
-                import pdb; pdb.set_trace()
+                rankings_per_qp = {}
+                weights_per_qp = {}
                 rankings = {}
+                weights = {}
                 
                 #Both attention and representer require a forward pass with the context and target set to access the attention weights/feature embeddings
                 # We also need to calculate the full task accuracy anyway
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
-                    task_accuracy = self.accuracy_fn(target_logits, target_labels)
+                    task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                     accuracies_full.append(task_accuracy)
                     del target_logits
                 
                 for mode in ranking_modes:
+
                     if mode == 'loo':
-                        rankings['loo'] = calculate_loo()
-                    elif mode == 'attention' 
+                        weights_per_qp['loo'] = self.calculate_loo(context_images, context_labels, target_images, target_labels)
+                    elif mode == 'attention':
                         # Make a copy of the attention weights otherwise we get a reference to what the model is storing
-                        attention_weights = self.model.attention_weights.clone()
-                        rankings['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
+                        attention_weights = self.model.attention_weights.copy()
+                        weights_per_qp['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
                         
                     elif mode == 'representer':
                         # Make a copy of the target features, otherwise we get a reference to what the model is storing
                         # (and we're about to send another task through it, so that's not what we want)
                         context_features, target_features = self.model.context_features.clone(), self.model.target_features.clone()
-                        rankings['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
-                    rankings[mode] = torch.argsort(rankings[mode], dim=1, descending=True)
+                        weights_per_qp['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
+                    rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
+                    # May want to normalize here:
+                    weights[mode] = weights_per_qp[mode].sum(dim=0)
+                    rankings[mode] = torch.argsort(weights[mode], descending=True)
                     
                 # Great, now we have the importance weights. Now what to do with them
                 if self.args.importance_mode == 'all':
-                    correlations['attention_representer'], intersections['attention_representer'] = compare_rankings(rankings['attention'], 
-                                rankings['representer'], "Attention vs Representer")
-                    correlations['attention_loo'], intersections['attention_representer'] = compare_rankings(rankings['attention'], 
-                                rankings['loo'], "Attention vs Meta-LOO")
-                    correlations['representer_loo'], intersections['attention_representer'] = compare_rankings(rankings['representer'], 
-                                rankings['loo'], "Representer vs Meta-LOO")
+                    corr, inters = self.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['representer'], "Attention vs Representer")
+                    correlations['attention_representer'].append(corr)
+                    intersections['attention_representer'].append(inters)
+                    corr, inters = self.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['loo'], "Attention vs Meta-LOO")
+                    correlations['attention_loo'].append(corr)
+                    intersections['attention_loo'].append(inters)
+                    corr, inters = self.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['loo'], "Representer vs Meta-LOO")
+                    correlations['representer_loo'].append(corr) 
+                    intersections['representer_loo'].append(inters)
                 
                 for key in rankings.keys():
-                    if self.args.selection_mode == "top_k"
-                        candidate_indices = self.select_top_k(rankings[key], context_labels)
+                    if self.args.selection_mode == "top_k":
+                        candidate_indices = self.select_top_k(weights[key], context_labels)
                     elif self.args.selection_mode == "multinomial":
-                        candidate_indices = self.select_multinomial(rankings[key], context_labels)
+                        candidate_indices = self.select_multinomial(weights[key], context_labels)
                     candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
                     
                     # Calculate accuracy on task using only selected candidates as context points
                     with torch.no_grad():
                         target_logits = self.model(candidate_images, candidate_labels, target_images, target_labels, MetaLearningState.META_TEST)
-                        task_accuracy = self.accuracy_fn(target_logits, target_labels)
+                        task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                         accuracies[key].append(task_accuracy)
                         
                     # Save out the selected candidates (?)
 
+            import pdb; pdb.set_trace()
             self.print_and_log_metric(accuracies_full, item, 'Accuracy')
             for key in rankings.keys():
-                self.print_and_log_metric(accuracies[key], item, 'Accuracy')
+                self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
             if self.args.importance_mode == 'all':
                 for key in correlations:
-                    self.print_and_log_metric(correlations[key], item, 'Correlation')
+                    self.print_and_log_metric(correlations[key], item, 'Correlation {}'.format(key))
                 for key in intersections:
-                    self.print_and_log_metric(intersections[key], item, 'Intersections')
+                    self.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
 
-    def select_top_k(self, ranking, class_labels):
-        return ranking[0:self.args.topk]
+    def select_top_k(self, weights, class_labels):
+        classes = torch.unique(class_labels)
+        candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
+        for c in classes:
+            c_indices = extract_class_indices(class_labels, c)
+            sub_weights = weights[c_indices]
+            sub_ranking = torch.argsort(sub_weights, descending=True)
+            class_candidate_indices = c_indices[sub_ranking[0:self.top_k]]
+            candidate_indices[c] = class_candidate_indices
+        return candidate_indices.flatten()
 
-    def select_multinomial(self, ranking, class_labels):
-        import pdb; pdb.set_trace()
-        
-        
-        return torch.multinomial(ranking, 2, replacement=False)
+    def select_multinomial(self, weights, class_labels):
+        classes = torch.unique(class_labels)
+        candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
+        for c in classes:
+            c_indices = extract_class_indices(class_labels, c)
+            sub_weights = weights[c_indices]
+            class_candidate_indices = c_indices[torch.multinomial(sub_weights, self.top_k, replacement=False)]
+            candidate_indices[c] = class_candidate_indices
+        return candidate_indices.flatten()
 
 
     def print_and_log_metric(self, values, item, metric_name="Accuracy"):
@@ -508,8 +529,8 @@ class Learner:
             corr, p_value = kendalltau(ranking1[t], ranking2[t])
             ave_corr = ave_corr + corr
             
-            top_k_1 = set(np.array(ranking1[t][1:self.args.topk]))
-            top_k_2 = set(np.array(ranking2[t][1:self.args.topk]))
+            top_k_1 = set(np.array(ranking1[t][1:self.top_k]))
+            top_k_2 = set(np.array(ranking2[t][1:self.top_k]))
             intersected = sorted(top_k_1 & top_k_2)
             ave_intersected =  ave_intersected + len(intersected)
             

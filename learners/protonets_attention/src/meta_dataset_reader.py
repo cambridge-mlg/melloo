@@ -172,7 +172,7 @@ class SingleDatasetReader:
         self.image_size = image_size
         tf.compat.v1.disable_eager_execution()
         self.session = tf.compat.v1.Session()
-        gin.parse_config_file('./meta_dataset_config.gin')
+        gin.parse_config_file('learners/protonets_attention/src/meta_dataset_config.gin')
 
         fixed_way_shot_train = self._get_train_episode_description(num_ways=way, num_support=shot, num_query=query_train)
         fixed_way_shot_test = self._get_test_episode_description(num_ways=way, num_support=shot, num_query=query_test)

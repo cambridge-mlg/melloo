@@ -1,6 +1,6 @@
 ulimit -n 50000
 export PYTHONPATH=.
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 
 python3 ./learners/protonets_attention/src/main.py \
@@ -12,8 +12,15 @@ python3 ./learners/protonets_attention/src/main.py \
     --pretrained_resnet_path learners/protonets_attention/models/pretrained_resnet.pt.tar \
     --batch_normalization basic \
     --feature_adaptation film \
-    --max_support_test 50 \
+    --max_support_test 10 \
     --max_way_test 5 \
-    --dataset meta-dataset_ilsvrc_only \
-    --l2_regularize_classifier
+    --way 5 \
+    --shot 10 \
+    --query_test 10 \
+    --dataset ilsvrc_2012 \
+    --l2_regularize_classifier \
+    --top_k 2 \
+    --selection_mode top_k \
+    --importance_mode all \
+    --kernel_agg class 
 
