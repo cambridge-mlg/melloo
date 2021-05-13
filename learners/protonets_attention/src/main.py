@@ -319,7 +319,6 @@ class Learner:
                 
                 representer_summed = representers.sum(dim=0).transpose(1,0).cpu()
                 representer_abs_sum = representers.abs().sum(dim=0).transpose(1,0).cpu()
-                import pdb; pdb.set_trace()
                 
                 plt.scatter(weights_per_query_point, representer_per_query_point)
                 plt.xlabel("attention weights")
@@ -563,7 +562,8 @@ class Learner:
         for c in classes:
             c_indices = extract_class_indices(class_labels, c)
             sub_weights = weights[c_indices]
-            class_candidate_indices = c_indices[torch.multinomial(sub_weights, self.top_k, replacement=False)]
+            sub_weights_sm = torch.nn.functional.softmax(sub_weights, dim=0)
+            class_candidate_indices = c_indices[torch.multinomial(sub_weights_sm, self.top_k, replacement=False)]
             candidate_indices[c] = class_candidate_indices
         return candidate_indices.flatten()
 
