@@ -154,6 +154,8 @@ class Learner:
         parser.add_argument("--kernel_agg", choices=["sum", "sum_abs", "class"], default="class",
                             help="When using representer importance, how to aggregate kernel information")
         parser.add_argument("--tasks", type=int, default=10, help="Number of test tasks to do")
+        parser.add_argument("--select_per_class", dest="select_per_class", default=True,
+                            action="store_false", help="Whether or not to enforce constraint that coreset points should be spread across classes.")
         
 
         args = parser.parse_args()
@@ -428,8 +430,7 @@ class Learner:
         for i in range(len(images)):
             save_image(tmp_images[i], 
                     os.path.join(path, '{}_index_{}.png'.format(descrip, i)))
-            
-
+    
     def generate_coreset(self, path):
         self.logger.print_and_log("")  # add a blank line
         self.logger.print_and_log('Generating coreset using model {0:}: '.format(path))
@@ -527,11 +528,17 @@ class Learner:
                     
                     if ti < 10:
                         self.save_image_set(ti, candidate_images, "{} ({})".format(key, self.args.selection_mode))
+                        
+                    # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
+                    reduced_candidate_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(candidate_labels, target_images, target_labels)
+                    
                     
                     # Calculate accuracy on task using only selected candidates as context points
                     with torch.no_grad():
-                        target_logits = self.model(candidate_images, candidate_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                        target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
                         task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
+                        # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
+                        task_accuracy = (task_accuracy * len(reduced_target_labels) + (len(target_labels) - len(reduced_target_labels)))/float(len(target_labels))
                         accuracies[key].append(task_accuracy)
                         
                     # Save out the selected candidates (?)
@@ -545,27 +552,56 @@ class Learner:
                 for key in intersections:
                     self.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
 
-    def select_top_k(self, weights, class_labels):
-        classes = torch.unique(class_labels)
-        candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
+    def remove_unrepresented_points(self, candidate_labels, target_images, target_labels):
+        import pdb; pdb.set_trace()
+        classes = torch.unique(target_labels)
+        unrepresented = (set(classes)).difference(set(candidate_labels))
+        num_represented_classes = len(classes) - len(unrepresented)
+        reduced_indices = []
         for c in classes:
-            c_indices = extract_class_indices(class_labels, c)
-            sub_weights = weights[c_indices]
-            sub_ranking = torch.argsort(sub_weights, descending=True)
-            class_candidate_indices = c_indices[sub_ranking[0:self.top_k]]
-            candidate_indices[c] = class_candidate_indices
-        return candidate_indices.flatten()
+            if c in unrepresented:
+                continue
+            else:
+                reduced_indices.append(extract_class_indices(target_labels, c))
+        reduced_target_images = target_images[reduced_indices]
+        reduced_labels = (target_images[reduced_indices]).clone()
+        reduced_candidate_labels = candidate_labels.clone()
+        for unc in unrepresented_classes:
+            reduced_labels[reduced_labels > unc] = reduced_labels[reduced_labels > unc] - 1
+            reduced_candidate_labels[reduced_candidate_labels > unc] = reduced_candidate_labels[reduced_candidate_labels > unc] - 1
+        return reduced_target_images, reduced_labels, 
+        
 
+    def select_top_k(self, weights, class_labels):
+        if self.args.select_per_class = True:
+            classes = torch.unique(class_labels)
+            candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
+            for c in classes:
+                c_indices = extract_class_indices(class_labels, c)
+                sub_weights = weights[c_indices]
+                sub_ranking = torch.argsort(sub_weights, descending=True)
+                class_candidate_indices = c_indices[sub_ranking[0:self.top_k]]
+                candidate_indices[c] = class_candidate_indices
+            return candidate_indices.flatten()
+        else:
+            ranking = torch.argsort(weights, descending=True)
+            return ranking[0:self.top_k]
+            
+            
     def select_multinomial(self, weights, class_labels):
-        classes = torch.unique(class_labels)
-        candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
-        for c in classes:
-            c_indices = extract_class_indices(class_labels, c)
-            sub_weights = weights[c_indices]
-            sub_weights_sm = torch.nn.functional.softmax(sub_weights, dim=0)
-            class_candidate_indices = c_indices[torch.multinomial(sub_weights_sm, self.top_k, replacement=False)]
-            candidate_indices[c] = class_candidate_indices
-        return candidate_indices.flatten()
+        if self.args.select_per_class = True:
+            classes = torch.unique(class_labels)
+            candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
+            for c in classes:
+                c_indices = extract_class_indices(class_labels, c)
+                sub_weights = weights[c_indices]
+                sub_weights_sm = torch.nn.functional.softmax(sub_weights, dim=0)
+                class_candidate_indices = c_indices[torch.multinomial(sub_weights_sm, self.top_k, replacement=False)]
+                candidate_indices[c] = class_candidate_indices
+            return candidate_indices.flatten()
+        else:
+            weights_sm = torch.nn.functional.softmax(weights, dim=0)
+            return torch.multinomial(weights_sm, self.top_k, replacement=False)
 
 
     def print_and_log_metric(self, values, item, metric_name="Accuracy"):
