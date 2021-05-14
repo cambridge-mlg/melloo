@@ -9,9 +9,11 @@ from utils import Logger, LogFiles, ValidationAccuracies, cross_entropy_loss, ca
 from model import FewShotClassifier
 from normalization_layers import TaskNormI
 from dataset import get_dataset_reader
-from scipy.stats import kendalltau
 import matplotlib.pyplot as plt
 from PIL import Image
+
+from scipy.stats import kendalltau
+from sklearn.metrics.pairwise import rbf_kernel
 
 NUM_VALIDATION_TASKS = 200
 PRINT_FREQUENCY = 1000
@@ -151,7 +153,7 @@ class Learner:
         parser.add_argument("--l2_regularize_classifier", dest="l2_regularize_classifier", default=False,
                             action="store_true", help="If True, perform l2 regularization on the classifier head.")
         parser.add_argument("--top_k", type=int, default=2, help="How many points to retain from each class")
-        parser.add_argument("--selection_mode", choices=["top_k", "multinomial"], default="top_k",
+        parser.add_argument("--selection_mode", choices=["top_k", "multinomial", "divine"], default="top_k",
                             help="How to select the candidates from the importance weights")
         parser.add_argument("--importance_mode", choices=["attention", "loo", "representer", "all"], default="all",
                             help="How to calculate candidate importance")
@@ -476,6 +478,14 @@ class Learner:
                     accuracies_full.append(task_accuracy)
                     del target_logits
                 
+                # Save the target/context features
+                # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
+                with torch.no_grad():
+                    self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    # Make a copy of the target features, otherwise we get a reference to what the model is storing
+                    # (and we're about to send another task through it, so that's not what we want)
+                    context_features, target_features = self.model.context_features.clone(), self.model.target_features.clone()
+                
                 for mode in ranking_modes:
 
                     if mode == 'loo':
@@ -488,11 +498,6 @@ class Learner:
                         weights_per_qp['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
                         
                     elif mode == 'representer':
-                        with torch.no_grad():
-                            self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
-                        # Make a copy of the target features, otherwise we get a reference to what the model is storing
-                        # (and we're about to send another task through it, so that's not what we want)
-                        context_features, target_features = self.model.context_features.clone(), self.model.target_features.clone()
                         weights_per_qp['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
                     elif mode == 'random':
                         weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
@@ -528,6 +533,8 @@ class Learner:
                         candidate_indices = self.select_top_k(weights[key], context_labels)
                     elif self.args.selection_mode == "multinomial":
                         candidate_indices = self.select_multinomial(weights[key], context_labels)
+                    elif self.args.selection_mode == "divine":
+                        candidate_indices = self.select_top_sum_redun_k(weights[key], context_features)
                     candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
                     
                     if ti < 10:
@@ -557,6 +564,7 @@ class Learner:
                     self.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
 
     def remove_unrepresented_points(self, candidate_labels, target_images, target_labels):
+        import pdb; pdb.set_trace()
         classes = torch.unique(target_labels).cpu().numpy()
         unrepresented = (set(classes)).difference(set(candidate_labels.cpu().numpy()))
         num_represented_classes = len(classes) - len(unrepresented)
@@ -577,6 +585,38 @@ class Learner:
             reduced_candidate_labels[reduced_candidate_labels > unc] = reduced_candidate_labels[reduced_candidate_labels > unc] - 1
         return reduced_candidate_labels, reduced_target_images, reduced_labels
         
+    def select_top_sum_redun_k(weights, embeddings, k=self.top_k, gamma=10, plus_div=False):
+        """
+        Returns indices of k diverse points with highest importance; based on facility location
+        """
+        top_ind = torch.argsort(weights)[-1:][::-1][0]
+        selected_influence = weights[top_ind]
+        selected_data = [embeddings[top_ind]]
+        selected_indices = [top_ind]
+
+        kappa = np.sum(rbf_kernel(embeddings).sum(axis=1))
+        n = np.shape(weights)[0]
+        weights = np.array(weights)
+
+        while len(selected_indices) < k:
+            candidates = np.setdiff1d(range(n), selected_indices)
+            curr = np.sum(rbf_kernel(selected_data).sum(axis=1))
+            diversity_term = rbf_kernel(embeddings,selected_data).sum(axis=1)[candidates]
+            diversity_term = (kappa - (curr+diversity_term))
+            weights_term = selected_influence + weights[candidates]
+
+            if plus_div:
+                dist_term = pairwise_distances(embeddings,selected_data).sum(axis=1)[candidates]
+                objective_term = weights_term + gamma*diversity_term + dist_term
+            else:
+                objective_term = weights_term + gamma*diversity_term
+            
+            cand = candidates[np.argmax(objective_term)]
+            selected_influence += weights[cand]
+            selected_data += [embeddings[cand]]
+            selected_indices += [cand]
+        return selected_indices
+
 
     def select_top_k(self, weights, class_labels):
         if self.args.spread_constraint == "by_class":
