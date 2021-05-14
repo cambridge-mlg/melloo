@@ -57,7 +57,11 @@ class Learner:
             self.load_checkpoint()
         self.optimizer.zero_grad()
         # Not sure whether to use shot or max_support_test
-        self.top_k = min(self.args.top_k, self.args.shot)
+        if self.args.spread_constraint == "by_class":
+            assert self.args.top_k <= self.args.shot
+        else:
+            assert self.args.top_k <= self.args.shot * self.args.way
+        self.top_k = self.args.top_k
 
     def init_model(self):
         use_two_gpus = self.use_two_gpus()
@@ -154,8 +158,8 @@ class Learner:
         parser.add_argument("--kernel_agg", choices=["sum", "sum_abs", "class"], default="class",
                             help="When using representer importance, how to aggregate kernel information")
         parser.add_argument("--tasks", type=int, default=10, help="Number of test tasks to do")
-        parser.add_argument("--select_per_class", dest="select_per_class", default=True,
-                            action="store_false", help="Whether or not to enforce constraint that coreset points should be spread across classes.")
+        parser.add_argument("--spread_constraint", choices=["by_class", "none"], default="by_class",
+                            help="Spread coresets over classes (by_class) or no constraint (none)")
         
 
         args = parser.parse_args()
@@ -536,9 +540,9 @@ class Learner:
                     # Calculate accuracy on task using only selected candidates as context points
                     with torch.no_grad():
                         target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
-                        task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
+                        task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels).item()
                         # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
-                        task_accuracy = (task_accuracy * len(reduced_target_labels) + (len(target_labels) - len(reduced_target_labels)))/float(len(target_labels))
+                        task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels))
                         accuracies[key].append(task_accuracy)
                         
                     # Save out the selected candidates (?)
@@ -553,9 +557,8 @@ class Learner:
                     self.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
 
     def remove_unrepresented_points(self, candidate_labels, target_images, target_labels):
-        import pdb; pdb.set_trace()
-        classes = torch.unique(target_labels)
-        unrepresented = (set(classes)).difference(set(candidate_labels))
+        classes = torch.unique(target_labels).cpu().numpy()
+        unrepresented = (set(classes)).difference(set(candidate_labels.cpu().numpy()))
         num_represented_classes = len(classes) - len(unrepresented)
         reduced_indices = []
         for c in classes:
@@ -563,17 +566,20 @@ class Learner:
                 continue
             else:
                 reduced_indices.append(extract_class_indices(target_labels, c))
+        reduced_indices = torch.stack(reduced_indices).flatten()
         reduced_target_images = target_images[reduced_indices]
-        reduced_labels = (target_images[reduced_indices]).clone()
+        reduced_labels = (target_labels[reduced_indices]).clone()
         reduced_candidate_labels = candidate_labels.clone()
+        unrepresented_classes = list(unrepresented)
+        unrepresented_classes.sort(reverse=True)
         for unc in unrepresented_classes:
             reduced_labels[reduced_labels > unc] = reduced_labels[reduced_labels > unc] - 1
             reduced_candidate_labels[reduced_candidate_labels > unc] = reduced_candidate_labels[reduced_candidate_labels > unc] - 1
-        return reduced_target_images, reduced_labels, 
+        return reduced_candidate_labels, reduced_target_images, reduced_labels
         
 
     def select_top_k(self, weights, class_labels):
-        if self.args.select_per_class = True:
+        if self.args.spread_constraint == "by_class":
             classes = torch.unique(class_labels)
             candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
             for c in classes:
@@ -583,13 +589,13 @@ class Learner:
                 class_candidate_indices = c_indices[sub_ranking[0:self.top_k]]
                 candidate_indices[c] = class_candidate_indices
             return candidate_indices.flatten()
-        else:
+        elif self.args.spread_constraint == "none":
             ranking = torch.argsort(weights, descending=True)
             return ranking[0:self.top_k]
             
             
     def select_multinomial(self, weights, class_labels):
-        if self.args.select_per_class = True:
+        if self.args.spread_constraint == "by_class":
             classes = torch.unique(class_labels)
             candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
             for c in classes:
@@ -599,7 +605,7 @@ class Learner:
                 class_candidate_indices = c_indices[torch.multinomial(sub_weights_sm, self.top_k, replacement=False)]
                 candidate_indices[c] = class_candidate_indices
             return candidate_indices.flatten()
-        else:
+        elif self.args.spread_constraint == "none":
             weights_sm = torch.nn.functional.softmax(weights, dim=0)
             return torch.multinomial(weights_sm, self.top_k, replacement=False)
 
