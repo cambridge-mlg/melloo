@@ -7,6 +7,7 @@ python3 ./learners/protonets_attention/src/main.py \
     --classifier protonets_attention \
     --mode test \
     --test_datasets ilsvrc_2012 \
+    --checkpoint /scratches/stroustrup/etv21/debug \
     --data_path /scratches/stroustrup/jfb54/tf-meta-dataset/records \
     --test_model_path /scratches/stroustrup/etv21/protonets_attention/checkpoints_l2/fully_trained.pt \
     --pretrained_resnet_path learners/protonets_attention/models/pretrained_resnet.pt.tar \
@@ -20,8 +21,9 @@ python3 ./learners/protonets_attention/src/main.py \
     --dataset ilsvrc_2012 \
     --l2_regularize_classifier \
     --top_k 2 \
-    --selection_mode top_k \
+    --selection_mode divine \
     --importance_mode all \
     --kernel_agg class  \
-    --tasks 200
+    --tasks 200 \
+    --spread_constraint none 
 

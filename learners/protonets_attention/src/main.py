@@ -564,7 +564,6 @@ class Learner:
                     self.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
 
     def remove_unrepresented_points(self, candidate_labels, target_images, target_labels):
-        import pdb; pdb.set_trace()
         classes = torch.unique(target_labels).cpu().numpy()
         unrepresented = (set(classes)).difference(set(candidate_labels.cpu().numpy()))
         num_represented_classes = len(classes) - len(unrepresented)
@@ -585,28 +584,31 @@ class Learner:
             reduced_candidate_labels[reduced_candidate_labels > unc] = reduced_candidate_labels[reduced_candidate_labels > unc] - 1
         return reduced_candidate_labels, reduced_target_images, reduced_labels
         
-    def select_top_sum_redun_k(weights, embeddings, k=self.top_k, gamma=10, plus_div=False):
+    def select_top_sum_redun_k(self, weights, embeddings, k=None, gamma=10, plus_div=False):
         """
         Returns indices of k diverse points with highest importance; based on facility location
         """
-        top_ind = torch.argsort(weights)[-1:][::-1][0]
+        if k == None:
+            k = self.top_k
+        top_ind = torch.argsort(weights, descending=True)[0]
         selected_influence = weights[top_ind]
         selected_data = [embeddings[top_ind]]
-        selected_indices = [top_ind]
+        selected_indices = [top_ind.item()]
 
-        kappa = np.sum(rbf_kernel(embeddings).sum(axis=1))
+        kappa = np.sum(rbf_kernel(embeddings.cpu()).sum(axis=1))
         n = np.shape(weights)[0]
         weights = np.array(weights)
 
         while len(selected_indices) < k:
             candidates = np.setdiff1d(range(n), selected_indices)
-            curr = np.sum(rbf_kernel(selected_data).sum(axis=1))
-            diversity_term = rbf_kernel(embeddings,selected_data).sum(axis=1)[candidates]
+            selected_data_cpu = torch.stack(selected_data).cpu()
+            curr = np.sum(rbf_kernel(selected_data_cpu).sum(axis=1))
+            diversity_term = rbf_kernel(embeddings.cpu(), selected_data_cpu).sum(axis=1)[candidates]
             diversity_term = (kappa - (curr+diversity_term))
             weights_term = selected_influence + weights[candidates]
 
             if plus_div:
-                dist_term = pairwise_distances(embeddings,selected_data).sum(axis=1)[candidates]
+                dist_term = pairwise_distances(embeddings.cpu(),selected_data_cpu).sum(axis=1)[candidates]
                 objective_term = weights_term + gamma*diversity_term + dist_term
             else:
                 objective_term = weights_term + gamma*diversity_term

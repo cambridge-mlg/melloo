@@ -1,13 +1,12 @@
 ulimit -n 50000
 export PYTHONPATH=.
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
-# 1 2 3 4 5 10 15 20 25 30 40 50 15 20 25
-for i in 30 40 50
+for i in {1..10}
 do
-    mkdir /scratches/stroustrup/etv21/protonets_attention/no_restrict/vary_k_top/top_$i
+    mkdir /scratches/stroustrup/etv21/protonets_attention/restrict/vary_k_divine/div_$i
     python3 ./learners/protonets_attention/src/main.py \
-        --checkpoint_dir /scratches/stroustrup/etv21/protonets_attention/no_restrict/vary_k_top/top_$i \
+        --checkpoint_dir /scratches/stroustrup/etv21/protonets_attention/restrict/vary_k_divine/div_$i \
         --classifier protonets_attention \
         --mode test \
         --test_datasets ilsvrc_2012 \
@@ -24,9 +23,9 @@ do
         --dataset ilsvrc_2012 \
         --l2_regularize_classifier \
         --top_k $i \
-        --selection_mode top_k \
+        --selection_mode divine \
         --importance_mode all \
         --kernel_agg class  \
         --tasks 200 \
-        --spread_constraint none
+        --spread_constraint by_class
 done
