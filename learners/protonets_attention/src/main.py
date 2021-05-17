@@ -437,12 +437,35 @@ class Learner:
             save_image(tmp_images[i], 
                     os.path.join(path, '{}_index_{}.png'.format(descrip, i)))
     
+    def remove_unrepresented_points(self, candidate_labels, target_images, target_labels):
+        classes = torch.unique(target_labels).cpu().numpy()
+        unrepresented = (set(classes)).difference(set(candidate_labels.cpu().numpy()))
+        num_represented_classes = len(classes) - len(unrepresented)
+        reduced_indices = []
+        for c in classes:
+            if c in unrepresented:
+                continue
+            else:
+                reduced_indices.append(extract_class_indices(target_labels, c))
+        reduced_indices = torch.stack(reduced_indices).flatten()
+        reduced_target_images = target_images[reduced_indices]
+        reduced_labels = (target_labels[reduced_indices]).clone()
+        reduced_candidate_labels = candidate_labels.clone()
+        unrepresented_classes = list(unrepresented)
+        unrepresented_classes.sort(reverse=True)
+        for unc in unrepresented_classes:
+            reduced_labels[reduced_labels > unc] = reduced_labels[reduced_labels > unc] - 1
+            reduced_candidate_labels[reduced_candidate_labels > unc] = reduced_candidate_labels[reduced_candidate_labels > unc] - 1
+        return reduced_candidate_labels, reduced_target_images, reduced_labels
+    
     def generate_coreset(self, path):
         self.logger.print_and_log("")  # add a blank line
         self.logger.print_and_log('Generating coreset using model {0:}: '.format(path))
         self.model = self.init_model()
         if path != 'None':
             self.model.load_state_dict(torch.load(path))
+
+        gammas = [0,0.001,0.01,0.1,1,10,10000]
 
         for item in self.test_set:
             accuracies_full = []
@@ -457,7 +480,8 @@ class Learner:
                 ranking_modes = [self.args.importance_mode]
                 
             for mode in ranking_modes:
-                accuracies[mode] = []
+                for gamma in gammas:
+                    accuracies["{}_{}".format(mode, gamma)] = []
             
             
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
@@ -527,81 +551,55 @@ class Learner:
                     corr, inters = self.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['random'], "Representer vs Random")
                     correlations['representer_random'].append(corr) 
                     intersections['representer_random'].append(inters)
-                
-                for key in rankings.keys():
-                    if self.args.selection_mode == "top_k":
-                        candidate_indices = self.select_top_k(weights[key], context_labels)
-                    elif self.args.selection_mode == "multinomial":
-                        candidate_indices = self.select_multinomial(weights[key], context_labels)
-                    elif self.args.selection_mode == "divine":
-                        candidate_indices = self.select_divine(weights[key], context_features, context_labels, key)
-                    candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
                     
-                    if ti < 10:
-                        self.save_image_set(ti, candidate_images, "{} ({})".format(key, self.args.selection_mode))
+                for gamma in gammas:
+                    for key in rankings.keys():
+                        if self.args.selection_mode == "top_k":
+                            candidate_indices = self.select_top_k(weights[key], context_labels)
+                        elif self.args.selection_mode == "multinomial":
+                            candidate_indices = self.select_multinomial(weights[key], context_labels)
+                        elif self.args.selection_mode == "divine":
+                            candidate_indices = self.select_divine(weights[key], context_features, context_labels, gamma)
+                        candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
                         
-                    # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
-                    reduced_candidate_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(candidate_labels, target_images, target_labels)
-                    
-                    
-                    # Calculate accuracy on task using only selected candidates as context points
-                    with torch.no_grad():
-                        target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
-                        task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels).item()
-                        # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
-                        task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels))
-                        accuracies[key].append(task_accuracy)
+                        #if ti < 10:
+                        #    self.save_image_set(ti, candidate_images, "{} ({})".format(key, self.args.selection_mode))
+                            
+                        # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
+                        reduced_candidate_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(candidate_labels, target_images, target_labels)
                         
-                    # Save out the selected candidates (?)
+                        
+                        # Calculate accuracy on task using only selected candidates as context points
+                        with torch.no_grad():
+                            target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
+                            task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels).item()
+                            # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
+                            task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels))
+                            accuracies["{}_{}".format(key, gamma)].append(task_accuracy)
+                            
+                        # Save out the selected candidates (?)
 
             self.print_and_log_metric(accuracies_full, item, 'Accuracy')
-            for key in rankings.keys():
+            for key in accuracies.keys():
                 self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
             if self.args.importance_mode == 'all':
                 for key in correlations:
                     self.print_and_log_metric(correlations[key], item, 'Correlation {}'.format(key))
                 for key in intersections:
                     self.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
-
-    def remove_unrepresented_points(self, candidate_labels, target_images, target_labels):
-        classes = torch.unique(target_labels).cpu().numpy()
-        unrepresented = (set(classes)).difference(set(candidate_labels.cpu().numpy()))
-        num_represented_classes = len(classes) - len(unrepresented)
-        reduced_indices = []
-        for c in classes:
-            if c in unrepresented:
-                continue
-            else:
-                reduced_indices.append(extract_class_indices(target_labels, c))
-        reduced_indices = torch.stack(reduced_indices).flatten()
-        reduced_target_images = target_images[reduced_indices]
-        reduced_labels = (target_labels[reduced_indices]).clone()
-        reduced_candidate_labels = candidate_labels.clone()
-        unrepresented_classes = list(unrepresented)
-        unrepresented_classes.sort(reverse=True)
-        for unc in unrepresented_classes:
-            reduced_labels[reduced_labels > unc] = reduced_labels[reduced_labels > unc] - 1
-            reduced_candidate_labels[reduced_candidate_labels > unc] = reduced_candidate_labels[reduced_candidate_labels > unc] - 1
-        return reduced_candidate_labels, reduced_target_images, reduced_labels
         
-    def select_divine(self, weights, embeddings, class_labels, importance_weight_descrip):
+    def select_divine(self, weights, embeddings, class_labels, gamma):
         if self.args.spread_constraint == "by_class":
             classes = torch.unique(class_labels)
             candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
             for c in classes:
                 c_indices = extract_class_indices(class_labels, c)
-                indices, div_terms, weight_terms = self.select_top_sum_redun_k(weights[c_indices], embeddings[c_indices], k=self.top_k)
-                self.logger.log("{} (class {})\n".format(importance_weight_descrip, c))
-                self.logger.log("\tDiversity terms {}\n".format(div_terms))
-                self.logger.log("\tWeight terms {}\n".format(weight_terms))
+                indices = self.select_top_sum_redun_k(weights[c_indices], embeddings[c_indices], k=self.top_k, gamma=gamma)
                 class_candidate_indices = c_indices[indices]
                 candidate_indices[c] = class_candidate_indices
             return candidate_indices.flatten()
         elif self.args.spread_constraint == "none":
-            indices, div_terms, weight_terms =  self.select_top_sum_redun_k(weights, embeddings, k=self.top_k)
-            self.logger.log("{}\n".format(importance_weight_descrip))
-            self.logger.log("\tDiversity terms {}\n".format(div_terms))
-            self.logger.log("\tWeight terms {}\n".format(weight_terms))
+            indices =  self.select_top_sum_redun_k(weights, embeddings, k=self.top_k, gamma=gamma)
             return indices
         
     def select_top_sum_redun_k(self, weights, embeddings, k, gamma=10, plus_div=False):
