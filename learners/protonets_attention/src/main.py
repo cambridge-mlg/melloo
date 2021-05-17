@@ -534,7 +534,7 @@ class Learner:
                     elif self.args.selection_mode == "multinomial":
                         candidate_indices = self.select_multinomial(weights[key], context_labels)
                     elif self.args.selection_mode == "divine":
-                        candidate_indices = self.select_top_sum_redun_k(weights[key], context_features)
+                        candidate_indices = self.select_divine(weights[key], context_features, context_labels, key)
                     candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
                     
                     if ti < 10:
@@ -584,12 +584,30 @@ class Learner:
             reduced_candidate_labels[reduced_candidate_labels > unc] = reduced_candidate_labels[reduced_candidate_labels > unc] - 1
         return reduced_candidate_labels, reduced_target_images, reduced_labels
         
-    def select_top_sum_redun_k(self, weights, embeddings, k=None, gamma=10, plus_div=False):
+    def select_divine(self, weights, embeddings, class_labels, importance_weight_descrip):
+        if self.args.spread_constraint == "by_class":
+            classes = torch.unique(class_labels)
+            candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
+            for c in classes:
+                c_indices = extract_class_indices(class_labels, c)
+                indices, div_terms, weight_terms = self.select_top_sum_redun_k(weights[c_indices], embeddings[c_indices], k=self.top_k)
+                self.logger.log("{} (class {})\n".format(importance_weight_descrip, c))
+                self.logger.log("\tDiversity terms {}\n".format(div_terms))
+                self.logger.log("\tWeight terms {}\n".format(weight_terms))
+                class_candidate_indices = c_indices[indices]
+                candidate_indices[c] = class_candidate_indices
+            return candidate_indices.flatten()
+        elif self.args.spread_constraint == "none":
+            indices, div_terms, weight_terms =  self.select_top_sum_redun_k(weights, embeddings, k=self.top_k)
+            self.logger.log("{}\n".format(importance_weight_descrip))
+            self.logger.log("\tDiversity terms {}\n".format(div_terms))
+            self.logger.log("\tWeight terms {}\n".format(weight_terms))
+            return indices
+        
+    def select_top_sum_redun_k(self, weights, embeddings, k, gamma=10, plus_div=False):
         """
         Returns indices of k diverse points with highest importance; based on facility location
         """
-        if k == None:
-            k = self.top_k
         top_ind = torch.argsort(weights, descending=True)[0]
         selected_influence = weights[top_ind]
         selected_data = [embeddings[top_ind]]
@@ -598,7 +616,7 @@ class Learner:
         kappa = np.sum(rbf_kernel(embeddings.cpu()).sum(axis=1))
         n = np.shape(weights)[0]
         weights = np.array(weights)
-
+        diversity_terms, weight_terms = [], []
         while len(selected_indices) < k:
             candidates = np.setdiff1d(range(n), selected_indices)
             selected_data_cpu = torch.stack(selected_data).cpu()
@@ -606,6 +624,8 @@ class Learner:
             diversity_term = rbf_kernel(embeddings.cpu(), selected_data_cpu).sum(axis=1)[candidates]
             diversity_term = (kappa - (curr+diversity_term))
             weights_term = selected_influence + weights[candidates]
+            diversity_terms.append(diversity_term)
+            weight_terms.append(weights_term)
 
             if plus_div:
                 dist_term = pairwise_distances(embeddings.cpu(),selected_data_cpu).sum(axis=1)[candidates]
@@ -617,7 +637,7 @@ class Learner:
             selected_influence += weights[cand]
             selected_data += [embeddings[cand]]
             selected_indices += [cand]
-        return selected_indices
+        return selected_indices, weight_terms, diversity_terms
 
 
     def select_top_k(self, weights, class_labels):
