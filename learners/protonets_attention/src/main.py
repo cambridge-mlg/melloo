@@ -162,6 +162,8 @@ class Learner:
         parser.add_argument("--tasks", type=int, default=10, help="Number of test tasks to do")
         parser.add_argument("--spread_constraint", choices=["by_class", "none"], default="by_class",
                             help="Spread coresets over classes (by_class) or no constraint (none)")
+        parser.add_argument("--test_case", choices=["default", "bimodal", "noise", "unrelated"], default="default",
+                            help="Specifiy a specific test case to try. Currently only default and bimodal are implemented")
         
 
         args = parser.parse_args()
@@ -458,11 +460,22 @@ class Learner:
                 
             for mode in ranking_modes:
                 accuracies[mode] = []
-            
-            
+                
+            if self.args.test_case == "bimodal":
+                num_unique_labels = {}
+                for mode in ranking_modes:
+                    num_unique_labels[mode] = 0
+
+
+
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
                 context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                if self.args.test_case == "bimodal":
+                    context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
+                    context_labels = context_labels.floor_divide(2)
+                    target_labels = target_labels.floor_divide(2)
+
                 rankings_per_qp = {}
                 weights_per_qp = {}
                 rankings = {}
@@ -536,6 +549,9 @@ class Learner:
                     elif self.args.selection_mode == "divine":
                         candidate_indices = self.select_divine(weights[key], context_features, context_labels, key)
                     candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
+
+                    if self.args.test_case == "bimodal":
+                        num_unique_labels[key] = num_unique_labels[key] + len(context_labels_orig[candidate_indices].unique())
                     
                     if ti < 10:
                         self.save_image_set(ti, candidate_images, "{} ({})".format(key, self.args.selection_mode))
@@ -555,6 +571,10 @@ class Learner:
                     # Save out the selected candidates (?)
 
             self.print_and_log_metric(accuracies_full, item, 'Accuracy')
+            if self.args.test_case == "bimodal":
+                for key in num_unique_labels.keys():
+                    self.logger.print_and_log("Average number of unique labels ({}): {}".format(key, float(num_unique_labels[key])/float(self.args.tasks)))
+
             for key in rankings.keys():
                 self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
             if self.args.importance_mode == 'all':
@@ -591,20 +611,20 @@ class Learner:
             for c in classes:
                 c_indices = extract_class_indices(class_labels, c)
                 indices, div_terms, weight_terms = self.select_top_sum_redun_k(weights[c_indices], embeddings[c_indices], k=self.top_k)
-                self.logger.log("{} (class {})\n".format(importance_weight_descrip, c))
-                self.logger.log("\tDiversity terms {}\n".format(div_terms))
-                self.logger.log("\tWeight terms {}\n".format(weight_terms))
+                #self.logger.log("{} (class {})\n".format(importance_weight_descrip, c))
+                #self.logger.log("\tDiversity terms {}\n".format(div_terms))
+                #self.logger.log("\tWeight terms {}\n".format(weight_terms))
                 class_candidate_indices = c_indices[indices]
                 candidate_indices[c] = class_candidate_indices
             return candidate_indices.flatten()
         elif self.args.spread_constraint == "none":
             indices, div_terms, weight_terms =  self.select_top_sum_redun_k(weights, embeddings, k=self.top_k)
-            self.logger.log("{}\n".format(importance_weight_descrip))
-            self.logger.log("\tDiversity terms {}\n".format(div_terms))
-            self.logger.log("\tWeight terms {}\n".format(weight_terms))
+            #self.logger.log("{}\n".format(importance_weight_descrip))
+            #self.logger.log("\tDiversity terms {}\n".format(div_terms))
+            #self.logger.log("\tWeight terms {}\n".format(weight_terms))
             return indices
         
-    def select_top_sum_redun_k(self, weights, embeddings, k, gamma=10, plus_div=False):
+    def select_top_sum_redun_k(self, weights, embeddings, k, gamma=25, plus_div=False):
         """
         Returns indices of k diverse points with highest importance; based on facility location
         """
@@ -624,8 +644,8 @@ class Learner:
             diversity_term = rbf_kernel(embeddings.cpu(), selected_data_cpu).sum(axis=1)[candidates]
             diversity_term = (kappa - (curr+diversity_term))
             weights_term = selected_influence + weights[candidates]
-            diversity_terms.append(diversity_term)
-            weight_terms.append(weights_term)
+            diversity_terms.append((diversity_term.mean(), diversity_term.max(), diversity_term.min()))
+            weight_terms.append((weights_term.mean(), weights_term.max(), weights_term.min()))
 
             if plus_div:
                 dist_term = pairwise_distances(embeddings.cpu(),selected_data_cpu).sum(axis=1)[candidates]
