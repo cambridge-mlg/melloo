@@ -439,6 +439,27 @@ class Learner:
             save_image(tmp_images[i], 
                     os.path.join(path, '{}_index_{}.png'.format(descrip, i)))
     
+    def remove_unrepresented_points(self, candidate_labels, target_images, target_labels):
+        classes = torch.unique(target_labels).cpu().numpy()
+        unrepresented = (set(classes)).difference(set(candidate_labels.cpu().numpy()))
+        num_represented_classes = len(classes) - len(unrepresented)
+        reduced_indices = []
+        for c in classes:
+            if c in unrepresented:
+                continue
+            else:
+                reduced_indices.append(extract_class_indices(target_labels, c))
+        reduced_indices = torch.stack(reduced_indices).flatten()
+        reduced_target_images = target_images[reduced_indices]
+        reduced_labels = (target_labels[reduced_indices]).clone()
+        reduced_candidate_labels = candidate_labels.clone()
+        unrepresented_classes = list(unrepresented)
+        unrepresented_classes.sort(reverse=True)
+        for unc in unrepresented_classes:
+            reduced_labels[reduced_labels > unc] = reduced_labels[reduced_labels > unc] - 1
+            reduced_candidate_labels[reduced_candidate_labels > unc] = reduced_candidate_labels[reduced_candidate_labels > unc] - 1
+        return reduced_candidate_labels, reduced_target_images, reduced_labels
+    
     def generate_coreset(self, path):
         self.logger.print_and_log("")  # add a blank line
         self.logger.print_and_log('Generating coreset using model {0:}: '.format(path))
@@ -465,8 +486,6 @@ class Learner:
                 num_unique_labels = {}
                 for mode in ranking_modes:
                     num_unique_labels[mode] = 0
-
-
 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
@@ -553,22 +572,18 @@ class Learner:
                     if self.args.test_case == "bimodal":
                         num_unique_labels[key] = num_unique_labels[key] + len(context_labels_orig[candidate_indices].unique())
                     
-                    if ti < 10:
-                        self.save_image_set(ti, candidate_images, "{} ({})".format(key, self.args.selection_mode))
-                        
                     # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
                     reduced_candidate_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(candidate_labels, target_images, target_labels)
-                    
-                    
-                    # Calculate accuracy on task using only selected candidates as context points
+
+                        # Calculate accuracy on task using only selected candidates as context points
                     with torch.no_grad():
                         target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
                         task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels).item()
                         # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
                         task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels))
                         accuracies[key].append(task_accuracy)
-                        
-                    # Save out the selected candidates (?)
+                            
+                        # Save out the selected candidates (?)
 
             self.print_and_log_metric(accuracies_full, item, 'Accuracy')
             if self.args.test_case == "bimodal":
@@ -582,29 +597,8 @@ class Learner:
                     self.print_and_log_metric(correlations[key], item, 'Correlation {}'.format(key))
                 for key in intersections:
                     self.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
-
-    def remove_unrepresented_points(self, candidate_labels, target_images, target_labels):
-        classes = torch.unique(target_labels).cpu().numpy()
-        unrepresented = (set(classes)).difference(set(candidate_labels.cpu().numpy()))
-        num_represented_classes = len(classes) - len(unrepresented)
-        reduced_indices = []
-        for c in classes:
-            if c in unrepresented:
-                continue
-            else:
-                reduced_indices.append(extract_class_indices(target_labels, c))
-        reduced_indices = torch.stack(reduced_indices).flatten()
-        reduced_target_images = target_images[reduced_indices]
-        reduced_labels = (target_labels[reduced_indices]).clone()
-        reduced_candidate_labels = candidate_labels.clone()
-        unrepresented_classes = list(unrepresented)
-        unrepresented_classes.sort(reverse=True)
-        for unc in unrepresented_classes:
-            reduced_labels[reduced_labels > unc] = reduced_labels[reduced_labels > unc] - 1
-            reduced_candidate_labels[reduced_candidate_labels > unc] = reduced_candidate_labels[reduced_candidate_labels > unc] - 1
-        return reduced_candidate_labels, reduced_target_images, reduced_labels
         
-    def select_divine(self, weights, embeddings, class_labels, importance_weight_descrip):
+    def select_divine(self, weights, embeddings, class_labels, gamma):
         if self.args.spread_constraint == "by_class":
             classes = torch.unique(class_labels)
             candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
