@@ -11,6 +11,7 @@ from normalization_layers import TaskNormI
 from dataset import get_dataset_reader
 import matplotlib.pyplot as plt
 from PIL import Image
+import pickle
 
 from scipy.stats import kendalltau
 from sklearn.metrics.pairwise import rbf_kernel
@@ -24,6 +25,27 @@ def save_image(image_array, save_path):
     im = Image.fromarray(np.clip((image_array + 1.0) * 127.5 + 0.5, 0, 255).astype(np.uint8), mode='RGB')
     im.save(save_path)
     
+def add_image_ranking(image_ranking_dict, image_key, image, ranking_key, ranking):
+    if image_key not in image_ranking_dict.keys():
+       image_ranking_dict[image_key] = {}
+    if ranking_key not in image_ranking_dict[image_key].keys():
+        image_ranking_dict[image_key][ranking_key] = []
+    image_ranking_dict[image_key][ranking_key].append(ranking)
+    return image_ranking_dict
+    
+def weights_from_multirankings(image_ranking_dict, ranking_key):
+    agg_ranking = np.array(len(image_ranking_dict.keys()))
+    # For each image
+    for img_id in image_ranking_dict.keys():
+        agg_ranking[img_id] = image_ranking_dict[img_id][ranking_key].sum()
+    return agg_ranking
+            
+    
+def calc_image_ranking_stats(image_ranking_dict):
+    counts = [len(image_ranking_dict[k]) for k in image_ranking_dict.keys()]
+    # histogram the counts?
+    
+    # aggregate rankings for each image so we can select top
 
 
 def main():
@@ -103,7 +125,7 @@ class Learner:
 
         parser.add_argument("--dataset", choices=["meta-dataset", "meta-dataset_ilsvrc_only", "ilsvrc_2012", "omniglot", "aircraft", "cu_birds",
                                                   "dtd", "quickdraw", "fungi", "vgg_flower", "traffic_sign", "mscoco",
-                                                  "mnist", "cifar10", "cifar100"], default="meta-dataset",
+                                                  "mnist", "cifar10", "cifar100", "split-cifar10"], default="meta-dataset",
                             help="Dataset to use.")
         parser.add_argument("--dataset_reader", choices=["official", "pytorch"], default="official",
                             help="Dataset reader to use.")
@@ -458,7 +480,7 @@ class Learner:
         for unc in unrepresented_classes:
             reduced_labels[reduced_labels > unc] = reduced_labels[reduced_labels > unc] - 1
             reduced_candidate_labels[reduced_candidate_labels > unc] = reduced_candidate_labels[reduced_candidate_labels > unc] - 1
-        return reduced_candidate_labels, reduced_target_images, reduced_labels
+        return reduced_candidate_labels, reduced_target_images, reduced_labels  
     
     def generate_coreset(self, path):
         self.logger.print_and_log("")  # add a blank line
@@ -478,6 +500,9 @@ class Learner:
                                     'attention_random': [], 'loo_random': [], 'representer_random': []}
             else:
                 ranking_modes = [self.args.importance_mode]
+                
+            # A dictionary mapping an image id to a list of its rankings
+            image_rankings = {}
                 
             for mode in ranking_modes:
                 accuracies[mode] = []
@@ -537,7 +562,10 @@ class Learner:
                     # May want to normalize here:
                     weights[mode] = weights_per_qp[mode].sum(dim=0)
                     rankings[mode] = torch.argsort(weights[mode], descending=True)
-                    
+                    import pdb; pdb.set_trace()
+                    normalized_rankings = rankings[mode]/(rankings[mode].max() - rankings[mode].min())
+                    for i in range(len(context_images)):
+                        image_rankings = add_image_rankings(image_rankings, task_dict["context_ids"][i], context_images[i], mode, normalized_rankings[i])
                     
                 # Great, now we have the importance weights. Now what to do with them
                 if self.args.importance_mode == 'all':
@@ -584,6 +612,8 @@ class Learner:
                         accuracies[key].append(task_accuracy)
                             
                         # Save out the selected candidates (?)
+                        
+                print("Rankings dictionary has {} many images".format(len(image_rankings.keys())))
 
             self.print_and_log_metric(accuracies_full, item, 'Accuracy')
             if self.args.test_case == "bimodal":
@@ -597,6 +627,36 @@ class Learner:
                     self.print_and_log_metric(correlations[key], item, 'Correlation {}'.format(key))
                 for key in intersections:
                     self.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
+            
+            # Righty-oh, now that we have our image_rankings, we need to do something with them.
+            # Let's get some basic stats about them;
+            # Aggregate to get indices.
+            for key in rankings.keys():
+                weights = weights_from_multirankings(image_rankings, key)
+                candidate_indices = self.select_top_k(weights[key], context_labels) # Why does this need context_labels?
+                # Evaluate those indices:
+                eval_accuracies = []
+                for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
+                    task_dict = self.dataset.get_task_from_indices(candidate_indices)
+                    context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                    if self.args.test_case == "bimodal":
+                        context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
+                        context_labels = context_labels.floor_divide(2)
+                        target_labels = target_labels.floor_divide(2)
+                    
+                    if ti < 5:
+                        self.save_image_set(ti, context_images, "context")
+                        self.save_image_set(ti, target_images, "target")
+                    
+                    with torch.no_grad():
+                        target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                        task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
+                        eval_accuracies.append(task_accuracy)
+                        del target_logits
+                    
+                self.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy ({})'.format(key))
+           
+        
         
     def select_divine(self, weights, embeddings, class_labels, gamma):
         if self.args.spread_constraint == "by_class":
@@ -654,7 +714,7 @@ class Learner:
         return selected_indices, weight_terms, diversity_terms
 
 
-    def select_top_k(self, weights, class_labels):
+    def select_top_k(self, weights, class_labels=None):
         if self.args.spread_constraint == "by_class":
             classes = torch.unique(class_labels)
             candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)

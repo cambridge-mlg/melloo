@@ -11,6 +11,9 @@ def get_dataset_reader(args, train_set, validation_set, test_set, device):
                                                args.max_way_train, args.max_way_test, args.max_support_train,
                                                args.max_support_test, args.query_train, args.query_test,
                                                args.image_size, device)
+    elif args.dataset = "split-cifar10":
+        from split_wrapper import IdentifiableDatasetWrapper
+        dataset = IdentifiableDatasetWrapper(args.data_path, args.dataset, args.way, args.shot, args.query_test)
     else:
         from meta_dataset_reader import SingleDatasetReader
         dataset = SingleDatasetReader(args.data_path, args.mode, args.dataset, args.way, args.shot, args.query_train,
