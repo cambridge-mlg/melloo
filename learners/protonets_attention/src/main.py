@@ -37,10 +37,13 @@ def add_image_rankings(image_ranking_dict, image_key, image, ranking_key, rankin
     
 def weights_from_multirankings(image_ranking_dict, ranking_key):
     agg_ranking = np.zeros(len(image_ranking_dict.keys()))
+    img_id = np.zeros(len(agg_ranking), dtype=np.int)
     # For each image
     for i, img_id in enumerate(image_ranking_dict.keys()):
         agg_ranking[i] = image_ranking_dict[img_id][ranking_key].sum()
-    return agg_ranking
+        img_id[i] = img_id
+    # Return parallel arrays of the ranking and the image id
+    return agg_ranking, img_id
             
     
 def calc_image_ranking_stats(image_ranking_dict):
@@ -604,12 +607,13 @@ class Learner:
             # Aggregate to get indices.
             import pdb; pdb.set_trace()
             for key in rankings.keys():
-                weights = weights_from_multirankings(image_rankings, key)
+                weights, img_ids = weights_from_multirankings(image_rankings, key)
                 candidate_indices = self.select_top_k(weights[key], context_labels) # Why does this need context_labels?
+                candidate_ids = img_ids[candidate_indices]
                 # Evaluate those indices:
                 eval_accuracies = []
                 for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
-                    task_dict = self.dataset.get_task_from_indices(candidate_indices)
+                    task_dict = self.dataset.get_task_from_ids(candidate_ids)
                     context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
                     if self.args.test_case == "bimodal":
                         context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
