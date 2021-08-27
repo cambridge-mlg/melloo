@@ -1,12 +1,12 @@
 ulimit -n 50000
 export PYTHONPATH=.
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 
 for i in {1..10}
 do
-    mkdir /scratches/stroustrup/etv21/protonets_attention/restrict/vary_k_divine/div_$i
+    mkdir /scratches/stroustrup/etv21/protonets_attention/per_class/vary_k_divine/div_$i
     python3 ./learners/protonets_attention/src/main.py \
-        --checkpoint_dir /scratches/stroustrup/etv21/protonets_attention/restrict/vary_k_divine/div_$i \
+        --checkpoint_dir /scratches/stroustrup/etv21/protonets_attention/per_class/vary_k_divine/div_$i \
         --classifier protonets_attention \
         --mode test \
         --test_datasets ilsvrc_2012 \
