@@ -25,19 +25,21 @@ def save_image(image_array, save_path):
     im = Image.fromarray(np.clip((image_array + 1.0) * 127.5 + 0.5, 0, 255).astype(np.uint8), mode='RGB')
     im.save(save_path)
     
-def add_image_ranking(image_ranking_dict, image_key, image, ranking_key, ranking):
+def add_image_rankings(image_ranking_dict, image_key, image, ranking_key, ranking):
     if image_key not in image_ranking_dict.keys():
        image_ranking_dict[image_key] = {}
+    
     if ranking_key not in image_ranking_dict[image_key].keys():
-        image_ranking_dict[image_key][ranking_key] = []
-    image_ranking_dict[image_key][ranking_key].append(ranking)
+        image_ranking_dict[image_key][ranking_key] = np.array(ranking)
+    else:
+        image_ranking_dict[image_key][ranking_key] = np.append(image_ranking_dict[image_key][ranking_key], ranking)
     return image_ranking_dict
     
 def weights_from_multirankings(image_ranking_dict, ranking_key):
-    agg_ranking = np.array(len(image_ranking_dict.keys()))
+    agg_ranking = np.zeros(len(image_ranking_dict.keys()))
     # For each image
-    for img_id in image_ranking_dict.keys():
-        agg_ranking[img_id] = image_ranking_dict[img_id][ranking_key].sum()
+    for i, img_id in enumerate(image_ranking_dict.keys()):
+        agg_ranking[i] = image_ranking_dict[img_id][ranking_key].sum()
     return agg_ranking
             
     
@@ -494,10 +496,6 @@ class Learner:
             accuracies = {}
             if self.args.importance_mode == 'all':
                 ranking_modes = ['loo', 'attention', 'representer', 'random']
-                correlations = {'attention_representer':[], 'attention_loo': [], 'representer_loo': [], 
-                                    'attention_random': [], 'loo_random': [], 'representer_random': []}
-                intersections = {'attention_representer':[], 'attention_loo': [], 'representer_loo': [], 
-                                    'attention_random': [], 'loo_random': [], 'representer_random': []}
             else:
                 ranking_modes = [self.args.importance_mode]
                 
@@ -562,32 +560,10 @@ class Learner:
                     # May want to normalize here:
                     weights[mode] = weights_per_qp[mode].sum(dim=0)
                     rankings[mode] = torch.argsort(weights[mode], descending=True)
-                    import pdb; pdb.set_trace()
                     normalized_rankings = rankings[mode]/(rankings[mode].max() - rankings[mode].min())
                     for i in range(len(context_images)):
                         image_rankings = add_image_rankings(image_rankings, task_dict["context_ids"][i], context_images[i], mode, normalized_rankings[i])
                     
-                # Great, now we have the importance weights. Now what to do with them
-                if self.args.importance_mode == 'all':
-                    corr, inters = self.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['representer'], "Attention vs Representer")
-                    correlations['attention_representer'].append(corr)
-                    intersections['attention_representer'].append(inters)
-                    corr, inters = self.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['loo'], "Attention vs Meta-LOO")
-                    correlations['attention_loo'].append(corr)
-                    intersections['attention_loo'].append(inters)
-                    corr, inters = self.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['loo'], "Representer vs Meta-LOO")
-                    correlations['representer_loo'].append(corr) 
-                    intersections['representer_loo'].append(inters)
-                    corr, inters = self.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['random'], "Attention vs Random")
-                    correlations['attention_random'].append(corr)
-                    intersections['attention_random'].append(inters)
-                    corr, inters = self.compare_rankings(rankings_per_qp['loo'], rankings_per_qp['random'], "Meta-LOO vs Random")
-                    correlations['loo_random'].append(corr)
-                    intersections['loo_random'].append(inters)
-                    corr, inters = self.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['random'], "Representer vs Random")
-                    correlations['representer_random'].append(corr) 
-                    intersections['representer_random'].append(inters)
-                
                 for key in rankings.keys():
                     if self.args.selection_mode == "top_k":
                         candidate_indices = self.select_top_k(weights[key], context_labels)
@@ -622,15 +598,11 @@ class Learner:
 
             for key in rankings.keys():
                 self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
-            if self.args.importance_mode == 'all':
-                for key in correlations:
-                    self.print_and_log_metric(correlations[key], item, 'Correlation {}'.format(key))
-                for key in intersections:
-                    self.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
             
             # Righty-oh, now that we have our image_rankings, we need to do something with them.
             # Let's get some basic stats about them;
             # Aggregate to get indices.
+            import pdb; pdb.set_trace()
             for key in rankings.keys():
                 weights = weights_from_multirankings(image_rankings, key)
                 candidate_indices = self.select_top_k(weights[key], context_labels) # Why does this need context_labels?
@@ -791,13 +763,17 @@ class Learner:
         return weights_per_query_point
 
     def prepare_task(self, task_dict):
-        if self.args.dataset_reader == "pytorch":
-            return task_dict['context_images'], task_dict['target_images'],\
-                   task_dict['context_labels'], task_dict['target_labels']
+        # If context_images are already a tensor, just assign
+        if torch.is_tensor(task_dict['context_images']):
+            context_images = task_dict['context_images']
+            target_images = task_dict['target_images']
+            context_labels = task_dict['context_labels']
+            target_labels = task_dict['target_labels']
+        # Else, assume numpy format and do conversion
         else:
             context_images_np, context_labels_np = task_dict['context_images'], task_dict['context_labels']
             target_images_np, target_labels_np = task_dict['target_images'], task_dict['target_labels']
-
+            
             context_images_np = context_images_np.transpose([0, 3, 1, 2])
             context_images_np, context_labels_np = self.shuffle(context_images_np, context_labels_np)
             context_images = torch.from_numpy(context_images_np)
@@ -808,12 +784,14 @@ class Learner:
             target_images = torch.from_numpy(target_images_np)
             target_labels = torch.from_numpy(target_labels_np)
 
+        # If context_images aren't on gpu, assume everything should be moved
+        if not context_images.is_cuda:
             context_images = context_images.to(self.device)
             target_images = target_images.to(self.device)
             context_labels = context_labels.type(torch.LongTensor).to(self.device)
             target_labels = target_labels.type(torch.LongTensor).to(self.device)
 
-            return context_images, target_images, context_labels, target_labels
+        return context_images, target_images, context_labels, target_labels
 
     def slim_images_and_labels(self, images, labels):
         slimmed_images = []
