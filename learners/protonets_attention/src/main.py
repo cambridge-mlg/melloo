@@ -36,14 +36,14 @@ def add_image_rankings(image_ranking_dict, image_key, image, ranking_key, rankin
     return image_ranking_dict
     
 def weights_from_multirankings(image_ranking_dict, ranking_key):
-    agg_ranking = np.zeros(len(image_ranking_dict.keys()))
-    img_id = np.zeros(len(agg_ranking), dtype=np.int)
+    agg_ranking = torch.zeros(len(image_ranking_dict.keys()))
+    img_ids = np.zeros(len(agg_ranking), dtype=np.int)
     # For each image
     for i, img_id in enumerate(image_ranking_dict.keys()):
-        agg_ranking[i] = image_ranking_dict[img_id][ranking_key].sum()
-        img_id[i] = img_id
+        agg_ranking[i] = image_ranking_dict[img_id][ranking_key].sum().item()
+        img_ids[i] = img_id
     # Return parallel arrays of the ranking and the image id
-    return agg_ranking, img_id
+    return agg_ranking, img_ids
             
     
 def calc_image_ranking_stats(image_ranking_dict):
@@ -88,7 +88,7 @@ class Learner:
         # Not sure whether to use shot or max_support_test
         if self.args.spread_constraint == "by_class":
             assert self.args.top_k <= self.args.shot
-        else:
+        elif not self.args.dataset =="split-cifar10" :
             assert self.args.top_k <= self.args.shot * self.args.way
         self.top_k = self.args.top_k
 
@@ -526,9 +526,9 @@ class Learner:
                 rankings = {}
                 weights = {}
                 
-                if ti < 10:
-                    self.save_image_set(ti, context_images, "context")
-                    self.save_image_set(ti, target_images, "target")
+                #if ti < 10:
+                #    self.save_image_set(ti, context_images, "context")
+                #    self.save_image_set(ti, target_images, "target")
                 
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
@@ -566,7 +566,7 @@ class Learner:
                     normalized_rankings = rankings[mode]/(rankings[mode].max() - rankings[mode].min())
                     for i in range(len(context_images)):
                         image_rankings = add_image_rankings(image_rankings, task_dict["context_ids"][i], context_images[i], mode, normalized_rankings[i])
-                    
+                '''    
                 for key in rankings.keys():
                     if self.args.selection_mode == "top_k":
                         candidate_indices = self.select_top_k(weights[key], context_labels)
@@ -591,24 +591,21 @@ class Learner:
                         accuracies[key].append(task_accuracy)
                             
                         # Save out the selected candidates (?)
-                        
-                print("Rankings dictionary has {} many images".format(len(image_rankings.keys())))
-
+                   '''     
             self.print_and_log_metric(accuracies_full, item, 'Accuracy')
             if self.args.test_case == "bimodal":
                 for key in num_unique_labels.keys():
                     self.logger.print_and_log("Average number of unique labels ({}): {}".format(key, float(num_unique_labels[key])/float(self.args.tasks)))
 
-            for key in rankings.keys():
-                self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
+            #for key in rankings.keys():
+            #    self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
             
             # Righty-oh, now that we have our image_rankings, we need to do something with them.
             # Let's get some basic stats about them;
             # Aggregate to get indices.
-            import pdb; pdb.set_trace()
             for key in rankings.keys():
                 weights, img_ids = weights_from_multirankings(image_rankings, key)
-                candidate_indices = self.select_top_k(weights[key], context_labels) # Why does this need context_labels?
+                candidate_indices = self.select_top_k(weights)
                 candidate_ids = img_ids[candidate_indices]
                 # Evaluate those indices:
                 eval_accuracies = []
@@ -623,6 +620,7 @@ class Learner:
                     if ti < 5:
                         self.save_image_set(ti, context_images, "context")
                         self.save_image_set(ti, target_images, "target")
+                    pickle.dump(image_rankings, open(os.path.join(self.args.checkpoint_dir, "rankings.pickle"), "wb"))
                     
                     with torch.no_grad():
                         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)

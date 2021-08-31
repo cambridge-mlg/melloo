@@ -27,7 +27,7 @@ def unique(values):
     result = []
     for v in values:
         if v not in result:
-            result = result.append(v)
+            result.append(v.item())
     return result
 
 class IdentifiableDatasetWrapper:
@@ -37,6 +37,9 @@ class IdentifiableDatasetWrapper:
                 tv_transforms.ToTensor(),
             ])
         self.context_data = tv_datasets.CIFAR10(dataset_path, transform=transforms, train=True, download=True)
+        #self.context_data.data = self.context_data.data[0:30]
+        #for i in range(30):
+        #    self.context_data.targets[i] = i % 5
         self.query_data = tv_datasets.CIFAR10(dataset_path, transform=transforms, train=False, download=True)
         self.query_mapping = map_to_classes(self.query_data)
         # Now we want splits for this per class so we can construct tasks
@@ -47,13 +50,17 @@ class IdentifiableDatasetWrapper:
         self.shot = shot
         self.query_shot = query_shot
         
-    def _context_task_shape(self):
+    def _context_task_shape(self, task_size=None):
+        if task_size is None:
+            task_size = self.way * self.shot
         image_shape = self.context_data[0][0].shape
-        return (self.way * self.shot, image_shape[0], image_shape[1], image_shape[2])
+        return (task_size, image_shape[0], image_shape[1], image_shape[2])
         
-    def _query_task_shape(self):
+    def _query_task_shape(self, task_size=None):
+        if task_size is None:
+            task_size = self.way * self.query_shot
         image_shape = self.query_data[0][0].shape
-        return (self.way * self.query_shot, image_shape[0], image_shape[1], image_shape[2])
+        return (task_size, image_shape[0], image_shape[1], image_shape[2])
         
     def get_validation_task(self, *args):
         # Not implemented
@@ -69,9 +76,9 @@ class IdentifiableDatasetWrapper:
         # No data left, reset
         if len(c_avail) == 0:
             self.current_context_mapping = map_to_classes(self.context_data)
+            c_avail = available_classes(self.current_context_mapping)
         
         task_dict = {}
-        import pdb; pdb.set_trace()
         task_dict["context_images"], unnormalized_context_labels, task_dict["context_ids"] = self._construct_context_set(c_avail)
         # Use our custom, order-preserving unique function
         chosen_classes = unique(unnormalized_context_labels)
@@ -84,16 +91,21 @@ class IdentifiableDatasetWrapper:
         
     def get_task_from_ids(self, context_image_ids):
         task_dict = {}
-        task_dict["context_images"], task_dict["context_labels"], _ = self.context_data[context_image_ids]
-        chosen_classes = task_dict["context_labels"].unique()
-        assert len(chosen_classes) == 10
-        task_dict["target_images"], task_dict["target_labels"], _ = self._construct_query_set(context_image_ids)
+        num_context = len(context_image_ids)
+        context_images = torch.zeros(self._context_task_shape(num_context))
+        context_labels = torch.zeros(num_context, dtype=torch.long)
+        for i, id in enumerate(context_image_ids):
+            context_images[i], context_labels[i] = self.context_data[id]
+        task_dict["context_images"], task_dict["context_labels"] = context_images, context_labels
+        full_test_classes = list(range(len(self.context_data.classes)))
+        task_dict["target_images"], task_dict["target_labels"], _ = self._construct_query_set(full_test_classes)
         return task_dict
         
     def _construct_query_set(self, task_classes):   
-        task_images = torch.zeros(self._query_task_shape(), dtype=torch.float32)
-        task_labels = torch.zeros(self.query_shot*self.way, dtype=torch.long)
-        task_ids = np.zeros(self.query_shot*self.way, dtype=np.int32)
+        task_way = len(task_classes)
+        task_images = torch.zeros(self._query_task_shape(task_way*self.query_shot), dtype=torch.float32)
+        task_labels = torch.zeros(self.query_shot*task_way, dtype=torch.long)
+        task_ids = np.zeros(self.query_shot*task_way, dtype=np.int32)
         t = 0
         for c in task_classes:
             c_indices = self.query_mapping[c]
@@ -106,13 +118,6 @@ class IdentifiableDatasetWrapper:
                 task_labels[t] = label
                 task_ids[t] = c_indices[i]
                 t += 1
-        '''
-        Unclear whether it would be better to do the label normalization
-        here or after returning, so leaving this here  for now
-        #import pdb; pdb.set_trace()
-        #task_labels = torch.arange(len(task_classes))
-        #task_labels = task_labels.repeat_interleave(self.query_shot)
-        '''
         return task_images, task_labels, task_ids
         
     def _construct_context_set(self, possible_classes):
@@ -136,9 +141,6 @@ class IdentifiableDatasetWrapper:
                 t += 1
             # Remove selected patterns from list of available patterns to choose from
             self.current_context_mapping[c] = np.delete(self.current_context_mapping[c], pattern_indices) 
-        #import pdb; pdb.set_trace()
-        #task_labels = torch.arange(len(task_classes))
-        #task_labels = task_labels.repeat_interleave(self.shot)
         return task_images, task_labels, task_ids
                 
             
