@@ -603,6 +603,9 @@ class Learner:
             # Righty-oh, now that we have our image_rankings, we need to do something with them.
             # Let's get some basic stats about them;
             # Aggregate to get indices.
+
+            pickle.dump(image_rankings, open(os.path.join(self.args.checkpoint_dir, "rankings.pickle"), "wb"))
+
             for key in rankings.keys():
                 weights, img_ids = weights_from_multirankings(image_rankings, key)
                 candidate_indices = self.select_top_k(weights)
@@ -620,7 +623,6 @@ class Learner:
                     if ti < 5:
                         self.save_image_set(ti, context_images, "context")
                         self.save_image_set(ti, target_images, "target")
-                    pickle.dump(image_rankings, open(os.path.join(self.args.checkpoint_dir, "rankings.pickle"), "wb"))
                     
                     with torch.no_grad():
                         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
