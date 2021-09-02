@@ -245,7 +245,14 @@ class Learner:
             self.test(self.log_files.best_validation_model_path)
 
         if self.args.mode == 'test':
-            self.generate_coreset(self.args.test_model_path)
+            if self.args.task_type == "generate_coreset":
+                self.generate_coreset(self.args.test_model_path)
+            elif self.args.task_type == "noisy_shots":
+                self.detect_noisy_shots(self.args.test_model_path)
+            elif self.args.task_type == "shot_selection":
+                self.select_shots(self.args.test_model_path)
+            else:
+                print("Unsupported task specified")
 
     def get_from_gpu(self, value):
         if self.use_two_gpus():
@@ -632,6 +639,276 @@ class Learner:
                     
                 self.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy ({})'.format(key))
            
+    def select_shots(self, path):
+        self.logger.print_and_log("")  # add a blank line
+        self.logger.print_and_log('Selecting shots using model {0:}: '.format(path))
+        self.model = self.init_model()
+        if path != 'None':
+            self.model.load_state_dict(torch.load(path))
+
+        for item in self.test_set:
+            accuracies_full = []
+            accuracies = {}
+            if self.args.importance_mode == 'all':
+                ranking_modes = ['loo', 'attention', 'representer', 'random']
+                correlations = {'attention_representer':[], 'attention_loo': [], 'representer_loo': [], 
+                                    'attention_random': [], 'loo_random': [], 'representer_random': []}
+                intersections = {'attention_representer':[], 'attention_loo': [], 'representer_loo': [], 
+                                    'attention_random': [], 'loo_random': [], 'representer_random': []}
+            else:
+                ranking_modes = [self.args.importance_mode]
+                
+            for mode in ranking_modes:
+                accuracies[mode] = []
+                
+            if self.args.test_case == "bimodal":
+                num_unique_labels = {}
+                for mode in ranking_modes:
+                    num_unique_labels[mode] = 0
+
+            for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
+                task_dict = self.dataset.get_test_task(item)
+                context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                if self.args.test_case == "bimodal":
+                    context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
+                    context_labels = context_labels.floor_divide(2)
+                    target_labels = target_labels.floor_divide(2)
+
+                rankings_per_qp = {}
+                weights_per_qp = {}
+                rankings = {}
+                weights = {}
+                
+                if ti < 10:
+                    self.save_image_set(ti, context_images, "context")
+                    self.save_image_set(ti, target_images, "target")
+                
+                with torch.no_grad():
+                    target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
+                    accuracies_full.append(task_accuracy)
+                    del target_logits
+                
+                # Save the target/context features
+                # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
+                with torch.no_grad():
+                    self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    # Make a copy of the target features, otherwise we get a reference to what the model is storing
+                    # (and we're about to send another task through it, so that's not what we want)
+                    context_features, target_features = self.model.context_features.clone(), self.model.target_features.clone()
+                
+                for mode in ranking_modes:
+
+                    if mode == 'loo':
+                        weights_per_qp['loo'] = self.calculate_loo(context_images, context_labels, target_images, target_labels)
+                    elif mode == 'attention':
+                        # Make a copy of the attention weights otherwise we get a reference to what the model is storing
+                        with torch.no_grad():
+                            self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                        attention_weights = self.model.attention_weights.copy()
+                        weights_per_qp['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
+                        
+                    elif mode == 'representer':
+                        weights_per_qp['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
+                    elif mode == 'random':
+                        weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
+                    rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
+                    # May want to normalize here:
+                    weights[mode] = weights_per_qp[mode].sum(dim=0)
+                    
+                # Great, now we have the importance weights. Now what to do with them
+                if self.args.importance_mode == 'all':
+                    corr, inters = self.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['representer'], "Attention vs Representer")
+                    correlations['attention_representer'].append(corr)
+                    intersections['attention_representer'].append(inters)
+                    corr, inters = self.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['loo'], "Attention vs Meta-LOO")
+                    correlations['attention_loo'].append(corr)
+                    intersections['attention_loo'].append(inters)
+                    corr, inters = self.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['loo'], "Representer vs Meta-LOO")
+                    correlations['representer_loo'].append(corr) 
+                    intersections['representer_loo'].append(inters)
+                    corr, inters = self.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['random'], "Attention vs Random")
+                    correlations['attention_random'].append(corr)
+                    intersections['attention_random'].append(inters)
+                    corr, inters = self.compare_rankings(rankings_per_qp['loo'], rankings_per_qp['random'], "Meta-LOO vs Random")
+                    correlations['loo_random'].append(corr)
+                    intersections['loo_random'].append(inters)
+                    corr, inters = self.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['random'], "Representer vs Random")
+                    correlations['representer_random'].append(corr) 
+                    intersections['representer_random'].append(inters)
+                    
+                for key in rankings.keys():
+                    if self.args.selection_mode == "top_k":
+                        candidate_indices = self.select_top_k(weights[key], context_labels)
+                    elif self.args.selection_mode == "multinomial":
+                        candidate_indices = self.select_multinomial(weights[key], context_labels)
+                    elif self.args.selection_mode == "divine":
+                        candidate_indices = self.select_divine(weights[key], context_features, context_labels, key)
+                    candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
+
+                    if self.args.test_case == "bimodal":
+                        num_unique_labels[key] = num_unique_labels[key] + len(context_labels_orig[candidate_indices].unique())
+                    
+                    # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
+                    reduced_candidate_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(candidate_labels, target_images, target_labels)
+
+                        # Calculate accuracy on task using only selected candidates as context points
+                    with torch.no_grad():
+                        target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
+                        task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels).item()
+                        # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
+                        task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels))
+                        accuracies[key].append(task_accuracy)
+                            
+                        # Save out the selected candidates (?)
+                     
+            self.print_and_log_metric(accuracies_full, item, 'Accuracy')
+            if self.args.test_case == "bimodal":
+                for key in num_unique_labels.keys():
+                    self.logger.print_and_log("Average number of unique labels ({}): {}".format(key, float(num_unique_labels[key])/float(self.args.tasks)))
+
+            for key in rankings.keys():
+                self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
+            if self.args.importance_mode == 'all':
+                for key in correlations:
+                    self.print_and_log_metric(correlations[key], item, 'Correlation {}'.format(key))
+                for key in intersections:
+                    self.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
+        
+    def make_noisy(self, task_dict):
+        num_classes = len(task_dict["target_labels"].unique())
+        num_context_images = len(task_dict["context_labels"])
+        num_noisy = self.args.error_rate * num_context_images
+        
+        new_context_labels = task_dict["context_labels"].clone()
+        if self.args.noise_type == "mislabel":
+            # Select images from the context set randomly to be mislabeled 
+            mislabeled_indices = rng.choice(num_context_images, num_noisy, replace=False)
+            # Mislabels selected images randomly
+            new_context_labels[new_context_labels] = (new_context_labels[new_context_labels] + np.randint(0, num_classes) + 1) % num_classes
+        elif self.args-noise_type == "ood":
+            # Choose a class to drop
+            class_to_drop = rng.choice(num_classes, 1)
+            # Relabel num_noisy-many of the patterns in the context set, choosing a random class each time
+            class_indices = extract_class_indices(task_dict["context_labels"], class_to_drop)
+            shuffled_class_indices = np.shuffle(class_indices)
+            new_context_labels = task_dict["context_labels"].clone()
+            # Normalize the new class labels
+            new_context_labels[new_context_labels > class_to_drop] = new_context_labels[new_context_labels > class_to_drop] -1
+            for k in range(num_noisy):
+                new_context_labels[shuffled_class_indices[k]] = np.randint(0, num_classes-1)
+            # Remove the rest from the context set
+            new_context_labels = torch.remove(new_context_labels, shuffled_class_indices[num_noisy:])
+            task_dict["context_images"] = torch.remove(task_dict["context_images"], shuffled_class_indices[num_noisy:])
+            mislabeled_indices = shuffled_class_indices[0:num_noisy]
+            
+            # Remove the class from the target set
+            target_class_indices = extract_class_indices(task_dict["target_labels"], class_to_drop)
+            task_dict["target_images"] = torch.remove(task_dict["target_images"], target_class_indices)
+            task_dict["target_labels"] = torch.remove(task_dict["target_labels"], target_class_indices)
+            
+        task_dict["true_context_labels"] = task_dict["context_labels"]
+        task_dict["context_labels"] = new_context_labels
+        task_dict["noisy_context_indices"] = mislabeled_indices
+        return task_dict
+        
+        
+    def detect_noisy_shots(self, path):
+        self.logger.print_and_log("")  # add a blank line
+        self.logger.print_and_log('Selecting shots using model {0:}: '.format(path))
+        self.model = self.init_model()
+        if path != 'None':
+            self.model.load_state_dict(torch.load(path))
+
+        for item in self.test_set:
+            accuracies_full = []
+            accuracies = {}
+            if self.args.importance_mode == 'all':
+                ranking_modes = ['loo', 'attention', 'representer', 'random']
+            else:
+                ranking_modes = [self.args.importance_mode]
+                
+            for mode in ranking_modes:
+                accuracies[mode] = []
+
+            for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
+                task_dict = self.dataset.get_test_task(item)
+                # Noisiness
+                task_dict = self.make_noisy(task_dict)
+                context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+
+                rankings_per_qp = {}
+                weights_per_qp = {}
+                rankings = {}
+                weights = {}
+                
+                if ti < 10:
+                    self.save_image_set(ti, context_images, "context")
+                    self.save_image_set(ti, target_images, "target")
+                
+                with torch.no_grad():
+                    target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
+                    accuracies_full.append(task_accuracy)
+                    del target_logits
+                
+                # Save the target/context features
+                # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
+                with torch.no_grad():
+                    self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    # Make a copy of the target features, otherwise we get a reference to what the model is storing
+                    # (and we're about to send another task through it, so that's not what we want)
+                    context_features, target_features = self.model.context_features.clone(), self.model.target_features.clone()
+                
+                for mode in ranking_modes:
+
+                    if mode == 'loo':
+                        weights_per_qp['loo'] = self.calculate_loo(context_images, context_labels, target_images, target_labels)
+                    elif mode == 'attention':
+                        # Make a copy of the attention weights otherwise we get a reference to what the model is storing
+                        with torch.no_grad():
+                            self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                        attention_weights = self.model.attention_weights.copy()
+                        weights_per_qp['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
+                        
+                    elif mode == 'representer':
+                        weights_per_qp['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
+                    elif mode == 'random':
+                        weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
+                    rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
+                    # May want to normalize here:
+                    weights[mode] = weights_per_qp[mode].sum(dim=0)
+                    
+                    
+                for key in rankings.keys():
+                    if self.args.selection_mode == "top_k":
+                        candidate_indices = self.select_top_k(weights[key], context_labels)
+                    elif self.args.selection_mode == "multinomial":
+                        candidate_indices = self.select_multinomial(weights[key], context_labels)
+                    elif self.args.selection_mode == "divine":
+                        candidate_indices = self.select_divine(weights[key], context_features, context_labels, key)
+                    candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
+
+                    if self.args.test_case == "bimodal":
+                        num_unique_labels[key] = num_unique_labels[key] + len(context_labels_orig[candidate_indices].unique())
+                    
+                    # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
+                    reduced_candidate_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(candidate_labels, target_images, target_labels)
+
+                        # Calculate accuracy on task using only selected candidates as context points
+                    with torch.no_grad():
+                        target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
+                        task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels).item()
+                        # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
+                        task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels))
+                        accuracies[key].append(task_accuracy)
+                            
+                        # Save out the selected candidates (?)
+                     
+            self.print_and_log_metric(accuracies_full, item, 'Accuracy')
+
+            for key in rankings.keys():
+                self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
         
         
     def select_divine(self, weights, embeddings, class_labels, gamma):
