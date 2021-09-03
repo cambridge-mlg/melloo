@@ -86,10 +86,19 @@ class Learner:
             self.load_checkpoint()
         self.optimizer.zero_grad()
         # Not sure whether to use shot or max_support_test
-        if self.args.spread_constraint == "by_class":
-            assert self.args.top_k <= self.args.shot
-        elif not self.args.dataset =="split-cifar10" :
-            assert self.args.top_k <= self.args.shot * self.args.way
+        if self.args.task_type == "shot_selection":
+            if self.args.spread_constraint == "by_class":
+                assert self.args.top_k <= self.args.shot
+            else :
+                assert self.args.top_k <= self.args.shot * self.args.way
+            assert self.args.selection_mode != "drop"
+        else:
+            assert self.args.spread_constraint == "none"
+            if self.args.task_type == "noisy_shots":
+                assert self.args.selection_mode == "drop"
+            else:
+                assert self.args.selection_mode != "drop"
+                
         self.top_k = self.args.top_k
 
     def init_model(self):
@@ -175,22 +184,33 @@ class Learner:
         parser.add_argument("--num_attention_heads", type=int, default=8, help="Number of heads in multi-head attention.")
         parser.add_argument("--attention_temperature", type=float, default=1.0,
                             help="Temperature used in dot-product attention softmax.")
+        # Regularization options when training
         parser.add_argument("--l2_lambda", type=float, default=0.0001,
                             help="Value of lambda when doing L2 regularization on the classifier head")
         parser.add_argument("--l2_regularize_classifier", dest="l2_regularize_classifier", default=False,
                             action="store_true", help="If True, perform l2 regularization on the classifier head.")
+        # Melloo task type and related settings
+        parser.add_argument("--task_type", choices=["generate_coreset", "noisy_shots", "shot_selection"], default="generate_coreset",
+                            help="Task to perform. Options are generate_coreset, noisy_shots or shot_selection")
+        parser.add_argument("--tasks", type=int, default=10, help="Number of test tasks to do")
+        parser.add_argument("--test_case", choices=["default", "bimodal", "noise", "unrelated"], default="default",
+                            help="Specifiy a specific test case to try. Currently only default and bimodal are implemented")
         parser.add_argument("--top_k", type=int, default=2, help="How many points to retain from each class")
-        parser.add_argument("--selection_mode", choices=["top_k", "multinomial", "divine"], default="top_k",
-                            help="How to select the candidates from the importance weights")
+        parser.add_argument("--selection_mode", choices=["top_k", "multinomial", "divine", "drop"], default="top_k",
+                            help="How to select the candidates from the importance weights. Drop option only works for noisy shot selection at present.")
         parser.add_argument("--importance_mode", choices=["attention", "loo", "representer", "all"], default="all",
                             help="How to calculate candidate importance")
         parser.add_argument("--kernel_agg", choices=["sum", "sum_abs", "class"], default="class",
                             help="When using representer importance, how to aggregate kernel information")
-        parser.add_argument("--tasks", type=int, default=10, help="Number of test tasks to do")
+        # Shot selection settings
         parser.add_argument("--spread_constraint", choices=["by_class", "none"], default="by_class",
                             help="Spread coresets over classes (by_class) or no constraint (none)")
-        parser.add_argument("--test_case", choices=["default", "bimodal", "noise", "unrelated"], default="default",
-                            help="Specifiy a specific test case to try. Currently only default and bimodal are implemented")
+        # Noisy task settings
+        parser.add_argument("--drop_rate", type=float, default=0.1, help="Percentage of points to drop (as float in [0,1])")
+        parser.add_argument("--noise_type", choices=["mislabel", "ood"], default="mislabel",
+                            help="Type of noise to use for noisy shot detection")
+        parser.add_argument("--error_rate", type=float, default=0.1,
+                            help="Rate at which noise is introduced. For mislabelling, this is the percentage of the context set to mislabel. For ood, this how many ood patterns are shuffled into the other classes (calculated as num context patterns * error rate)")
         
 
         args = parser.parse_args()
@@ -573,32 +593,7 @@ class Learner:
                     normalized_rankings = rankings[mode]/(rankings[mode].max() - rankings[mode].min())
                     for i in range(len(context_images)):
                         image_rankings = add_image_rankings(image_rankings, task_dict["context_ids"][i], context_images[i], mode, normalized_rankings[i])
-                '''    
-                for key in rankings.keys():
-                    if self.args.selection_mode == "top_k":
-                        candidate_indices = self.select_top_k(weights[key], context_labels)
-                    elif self.args.selection_mode == "multinomial":
-                        candidate_indices = self.select_multinomial(weights[key], context_labels)
-                    elif self.args.selection_mode == "divine":
-                        candidate_indices = self.select_divine(weights[key], context_features, context_labels, key)
-                    candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
-
-                    if self.args.test_case == "bimodal":
-                        num_unique_labels[key] = num_unique_labels[key] + len(context_labels_orig[candidate_indices].unique())
-                    
-                    # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
-                    reduced_candidate_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(candidate_labels, target_images, target_labels)
-
-                        # Calculate accuracy on task using only selected candidates as context points
-                    with torch.no_grad():
-                        target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
-                        task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels).item()
-                        # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
-                        task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels))
-                        accuracies[key].append(task_accuracy)
-                            
-                        # Save out the selected candidates (?)
-                   '''     
+                
             self.print_and_log_metric(accuracies_full, item, 'Accuracy')
             if self.args.test_case == "bimodal":
                 for key in num_unique_labels.keys():
@@ -779,6 +774,7 @@ class Learner:
         num_classes = len(task_dict["target_labels"].unique())
         num_context_images = len(task_dict["context_labels"])
         num_noisy = self.args.error_rate * num_context_images
+        assert num_noisy < num_context_images
         
         new_context_labels = task_dict["context_labels"].clone()
         if self.args.noise_type == "mislabel":
@@ -795,12 +791,17 @@ class Learner:
             new_context_labels = task_dict["context_labels"].clone()
             # Normalize the new class labels
             new_context_labels[new_context_labels > class_to_drop] = new_context_labels[new_context_labels > class_to_drop] -1
-            for k in range(num_noisy):
+            upper_bound = min(num_noisy, len(shuffled_class_indices))
+            for k in range(upper_bound):
                 new_context_labels[shuffled_class_indices[k]] = np.randint(0, num_classes-1)
             # Remove the rest from the context set
-            new_context_labels = torch.remove(new_context_labels, shuffled_class_indices[num_noisy:])
-            task_dict["context_images"] = torch.remove(task_dict["context_images"], shuffled_class_indices[num_noisy:])
-            mislabeled_indices = shuffled_class_indices[0:num_noisy]
+            if num_noisy < len(shuffled_class_indices):
+                new_context_labels = torch.remove(new_context_labels, shuffled_class_indices[num_noisy:])
+                task_dict["context_images"] = torch.remove(task_dict["context_images"], shuffled_class_indices[num_noisy:])
+            elif num_noisy > len(shuffled_class_indices)
+                print("Diff between requested and obtained error nums: {}".format(float(num_noisy - len(shuffled_class_indices)))/float(num_context_images))
+            
+            mislabeled_indices = shuffled_class_indices[0:upper_bound]
             
             # Remove the class from the target set
             target_class_indices = extract_class_indices(task_dict["target_labels"], class_to_drop)
@@ -815,7 +816,7 @@ class Learner:
         
     def detect_noisy_shots(self, path):
         self.logger.print_and_log("")  # add a blank line
-        self.logger.print_and_log('Selecting shots using model {0:}: '.format(path))
+        self.logger.print_and_log('Detecting noisy shots using model {0:}: '.format(path))
         self.model = self.init_model()
         if path != 'None':
             self.model.load_state_dict(torch.load(path))
@@ -823,6 +824,8 @@ class Learner:
         for item in self.test_set:
             accuracies_full = []
             accuracies = {}
+            overlaps = {}
+            
             if self.args.importance_mode == 'all':
                 ranking_modes = ['loo', 'attention', 'representer', 'random']
             else:
@@ -830,10 +833,12 @@ class Learner:
                 
             for mode in ranking_modes:
                 accuracies[mode] = []
+                overlaps[mode] = []
 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
                 # Noisiness
+                import pdb; pdb.set_trace()
                 task_dict = self.make_noisy(task_dict)
                 context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
 
@@ -880,22 +885,28 @@ class Learner:
                     weights[mode] = weights_per_qp[mode].sum(dim=0)
                     
                     
+                import pdb; pdb.set_trace()
                 for key in rankings.keys():
+                    removed_indices = None
                     if self.args.selection_mode == "top_k":
                         candidate_indices = self.select_top_k(weights[key], context_labels)
                     elif self.args.selection_mode == "multinomial":
                         candidate_indices = self.select_multinomial(weights[key], context_labels)
                     elif self.args.selection_mode == "divine":
                         candidate_indices = self.select_divine(weights[key], context_features, context_labels, key)
+                    elif self.args.selection_mode == "drop":
+                        candidate_indices, removed_indices = self.select_by_dropping(weights[key], context_features, context_labels, key)
+                    if removed_indices is None:
+                        removed_indices = set(range(len(context_labels))).difference(set(candidate_indices))
+                        
+                    # Determine overlap between removed candidates and noisy shots
+                    overlaps[key] = float(len(removed_indices.intersection(set(task_dict["noisy_context_indices"]))))/float(len(task_dict["noisy_context_indices"]))
                     candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
-
-                    if self.args.test_case == "bimodal":
-                        num_unique_labels[key] = num_unique_labels[key] + len(context_labels_orig[candidate_indices].unique())
                     
                     # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
                     reduced_candidate_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(candidate_labels, target_images, target_labels)
 
-                        # Calculate accuracy on task using only selected candidates as context points
+                    # Calculate accuracy on task using only selected candidates as context points
                     with torch.no_grad():
                         target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
                         task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels).item()
@@ -909,6 +920,7 @@ class Learner:
 
             for key in rankings.keys():
                 self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
+                self.print_and_log_metric(overlaps[key], item, 'Shot Overlap {}'.format(key))
         
         
     def select_divine(self, weights, embeddings, class_labels, gamma):
@@ -966,6 +978,10 @@ class Learner:
             selected_indices += [cand]
         return selected_indices, weight_terms, diversity_terms
 
+    def select_by_dropping(self, weights):
+        num_to_keep = int(len(weights) * (1 - self.args.drop_rate))
+        ranking = torch.argsort(weights, descending=True)
+        return ranking[0:num_to_keep], ranking[num_to_keep:]
 
     def select_top_k(self, weights, class_labels=None):
         if self.args.spread_constraint == "by_class":
