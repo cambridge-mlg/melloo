@@ -473,6 +473,15 @@ class Learner:
                 else:
                     context_images_loo = torch.cat((context_images[0:i], context_images[i + 1:]), 0)
                     context_labels_loo = torch.cat((context_labels[0:i], context_labels[i + 1:]), 0)
+                    
+                # Handle the case where we're dropping the only instance of a class
+                #reduced_context_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(context_labels_loo, target_images, target_labels)
+
+                # Calculate accuracy on task using only selected candidates as context points
+                # target_logits = self.model(context_images_loo, reduced_context_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
+                # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
+                # task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels)) # TODO: We should add random accuracy back in, not zero.
+                # accuracies[key].append(task_accuracy)
 
                 logits = self.model(context_images_loo, context_labels_loo, target_images, target_labels, MetaLearningState.META_TEST)
                 for t in range(len(target_labels)):
@@ -785,6 +794,7 @@ class Learner:
             # Mislabels selected images randomly
             new_context_labels[mislabeled_indices] = (new_context_labels[mislabeled_indices] + rng.integers(0, num_classes, num_noisy) + 1) % num_classes
         elif self.args-noise_type == "ood":
+            import pdb; pdb.set_trace()
             # Choose a class to drop
             class_to_drop = rng.choice(num_classes, 1)
             # Relabel num_noisy-many of the patterns in the context set, choosing a random class each time
@@ -920,7 +930,7 @@ class Learner:
                         target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
                         task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels).item()
                         # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
-                        task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels))
+                        task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels)) # TODO: We should add random accuracy back in, not zero.
                         accuracies[key].append(task_accuracy)
                             
                         # Save out the selected candidates (?)
