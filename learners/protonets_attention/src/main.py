@@ -1,6 +1,7 @@
 import torch
 import torchvision.transforms.functional as tvf
 import numpy as np
+from numpy.random import default_rng
 import argparse
 import os
 from tqdm import tqdm
@@ -18,6 +19,7 @@ from sklearn.metrics.pairwise import rbf_kernel
 
 NUM_VALIDATION_TASKS = 200
 PRINT_FREQUENCY = 1000
+rng = default_rng()
 
 def save_image(image_array, save_path):
     image_array = image_array.squeeze()
@@ -771,42 +773,42 @@ class Learner:
                     self.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
         
     def make_noisy(self, task_dict):
-        num_classes = len(task_dict["target_labels"].unique())
+        num_classes = len(np.unique(task_dict["target_labels"]))
         num_context_images = len(task_dict["context_labels"])
-        num_noisy = self.args.error_rate * num_context_images
+        num_noisy = max(1, int(self.args.error_rate * num_context_images))
         assert num_noisy < num_context_images
         
-        new_context_labels = task_dict["context_labels"].clone()
+        new_context_labels = task_dict["context_labels"].copy()
         if self.args.noise_type == "mislabel":
             # Select images from the context set randomly to be mislabeled 
             mislabeled_indices = rng.choice(num_context_images, num_noisy, replace=False)
             # Mislabels selected images randomly
-            new_context_labels[new_context_labels] = (new_context_labels[new_context_labels] + np.randint(0, num_classes) + 1) % num_classes
+            new_context_labels[mislabeled_indices] = (new_context_labels[mislabeled_indices] + rng.integers(0, num_classes, num_noisy) + 1) % num_classes
         elif self.args-noise_type == "ood":
             # Choose a class to drop
             class_to_drop = rng.choice(num_classes, 1)
             # Relabel num_noisy-many of the patterns in the context set, choosing a random class each time
             class_indices = extract_class_indices(task_dict["context_labels"], class_to_drop)
             shuffled_class_indices = np.shuffle(class_indices)
-            new_context_labels = task_dict["context_labels"].clone()
+            new_context_labels = task_dict["context_labels"].copy()
             # Normalize the new class labels
             new_context_labels[new_context_labels > class_to_drop] = new_context_labels[new_context_labels > class_to_drop] -1
             upper_bound = min(num_noisy, len(shuffled_class_indices))
             for k in range(upper_bound):
-                new_context_labels[shuffled_class_indices[k]] = np.randint(0, num_classes-1)
+                new_context_labels[shuffled_class_indices[k]] = rng.integers(0, num_classes-1, 1)
             # Remove the rest from the context set
             if num_noisy < len(shuffled_class_indices):
-                new_context_labels = torch.remove(new_context_labels, shuffled_class_indices[num_noisy:])
-                task_dict["context_images"] = torch.remove(task_dict["context_images"], shuffled_class_indices[num_noisy:])
-            elif num_noisy > len(shuffled_class_indices)
+                new_context_labels = np.delete(new_context_labels, shuffled_class_indices[num_noisy:])
+                task_dict["context_images"] = np.delete(task_dict["context_images"], shuffled_class_indices[num_noisy:], axis=0)
+            elif num_noisy > len(shuffled_class_indices):
                 print("Diff between requested and obtained error nums: {}".format(float(num_noisy - len(shuffled_class_indices)))/float(num_context_images))
             
             mislabeled_indices = shuffled_class_indices[0:upper_bound]
             
             # Remove the class from the target set
             target_class_indices = extract_class_indices(task_dict["target_labels"], class_to_drop)
-            task_dict["target_images"] = torch.remove(task_dict["target_images"], target_class_indices)
-            task_dict["target_labels"] = torch.remove(task_dict["target_labels"], target_class_indices)
+            task_dict["target_images"] = np.delete(task_dict["target_images"], target_class_indices, axis=0)
+            task_dict["target_labels"] = np.delete(task_dict["target_labels"], target_class_indices)
             
         task_dict["true_context_labels"] = task_dict["context_labels"]
         task_dict["context_labels"] = new_context_labels
@@ -822,9 +824,10 @@ class Learner:
             self.model.load_state_dict(torch.load(path))
 
         for item in self.test_set:
-            accuracies_full = []
             accuracies = {}
             overlaps = {}
+            accuracies_clean = []
+            accuracies_noisy = []
             
             if self.args.importance_mode == 'all':
                 ranking_modes = ['loo', 'attention', 'representer', 'random']
@@ -837,28 +840,35 @@ class Learner:
 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
+                context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                # Calculate clean accuracy 
+                with torch.no_grad():
+                    target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
+                    accuracies_clean.append(task_accuracy)
+                    del target_logits
+
                 # Noisiness
-                import pdb; pdb.set_trace()
                 task_dict = self.make_noisy(task_dict)
                 context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
-
-                rankings_per_qp = {}
-                weights_per_qp = {}
-                rankings = {}
-                weights = {}
-                
-                if ti < 10:
-                    self.save_image_set(ti, context_images, "context")
-                    self.save_image_set(ti, target_images, "target")
                 
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
-                    accuracies_full.append(task_accuracy)
+                    accuracies_noisy.append(task_accuracy)
                     del target_logits
-                
+
+                rankings_per_qp = {}
+                weights_per_qp = {}
+                weights = {}
+
+                if ti < 10:
+                    self.save_image_set(ti, context_images, "context")
+                    self.save_image_set(ti, target_images, "target")
+
                 # Save the target/context features
                 # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
+                # And we usually calculate attention weights
                 with torch.no_grad():
                     self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     # Make a copy of the target features, otherwise we get a reference to what the model is storing
@@ -884,10 +894,8 @@ class Learner:
                     # May want to normalize here:
                     weights[mode] = weights_per_qp[mode].sum(dim=0)
                     
-                    
-                import pdb; pdb.set_trace()
-                for key in rankings.keys():
-                    removed_indices = None
+                for key in ranking_modes:
+                    removed_indices_set = None
                     if self.args.selection_mode == "top_k":
                         candidate_indices = self.select_top_k(weights[key], context_labels)
                     elif self.args.selection_mode == "multinomial":
@@ -895,12 +903,13 @@ class Learner:
                     elif self.args.selection_mode == "divine":
                         candidate_indices = self.select_divine(weights[key], context_features, context_labels, key)
                     elif self.args.selection_mode == "drop":
-                        candidate_indices, removed_indices = self.select_by_dropping(weights[key], context_features, context_labels, key)
-                    if removed_indices is None:
-                        removed_indices = set(range(len(context_labels))).difference(set(candidate_indices))
+                        candidate_indices, removed_indices = self.select_by_dropping(weights[key])
+                        removed_indices_set = set(removed_indices.tolist())
+                    if removed_indices_set is None:
+                        removed_indices_set = set(range(len(context_labels))).difference(set(candidate_indices.tolist()))
                         
                     # Determine overlap between removed candidates and noisy shots
-                    overlaps[key] = float(len(removed_indices.intersection(set(task_dict["noisy_context_indices"]))))/float(len(task_dict["noisy_context_indices"]))
+                    overlaps[key].append(float(len(removed_indices_set.intersection(set(task_dict["noisy_context_indices"]))))/float(len(task_dict["noisy_context_indices"])))
                     candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
                     
                     # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
@@ -915,10 +924,13 @@ class Learner:
                         accuracies[key].append(task_accuracy)
                             
                         # Save out the selected candidates (?)
+                    if ti < 10:
+                        self.save_image_set(ti, context_images[removed_indices], "removed_by_{}".format(key))
                      
-            self.print_and_log_metric(accuracies_full, item, 'Accuracy')
+            self.print_and_log_metric(accuracies_clean, item, 'Clean Accuracy')
+            self.print_and_log_metric(accuracies_noisy, item, 'Noisy Accuracy')
 
-            for key in rankings.keys():
+            for key in ranking_modes:
                 self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
                 self.print_and_log_metric(overlaps[key], item, 'Shot Overlap {}'.format(key))
         
@@ -1059,7 +1071,7 @@ class Learner:
                 
         return weights_per_query_point
 
-    def prepare_task(self, task_dict):
+    def prepare_task(self, task_dict, shuffle=False):
         # If context_images are already a tensor, just assign
         if torch.is_tensor(task_dict['context_images']):
             context_images = task_dict['context_images']
@@ -1072,12 +1084,15 @@ class Learner:
             target_images_np, target_labels_np = task_dict['target_images'], task_dict['target_labels']
             
             context_images_np = context_images_np.transpose([0, 3, 1, 2])
-            context_images_np, context_labels_np = self.shuffle(context_images_np, context_labels_np)
+            # Don't shuffle so that we are assured consistency in the noisy shot detection case
+            if shuffle:
+                context_images_np, context_labels_np = self.shuffle(context_images_np, context_labels_np)
             context_images = torch.from_numpy(context_images_np)
             context_labels = torch.from_numpy(context_labels_np)
 
             target_images_np = target_images_np.transpose([0, 3, 1, 2])
-            target_images_np, target_labels_np = self.shuffle(target_images_np, target_labels_np)
+            if shuffle:
+                target_images_np, target_labels_np = self.shuffle(target_images_np, target_labels_np)
             target_images = torch.from_numpy(target_images_np)
             target_labels = torch.from_numpy(target_labels_np)
 
