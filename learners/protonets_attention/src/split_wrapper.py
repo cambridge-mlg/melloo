@@ -15,6 +15,25 @@ def map_to_classes(dataset):
     for index, (img, label) in enumerate(dataset):
         class_mapping[label].append(index)
     return class_mapping
+
+def reset_empty_class_mapings(dataset, class_mapping, shot):
+    # Make a list of all the classes that have been exhausted
+    empty_classes = []
+    for c in range(len(class_mapping)):
+        if len(class_mapping[c]) < shot:
+            empty_classes.append(c)
+            # Make it a list containing the unused patterns 
+            # (so they have a bigger chance of being sampled next round)
+            class_mapping[c] = class_mapping[c].tolist()
+    # If no classes have been exhausted, return mapping unchanged
+    if len(empty_classes) == 0:
+        return class_mapping
+
+    for index, (img, label) in enumerate(dataset):
+        if label in empty_classes:
+            class_mapping[label].append(index)
+    return class_mapping
+
     
 def available_classes(class_mapping):
     c_avail = []
@@ -36,14 +55,34 @@ class IdentifiableDatasetWrapper:
                 tv_transforms.Resize(84, interpolation=Image.LANCZOS),
                 tv_transforms.ToTensor(),
             ])
-        self.context_data = tv_datasets.CIFAR10(dataset_path, transform=transforms, train=True, download=True)
-        #self.context_data.data = self.context_data.data[0:30]
-        #for i in range(30):
-        #    self.context_data.targets[i] = i % 5
-        self.query_data = tv_datasets.CIFAR10(dataset_path, transform=transforms, train=False, download=True)
+
+        if dataset_name == "split-cifar10":
+            transforms = tv_transforms.Compose([
+                tv_transforms.Resize(84, interpolation=Image.LANCZOS),
+                tv_transforms.ToTensor(),
+                ])
+
+            self.context_data = tv_datasets.CIFAR10(dataset_path, transform=transforms, train=True, download=True)
+            self.query_data = tv_datasets.CIFAR10(dataset_path, transform=transforms, train=False, download=True)
+        elif dataset_name == "split-mnist":
+            transforms = tv_transforms.Compose([
+                    tv_transforms.Resize(84, interpolation=Image.LANCZOS),
+                    tv_transforms.ToTensor(),
+                    tv_transforms.Lambda(lambda x: x.repeat(3, 1, 1)),
+                ])
+
+            self.context_data = tv_datasets.MNIST(dataset_path, transform=transforms, train=True, download=True)
+            self.query_data = tv_datasets.MNIST(dataset_path, transform=transforms, train=False, download=True)
+        else:
+            print("Unsupported dataset specified: {}".format(dataset_name))
+
+        #self.context_data.classes = self.context_data.classes[0:10]
+        #self.context_data.data = self.context_data.data[0:100]
+        #for i in range(100):
+        #    self.context_data.targets[i] = i % 10
+
         self.query_mapping = map_to_classes(self.query_data)
         # Now we want splits for this per class so we can construct tasks
-        #self.class_mapping = map_to_classes(self.dataset)
         # This is the version that we'll be editing
         self.current_context_mapping = map_to_classes(self.context_data)
         self.way = way
@@ -71,12 +110,15 @@ class IdentifiableDatasetWrapper:
         return None
         
     def get_test_task(self, *args):
+        self.current_context_mapping = reset_empty_class_mapings(self.context_data, self.current_context_mapping, self.shot)
+
         c_avail = available_classes(self.current_context_mapping)
         
         # No data left, reset
-        if len(c_avail) == 0:
-            self.current_context_mapping = map_to_classes(self.context_data)
-            c_avail = available_classes(self.current_context_mapping)
+        #if len(c_avail) == 0:
+        #    self.current_context_mapping = map_to_classes(self.context_data)
+        #    c_avail = available_classes(self.current_context_mapping)
+        
         
         task_dict = {}
         task_dict["context_images"], unnormalized_context_labels, task_dict["context_ids"] = self._construct_context_set(c_avail)
@@ -122,7 +164,11 @@ class IdentifiableDatasetWrapper:
         
     def _construct_context_set(self, possible_classes):
         # Choose the classes for the task
-        task_classes = rng.choice(possible_classes, size=self.way, replace=False)
+        try:
+            task_classes = rng.choice(possible_classes, size=self.way, replace=False)
+        except ValueError:
+            print("Something bad happened when sampling classes")
+            import pdb; pdb.set_trace()
 
         task_images = torch.zeros(self._context_task_shape(), dtype=torch.float32)
         task_labels = torch.zeros(self.shot*self.way, dtype=torch.long)
@@ -131,7 +177,11 @@ class IdentifiableDatasetWrapper:
         for c in task_classes:
             c_indices = self.current_context_mapping[c]
             # From that class, choose (and remove) available instances
-            pattern_indices = rng.choice(len(c_indices), self.shot, replace=False)
+            try:
+                pattern_indices = rng.choice(len(c_indices), self.shot, replace=False)
+            except ValueError:
+                print("Something bad happened when sampling indices from {}".format(c_indices))
+                import pdb; pdb.set_trace()
             for i in pattern_indices:
                 pattern, label = self.context_data[c_indices[i]]
                 assert label == c
