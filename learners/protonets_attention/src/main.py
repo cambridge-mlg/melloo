@@ -141,7 +141,7 @@ class Learner:
 
         parser.add_argument("--dataset", choices=["meta-dataset", "meta-dataset_ilsvrc_only", "ilsvrc_2012", "omniglot", "aircraft", "cu_birds",
                                                   "dtd", "quickdraw", "fungi", "vgg_flower", "traffic_sign", "mscoco",
-                                                  "mnist", "cifar10", "cifar100", "split-cifar10"], default="meta-dataset",
+                                                  "mnist", "cifar10", "cifar100", "split-cifar10", "split-mnist"], default="meta-dataset",
                             help="Dataset to use.")
         parser.add_argument("--dataset_reader", choices=["official", "pytorch"], default="official",
                             help="Dataset reader to use.")
@@ -265,7 +265,7 @@ class Learner:
         if self.args.mode == 'train_test':
             self.test(self.log_files.fully_trained_model_path)
             self.test(self.log_files.best_validation_model_path)
-
+        #import pdb; pdb.set_trace()
         if self.args.mode == 'test':
             if self.args.task_type == "generate_coreset":
                 self.generate_coreset(self.args.test_model_path)
@@ -488,8 +488,8 @@ class Learner:
                     loo_loss =  self.loss(logits[t].unsqueeze(0), target_labels[t].unsqueeze(0))
                     loss_per_qp[t][i] = loo_loss
         #Somehow turn the loss into a weight:
-        weight_per_qp = 1.0 - loss_per_qp/loss_per_qp.max()
-        return loss_per_qp
+        #weight_per_qp = loss_per_qp/loss_per_qp.max() - 1
+        return loss_per_qp 
 
 
     def random_weights(self, context_images, context_labels, target_images, target_labels):
@@ -531,7 +531,6 @@ class Learner:
         self.model = self.init_model()
         if path != 'None':
             self.model.load_state_dict(torch.load(path))
-
         for item in self.test_set:
             accuracies_full = []
             accuracies = {}
@@ -742,8 +741,9 @@ class Learner:
                     corr, inters = self.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['random'], "Representer vs Random")
                     correlations['representer_random'].append(corr) 
                     intersections['representer_random'].append(inters)
+
                     
-                for key in rankings.keys():
+                for key in weights.keys():
                     if self.args.selection_mode == "top_k":
                         candidate_indices = self.select_top_k(weights[key], context_labels)
                     elif self.args.selection_mode == "multinomial":
@@ -773,7 +773,7 @@ class Learner:
                 for key in num_unique_labels.keys():
                     self.logger.print_and_log("Average number of unique labels ({}): {}".format(key, float(num_unique_labels[key])/float(self.args.tasks)))
 
-            for key in rankings.keys():
+            for key in weights.keys():
                 self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
             if self.args.importance_mode == 'all':
                 for key in correlations:
@@ -793,33 +793,39 @@ class Learner:
             mislabeled_indices = rng.choice(num_context_images, num_noisy, replace=False)
             # Mislabels selected images randomly
             new_context_labels[mislabeled_indices] = (new_context_labels[mislabeled_indices] + rng.integers(0, num_classes, num_noisy) + 1) % num_classes
-        elif self.args-noise_type == "ood":
-            import pdb; pdb.set_trace()
+        elif self.args.noise_type == "ood":
             # Choose a class to drop
-            class_to_drop = rng.choice(num_classes, 1)
+            class_to_drop = rng.choice(num_classes, 1)[0]
             # Relabel num_noisy-many of the patterns in the context set, choosing a random class each time
-            class_indices = extract_class_indices(task_dict["context_labels"], class_to_drop)
-            shuffled_class_indices = np.shuffle(class_indices)
+            shuffled_class_indices = extract_class_indices(torch.from_numpy(task_dict["context_labels"]), class_to_drop).numpy()
+            rng.shuffle(shuffled_class_indices)
             new_context_labels = task_dict["context_labels"].copy()
             # Normalize the new class labels
-            new_context_labels[new_context_labels > class_to_drop] = new_context_labels[new_context_labels > class_to_drop] -1
+            new_context_labels[new_context_labels > class_to_drop] -= 1
             upper_bound = min(num_noisy, len(shuffled_class_indices))
             for k in range(upper_bound):
-                new_context_labels[shuffled_class_indices[k]] = rng.integers(0, num_classes-1, 1)
+                new_context_labels[shuffled_class_indices[k]] = rng.integers(0, num_classes-1, 1)[0]
             # Remove the rest from the context set
+            new_context_images = None
             if num_noisy < len(shuffled_class_indices):
                 new_context_labels = np.delete(new_context_labels, shuffled_class_indices[num_noisy:])
-                task_dict["context_images"] = np.delete(task_dict["context_images"], shuffled_class_indices[num_noisy:], axis=0)
+                new_context_images = np.delete(task_dict["context_images"], shuffled_class_indices[num_noisy:], axis=0)
             elif num_noisy > len(shuffled_class_indices):
                 print("Diff between requested and obtained error nums: {}".format(float(num_noisy - len(shuffled_class_indices)))/float(num_context_images))
             
             mislabeled_indices = shuffled_class_indices[0:upper_bound]
             
-            # Remove the class from the target set
-            target_class_indices = extract_class_indices(task_dict["target_labels"], class_to_drop)
+            # Remove the class from the target set and keep a copy of the context set without the extra class so we can calculate clean accuracy
+            target_class_indices = extract_class_indices(torch.from_numpy(task_dict["target_labels"]), class_to_drop)
             task_dict["target_images"] = np.delete(task_dict["target_images"], target_class_indices, axis=0)
             task_dict["target_labels"] = np.delete(task_dict["target_labels"], target_class_indices)
-            
+            task_dict["target_labels"][task_dict["target_labels"] > class_to_drop] -= 1
+
+            task_dict["task_consistent_context_images"] = np.delete(task_dict["context_images"], shuffled_class_indices, axis=0)
+            task_dict["task_consistent_context_labels"] = np.delete(task_dict["context_labels"], shuffled_class_indices)
+            task_dict["task_consistent_context_labels"][task_dict["task_consistent_context_labels"] > class_to_drop] -= 1
+            task_dict["context_images"] = new_context_images
+
         task_dict["true_context_labels"] = task_dict["context_labels"]
         task_dict["context_labels"] = new_context_labels
         task_dict["noisy_context_indices"] = mislabeled_indices
@@ -850,18 +856,24 @@ class Learner:
 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
-                context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
-                # Calculate clean accuracy 
-                with torch.no_grad():
-                    target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
-                    task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
-                    accuracies_clean.append(task_accuracy)
-                    del target_logits
+                # If mislabelling, then we calculate clean accuracy before doing any mislabeling
+                if self.args.noise_type == "mislabel":
+                    context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                    # Calculate clean accuracy 
+                    with torch.no_grad():
+                        target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                        task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
+                        accuracies_clean.append(task_accuracy)
+                        del target_logits
 
                 # Noisiness
                 task_dict = self.make_noisy(task_dict)
                 context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
                 
+                # If ood, then we need to first remove the superfluous class (i.e. make noisy), 
+                # and then remove the noisy indices from the resulting context set
+                if self.args.noise_type == "ood":
+                    clean_context_images = context_images[task_dict["noisy_indices"]]
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
