@@ -176,9 +176,14 @@ def save_image(image_array, save_path):
 
 
 def extract_class_indices(labels, which_class):
-    class_mask = torch.eq(labels, which_class)  # binary mask of labels equal to which_class
-    class_mask_indices = torch.nonzero(class_mask)  # indices of labels equal to which class
-    return torch.reshape(class_mask_indices, (-1,))  # reshape to be a 1D vector
+    if isinstance(labels, torch.Tensor):
+       class_mask = torch.eq(labels, which_class)  # binary mask of labels equal to which_class
+       class_mask_indices = torch.nonzero(class_mask)  # indices of labels equal to which class
+       return torch.reshape(class_mask_indices, (-1,))  # reshape to be a 1D vector
+    else:
+        if isinstance(which_class, torch.Tensor):
+            which_class = which_class.item()
+        return np.argwhere(labels == which_class).reshape(-1)
 
 
 def merge_logits(logits, labels, method):
