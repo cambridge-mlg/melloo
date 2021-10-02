@@ -271,6 +271,7 @@ class Learner:
         if self.args.mode == 'test':
             if self.args.task_type == "generate_coreset":
                 self.generate_coreset(self.args.test_model_path)
+                #self.save_coreset_from_ranking(self.args.test_model_path)
             elif self.args.task_type == "noisy_shots":
                 self.detect_noisy_shots(self.args.test_model_path)
             elif self.args.task_type == "shot_selection":
@@ -536,6 +537,24 @@ class Learner:
             reduced_candidate_labels[reduced_candidate_labels > unc] = reduced_candidate_labels[reduced_candidate_labels > unc] - 1
         return reduced_candidate_labels, reduced_target_images, reduced_labels  
     
+
+    def save_coreset_from_ranking(self, path):
+        self.logger.print_and_log("")  # add a blank line
+        self.logger.print_and_log("Saving out top candidates from ranking")  # add a blank line
+        
+        
+        image_rankings = pickle.load(open(os.path.join(self.args.checkpoint_dir, "rankings.pickle"), "rb"))
+
+        for key in image_rankings[0].keys():
+            weights, img_ids = weights_from_multirankings(image_rankings, key)
+            candidate_indices = self.select_top_k(weights)
+            candidate_ids = img_ids[candidate_indices]
+
+            task_dict = self.dataset.get_task_from_ids(candidate_ids)
+            context_images, _, _, _ = self.prepare_task(task_dict)
+
+            self.save_image_set(0, context_images, "selected_{}".format(key))
+
     def generate_coreset(self, path):
         self.logger.print_and_log("")  # add a blank line
         self.logger.print_and_log('Generating coreset using model {0:}: '.format(path))
@@ -638,8 +657,7 @@ class Learner:
                         target_labels = target_labels.floor_divide(2)
                     
                     if ti == 0:
-                        self.save_image_set(-1, context_images, "context", labels=task_dict["context_labels"])
-                        #self.save_image_set(-1, target_images, "target", labels=task_dict["target_labels"])
+                        self.save_image_set(ti, context_images, "selected_{}".format(key))
                     
                     with torch.no_grad():
                         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
