@@ -76,10 +76,12 @@ class IdentifiableDatasetWrapper:
         else:
             print("Unsupported dataset specified: {}".format(dataset_name))
 
-        #self.context_data.classes = self.context_data.classes[0:10]
-        #self.context_data.data = self.context_data.data[0:100]
-        #for i in range(100):
-        #    self.context_data.targets[i] = i % 10
+        nc = 5
+        ns = 100
+        self.context_data.classes = self.context_data.classes[0:nc]
+        self.context_data.data = self.context_data.data[0:ns]
+        for i in range(ns):
+            self.context_data.targets[i] = i % nc
 
         self.query_mapping = map_to_classes(self.query_data)
         # Now we want splits for this per class so we can construct tasks
@@ -100,6 +102,11 @@ class IdentifiableDatasetWrapper:
             task_size = self.way * self.query_shot
         image_shape = self.query_data[0][0].shape
         return (task_size, image_shape[0], image_shape[1], image_shape[2])
+        
+    def get_total_num_classes(self):
+        num_context_classes = len(self.context_data.classes)
+        assert num_context_classes = len(self.query_data.classes)
+        return num_context_classes
         
     def get_validation_task(self, *args):
         # Not implemented
@@ -193,7 +200,50 @@ class IdentifiableDatasetWrapper:
             self.current_context_mapping[c] = np.delete(self.current_context_mapping[c], pattern_indices) 
         return task_images, task_labels, task_ids
                 
-            
+
+class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
+    def __init__(self, dataset_path, dataset_name, way, shot, query_shot):
+        IdentifiableDatasetWrapper.__init__(self, dataset_path, dataset_name, way, shot, query_shot)
+        num_context_images = len(self.context_data.labels)
+        self.current_context_ids = []
+        self.drawable_context_ids = list(range(num_context_images))
+        self.rounds_not_discarded = np.zeros(num_context_images)
         
+    # For the ValueTracking dataset wrapper, the requested way should match actual classes
+    def get_test_task(self, *args):
+        assert self.way == len(self.context_data.classes)
+        task_dict = IdentifiableDatasetWrapper.get_test_task(self, *args)
+        # Track what images are currently in rotation
+        self.current_context_ids = task_dict["context_ids].tolist()
+        # Mark the selected context images so that we don't swap them in multiple times
+        for context_id in self.current_context_ids:
+            self.drawable_context_ids.remove(context_id)
+        return task_dict
         
+    def mark_discarded(self, image_ids)
+        # Increase count for images not discarded this round
+        current_context_set = set(self.current_context_ids)
+        not_discarded_ids = list(current_context_set.difference(set(image_ids)))
+        self.rounds_not_discarded[not_discarded_ids] += 1
         
+        # Remove discarded from context set
+        for image_id in image_ids:
+            self.current_context_ids.remove(image_id)
+        
+    def sample_new_context_points(self, num_points_requested):
+        # Check whether there are new points to propose
+        # If not, reset the list of drawables, excluding current selection
+        if len(self.drawable_context_ids) == 0:
+            self.drawable_context_ids == list(range(num_context_images))
+            for context_id in self.current_context_ids:
+                self.drawable_context_ids.remove(context_id)
+          
+        indices = rng.choice(self.drawable_context_ids, size=num_points_requested, replace=False)
+        for index in indices:
+            self.drawable_context_ids.remove(index)
+        self.current_context_ids = self.current_context_ids + indices
+        
+        return self.context_data[indices], self.context_labels[indices], indices
+        
+    def get_query_set(self):
+        return self._construct_query_set(self.query_data.classes)
