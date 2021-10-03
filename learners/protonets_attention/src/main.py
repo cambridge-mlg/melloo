@@ -24,6 +24,42 @@ NUM_VALIDATION_TASKS = 200
 PRINT_FREQUENCY = 1000
 rng = default_rng()
 
+def move_set_to_cuda(images, labels):
+        if not images.is_cuda:
+            images = images.to(self.device)
+        if not labels.is_cude:
+            labels = labels.type(torch.LongTensor).to(self.device)
+        return images, labels
+        
+def np_set_to_torch(images_np, labels_np, shuffle=False):
+    images_np = images_np.transpose([0, 3, 1, 2])
+    # Don't shuffle so that we are assured consistency in the noisy shot detection case
+    if shuffle:
+        images_np, labels_np = shuffle_set(images_np, labels_np)
+    images = torch.from_numpy(images_np)
+    labels = torch.from_numpy(labels_np)
+    
+    
+def shuffle_set(images, labels):
+    """
+    Return shuffled data.
+    """
+    permutation = np.random.permutation(images.shape[0])
+    return images[permutation], labels[permutation]
+
+def prepare_task(task_dict, shuffle=False):
+    # If context_images are already a tensor, just assign
+    context_images, context_labels = task_dict['context_images'], task_dict['context_labels']
+    target_images, target_labels = task_dict['target_images'], task_dict['target_labels']
+    # Else, assume numpy format and do conversion
+    if not torch.is_tensor(context_images):
+        context_images, context_labels = np_set_to_torch(context_images, context_labels, shuffle)
+        target_images, target_labels = np_set_to_torch(target_images, target_labels, shuffle)
+
+    context_images, context_labels = move_set_to_cuda(context_images, context_labels)
+    target_images, target_labels = move_set_to_cuda(target_images, target_labels)
+    return context_images, target_images, context_labels, target_labels
+
 def save_image(image_array, save_path):
     image_array = image_array.squeeze()
     image_array = image_array.transpose([1, 2, 0])
@@ -49,14 +85,6 @@ def weights_from_multirankings(image_ranking_dict, ranking_key):
         img_ids[i] = img_id
     # Return parallel arrays of the ranking and the image id
     return agg_ranking, img_ids
-            
-    
-def calc_image_ranking_stats(image_ranking_dict):
-    counts = [len(image_ranking_dict[k]) for k in image_ranking_dict.keys()]
-    # histogram the counts?
-    
-    # aggregate rankings for each image so we can select top
-
 
 def main():
     learner = Learner()
@@ -75,12 +103,15 @@ class Learner:
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.model = self.init_model()
         self.train_set, self.validation_set, self.test_set = self.init_data()
+        value_tracking = self.args.task_type == "generate_coreset_discard"
+        
         self.dataset = get_dataset_reader(
             args=self.args,
             train_set=self.train_set,
             validation_set=self.validation_set,
             test_set=self.test_set,
-            device=self.device)
+            device=self.device,
+            value_tracking)
 
         self.loss = cross_entropy_loss
         self.accuracy_fn = categorical_accuracy
@@ -195,7 +226,7 @@ class Learner:
         parser.add_argument("--l2_regularize_classifier", dest="l2_regularize_classifier", default=False,
                             action="store_true", help="If True, perform l2 regularization on the classifier head.")
         # Melloo task type and related settings
-        parser.add_argument("--task_type", choices=["generate_coreset", "noisy_shots", "shot_selection"], default="generate_coreset",
+        parser.add_argument("--task_type", choices=["generate_coreset", "generate_coreset_discard", "noisy_shots", "shot_selection"], default="generate_coreset",
                             help="Task to perform. Options are generate_coreset, noisy_shots or shot_selection")
         parser.add_argument("--tasks", type=int, default=10, help="Number of test tasks to do")
         parser.add_argument("--test_case", choices=["default", "bimodal", "noise", "unrelated"], default="default",
@@ -271,6 +302,8 @@ class Learner:
         if self.args.mode == 'test':
             if self.args.task_type == "generate_coreset":
                 self.generate_coreset(self.args.test_model_path)
+            elif self.args.task_type == "generate_coreset_discard":
+                self.generate_coreset_discard(self.args.test_model_path)
                 #self.save_coreset_from_ranking(self.args.test_model_path)
             elif self.args.task_type == "noisy_shots":
                 self.detect_noisy_shots(self.args.test_model_path)
@@ -286,7 +319,7 @@ class Learner:
             return value
 
     def train_task(self, task_dict):
-        context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+        context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
 
         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TRAIN)
         task_loss = self.loss(target_logits, target_labels)
@@ -311,7 +344,7 @@ class Learner:
                 accuracies = []
                 for _ in range(NUM_VALIDATION_TASKS):
                     task_dict = self.dataset.get_validation_task(item)
-                    context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                    context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     accuracy = self.accuracy_fn(target_logits, target_labels)
                     accuracies.append(accuracy.item())
@@ -336,7 +369,7 @@ class Learner:
             protonets_accuracies = []
             for _ in range(self.args.tasks):
                 task_dict = self.dataset.get_test_task(item)
-                context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
                 # Do the forward pass with the target set so that we can get the feature embeddings
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels,
@@ -551,13 +584,97 @@ class Learner:
             candidate_ids = img_ids[candidate_indices]
 
             task_dict = self.dataset.get_task_from_ids(candidate_ids)
-            context_images, _, _, _ = self.prepare_task(task_dict)
+            context_images, _, _, _ = prepare_task(task_dict)
 
             self.save_image_set(0, context_images, "selected_{}".format(key))
 
+    def generate_coreset_discard(self, path):
+        self.logger.print_and_log("")  # add a blank line
+        self.logger.print_and_log('Generating coreset (by discard) using model {0:}: '.format(path))
+        self.model = self.init_model()
+        if path != 'None':
+            self.model.load_state_dict(torch.load(path))
+
+        for item in self.test_set:
+            accuracies = []
+            if self.args.importance_mode == 'all':
+                self.print_and_log_metric("Error - coreset construction by discard does not support doing all importance modes simultaneously")
+                return
+            ranking_mode = self.args.importance_mode    
+            
+            # Start with the original, random context set
+            task_dict = self.dataset.get_test_task(item)
+            context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
+            img_ids = task_dict["context_ids"]
+            
+            for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
+                
+                with torch.no_grad():
+                    target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
+                    accuracies.append(task_accuracy)
+                    del target_logits
+                
+                # Save the target/context features
+                # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
+                if ranking_mode == "attention":
+                    with torch.no_grad():
+                        self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                        # Make a copy of the target features, otherwise we get a reference to what the model is storing
+                        # (and we're about to send another task through it, so that's not what we want)
+                        context_features, target_features = self.model.context_features.clone(), self.model.target_features.clone()
+
+                if ranking_mode == 'loo':
+                    weight_per_qp = self.calculate_loo(context_images, context_labels, target_images, target_labels)
+                elif ranking_mode == 'attention':
+                    # Make a copy of the attention weights otherwise we get a reference to what the model is storing
+                    with torch.no_grad():
+                        self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    attention_weights = self.model.attention_weights.copy()
+                    weight_per_qp = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
+                elif ranking_mode == 'representer':
+                    weight_per_qp = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
+                elif ranking_mode == 'random':
+                    weight_per_qp = self.random_weights(context_images, context_labels, target_images, target_labels)
+                    
+                # May want to normalize here:
+                weights = weight_per_qp.sum(dim=0)
+                rankings = torch.argsort(weights, descending=True)
+                normalized_rankings = rankings/(rankings.max() - rankings.min())
+                
+                # Discard least valuable point/s
+                candidate_indices = self.select_by_dropping(weights) #TODO Different selector
+                candidate_ids = img_ids[candidate_indices]
+                self.dataset.mark_discarded(candidate_ids)
+                
+                if ti % 100 == 0:
+                    self.save_image_set(ti, context_images, "context_{}".format(ti))
+                    self.save_image_set(ti, context_images[candidate_indices], "discard_{}".format(ti))
+                    
+                if ti < self.args.tasks -1:
+                    # Request new points to replace those
+                    new_images, new_labels, new_ids = self.dataset.sample_new_context_points(self.args.top_k)
+                    # Remove the old points, replace with new points
+                    # TODO: Check that we aren't messing with split_dataset's data by doing this here
+                    img_ids = np.delete(img_ids, candidate_indices)
+                    context_images = np.delete(task_dict["context_images"], candidate_indices)
+                    context_labels = np.delete(task_dict["context_labels"], candidate_indices)
+                    context_images = np.append(context_images, new_images)
+                    context_labels = np.append(context_labels, new_labels)
+                    img_ids = np.append(img_ids, new_ids)
+                    # Re-prepare data
+                    context_images, context_labels = move_set_to_cuda(np_set_to_torch(context_images, context_labels))
+                    # Get new query set as well
+                    target_images, target_labels = move_set_to_cuda(np_set_to_torch(self.dataset.get_query_set()))
+
+            self.print_and_log_metric(accuracies, item, 'Accuracy')
+            self.save_image_set(ti, context_images, "context_final".format(ti))
+            self.logger.log("Accuracies over tasks")
+            self.logger.log("{}".format(accuracies))
+
     def generate_coreset(self, path):
         self.logger.print_and_log("")  # add a blank line
-        self.logger.print_and_log('Generating coreset using model {0:}: '.format(path))
+        self.logger.print_and_log('Generating coreset (full scoring) using model {0:}: '.format(path))
         self.model = self.init_model()
         if path != 'None':
             self.model.load_state_dict(torch.load(path))
@@ -583,7 +700,7 @@ class Learner:
 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
-                context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
                 if self.args.test_case == "bimodal":
                     context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
                     context_labels = context_labels.floor_divide(2)
@@ -650,7 +767,7 @@ class Learner:
                 eval_accuracies = []
                 for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                     task_dict = self.dataset.get_task_from_ids(candidate_ids)
-                    context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                    context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
                     if self.args.test_case == "bimodal":
                         context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
                         context_labels = context_labels.floor_divide(2)
@@ -700,7 +817,7 @@ class Learner:
 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
-                context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
                 if self.args.test_case == "bimodal":
                     context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
                     context_labels = context_labels.floor_divide(2)
@@ -930,7 +1047,7 @@ class Learner:
                 task_dict = self.dataset.get_test_task(item)
                 # If mislabelling, then we calculate clean accuracy before doing any mislabeling
                 if self.args.noise_type == "mislabel":
-                    context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                    context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
                     # Calculate clean accuracy 
                     with torch.no_grad():
                         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
@@ -940,7 +1057,7 @@ class Learner:
 
                 # Noisiness
                 task_dict = self.make_noisy(task_dict)
-                context_images, target_images, context_labels, target_labels = self.prepare_task(task_dict)
+                context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
 
                 # For now, just don't bother with "clean" accuracy; it's hard to be comparable
                 # If ood, then we need to first remove the superfluous class (i.e. make noisy), 
@@ -1169,40 +1286,6 @@ class Learner:
                 
         return weights_per_query_point
 
-    def prepare_task(self, task_dict, shuffle=False):
-        # If context_images are already a tensor, just assign
-        if torch.is_tensor(task_dict['context_images']):
-            context_images = task_dict['context_images']
-            target_images = task_dict['target_images']
-            context_labels = task_dict['context_labels']
-            target_labels = task_dict['target_labels']
-        # Else, assume numpy format and do conversion
-        else:
-            context_images_np, context_labels_np = task_dict['context_images'], task_dict['context_labels']
-            target_images_np, target_labels_np = task_dict['target_images'], task_dict['target_labels']
-            
-            context_images_np = context_images_np.transpose([0, 3, 1, 2])
-            # Don't shuffle so that we are assured consistency in the noisy shot detection case
-            if shuffle:
-                context_images_np, context_labels_np = self.shuffle(context_images_np, context_labels_np)
-            context_images = torch.from_numpy(context_images_np)
-            context_labels = torch.from_numpy(context_labels_np)
-
-            target_images_np = target_images_np.transpose([0, 3, 1, 2])
-            if shuffle:
-                target_images_np, target_labels_np = self.shuffle(target_images_np, target_labels_np)
-            target_images = torch.from_numpy(target_images_np)
-            target_labels = torch.from_numpy(target_labels_np)
-
-        # If context_images aren't on gpu, assume everything should be moved
-        if not context_images.is_cuda:
-            context_images = context_images.to(self.device)
-            target_images = target_images.to(self.device)
-            context_labels = context_labels.type(torch.LongTensor).to(self.device)
-            target_labels = target_labels.type(torch.LongTensor).to(self.device)
-
-        return context_images, target_images, context_labels, target_labels
-
     def slim_images_and_labels(self, images, labels):
         slimmed_images = []
         slimmed_labels = []
@@ -1297,13 +1380,6 @@ class Learner:
                     continue
 
         return context_images
-
-    def shuffle(self, images, labels):
-        """
-        Return shuffled data.
-        """
-        permutation = np.random.permutation(images.shape[0])
-        return images[permutation], labels[permutation]
 
     def use_two_gpus(self):
         use_two_gpus = False
