@@ -8,6 +8,12 @@ from PIL import Image
 
 rng = default_rng()
 
+def convert_to_array(my_list):
+    if type(my_list) == np.int32 or type(my_list) == int:
+        return np.array([my_list])
+    return my_list
+
+
 def map_to_classes(dataset):
     class_mapping = []
     for c in range(len(dataset.classes)):
@@ -76,12 +82,13 @@ class IdentifiableDatasetWrapper:
         else:
             print("Unsupported dataset specified: {}".format(dataset_name))
 
-        nc = 5
-        ns = 100
-        self.context_data.classes = self.context_data.classes[0:nc]
-        self.context_data.data = self.context_data.data[0:ns]
-        for i in range(ns):
-            self.context_data.targets[i] = i % nc
+        #nc = 2
+        #ns = 15
+        #self.context_data.classes = self.context_data.classes[0:nc]
+        #self.context_data.data = self.context_data.data[0:ns]
+        #self.context_data.targets = self.context_data.targets[0:ns]
+        #for i in range(ns):
+        #    self.context_data.targets[i] = i % nc
 
         self.query_mapping = map_to_classes(self.query_data)
         # Now we want splits for this per class so we can construct tasks
@@ -105,7 +112,7 @@ class IdentifiableDatasetWrapper:
         
     def get_total_num_classes(self):
         num_context_classes = len(self.context_data.classes)
-        assert num_context_classes = len(self.query_data.classes)
+        assert num_context_classes == len(self.query_data.classes)
         return num_context_classes
         
     def get_validation_task(self, *args):
@@ -204,7 +211,7 @@ class IdentifiableDatasetWrapper:
 class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
     def __init__(self, dataset_path, dataset_name, way, shot, query_shot):
         IdentifiableDatasetWrapper.__init__(self, dataset_path, dataset_name, way, shot, query_shot)
-        num_context_images = len(self.context_data.labels)
+        num_context_images = len(self.context_data.targets)
         self.current_context_ids = []
         self.drawable_context_ids = list(range(num_context_images))
         self.rounds_not_discarded = np.zeros(num_context_images)
@@ -214,36 +221,44 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
         assert self.way == len(self.context_data.classes)
         task_dict = IdentifiableDatasetWrapper.get_test_task(self, *args)
         # Track what images are currently in rotation
-        self.current_context_ids = task_dict["context_ids].tolist()
+        self.current_context_ids = task_dict["context_ids"].tolist()
         # Mark the selected context images so that we don't swap them in multiple times
         for context_id in self.current_context_ids:
             self.drawable_context_ids.remove(context_id)
         return task_dict
         
-    def mark_discarded(self, image_ids)
+    def mark_discarded(self, image_ids):
+        image_ids = convert_to_array(image_ids)
+
         # Increase count for images not discarded this round
         current_context_set = set(self.current_context_ids)
         not_discarded_ids = list(current_context_set.difference(set(image_ids)))
         self.rounds_not_discarded[not_discarded_ids] += 1
-        
-        # Remove discarded from context set
-        for image_id in image_ids:
-            self.current_context_ids.remove(image_id)
+        try:
+            # Remove discarded from context set
+            for image_id in image_ids:
+                self.current_context_ids.remove(image_id)
+        except ValueError:
+            import pdb; pdb.set_trace()
         
     def sample_new_context_points(self, num_points_requested):
         # Check whether there are new points to propose
         # If not, reset the list of drawables, excluding current selection
-        if len(self.drawable_context_ids) == 0:
-            self.drawable_context_ids == list(range(num_context_images))
+        if len(self.drawable_context_ids) < num_points_requested:
+            self.drawable_context_ids = list(range(len(self.context_data)))
             for context_id in self.current_context_ids:
                 self.drawable_context_ids.remove(context_id)
           
         indices = rng.choice(self.drawable_context_ids, size=num_points_requested, replace=False)
         for index in indices:
             self.drawable_context_ids.remove(index)
-        self.current_context_ids = self.current_context_ids + indices
+        self.current_context_ids = self.current_context_ids + indices.tolist()
         
-        return self.context_data[indices], self.context_labels[indices], indices
+        context_images = torch.zeros(self._context_task_shape(num_points_requested))
+        context_labels = torch.zeros(num_points_requested, dtype=torch.long)
+        for i, id in enumerate(indices):
+            context_images[i], context_labels[i] = self.context_data[id]
+        return context_images, context_labels, indices
         
     def get_query_set(self):
-        return self._construct_query_set(self.query_data.classes)
+        return self._construct_query_set(range(len(self.query_data.classes)))

@@ -24,14 +24,21 @@ NUM_VALIDATION_TASKS = 200
 PRINT_FREQUENCY = 1000
 rng = default_rng()
 
-def move_set_to_cuda(images, labels):
+def convert_to_array(my_list):
+    if type(my_list) == np.int32:
+        return np.array([my_list])
+    return my_list
+
+def move_set_to_cuda(images, labels, device):
         if not images.is_cuda:
-            images = images.to(self.device)
-        if not labels.is_cude:
-            labels = labels.type(torch.LongTensor).to(self.device)
+            images = images.to(device)
+        if not labels.is_cuda:
+            labels = labels.type(torch.LongTensor).to(device)
         return images, labels
         
 def np_set_to_torch(images_np, labels_np, shuffle=False):
+    if len(images_np.shape) == 3:
+        images_np = images_np.unsqueeze(0)
     images_np = images_np.transpose([0, 3, 1, 2])
     # Don't shuffle so that we are assured consistency in the noisy shot detection case
     if shuffle:
@@ -47,7 +54,7 @@ def shuffle_set(images, labels):
     permutation = np.random.permutation(images.shape[0])
     return images[permutation], labels[permutation]
 
-def prepare_task(task_dict, shuffle=False):
+def prepare_task(task_dict, device, shuffle=False):
     # If context_images are already a tensor, just assign
     context_images, context_labels = task_dict['context_images'], task_dict['context_labels']
     target_images, target_labels = task_dict['target_images'], task_dict['target_labels']
@@ -56,8 +63,8 @@ def prepare_task(task_dict, shuffle=False):
         context_images, context_labels = np_set_to_torch(context_images, context_labels, shuffle)
         target_images, target_labels = np_set_to_torch(target_images, target_labels, shuffle)
 
-    context_images, context_labels = move_set_to_cuda(context_images, context_labels)
-    target_images, target_labels = move_set_to_cuda(target_images, target_labels)
+    context_images, context_labels = move_set_to_cuda(context_images, context_labels, device)
+    target_images, target_labels = move_set_to_cuda(target_images, target_labels, device)
     return context_images, target_images, context_labels, target_labels
 
 def save_image(image_array, save_path):
@@ -78,13 +85,13 @@ def add_image_rankings(image_ranking_dict, image_key, image, ranking_key, rankin
     
 def weights_from_multirankings(image_ranking_dict, ranking_key):
     agg_ranking = torch.zeros(len(image_ranking_dict.keys()))
-    img_ids = np.zeros(len(agg_ranking), dtype=np.int)
+    image_ids = np.zeros(len(agg_ranking), dtype=np.int)
     # For each image
     for i, img_id in enumerate(image_ranking_dict.keys()):
         agg_ranking[i] = image_ranking_dict[img_id][ranking_key].sum().item()
-        img_ids[i] = img_id
+        image_ids[i] = img_id
     # Return parallel arrays of the ranking and the image id
-    return agg_ranking, img_ids
+    return agg_ranking, image_ids
 
 def main():
     learner = Learner()
@@ -111,7 +118,7 @@ class Learner:
             validation_set=self.validation_set,
             test_set=self.test_set,
             device=self.device,
-            value_tracking)
+            value_tracking=value_tracking)
 
         self.loss = cross_entropy_loss
         self.accuracy_fn = categorical_accuracy
@@ -130,7 +137,7 @@ class Learner:
             assert self.args.selection_mode != "drop"
         else:
             assert self.args.spread_constraint == "none"
-            if self.args.task_type == "noisy_shots":
+            if self.args.task_type == "noisy_shots" or self.args.task_type == "generate_coreset_discard":
                 assert self.args.selection_mode == "drop"
             else:
                 assert self.args.selection_mode != "drop"
@@ -319,7 +326,7 @@ class Learner:
             return value
 
     def train_task(self, task_dict):
-        context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
+        context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
 
         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TRAIN)
         task_loss = self.loss(target_logits, target_labels)
@@ -344,7 +351,7 @@ class Learner:
                 accuracies = []
                 for _ in range(NUM_VALIDATION_TASKS):
                     task_dict = self.dataset.get_validation_task(item)
-                    context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
+                    context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     accuracy = self.accuracy_fn(target_logits, target_labels)
                     accuracies.append(accuracy.item())
@@ -369,7 +376,7 @@ class Learner:
             protonets_accuracies = []
             for _ in range(self.args.tasks):
                 task_dict = self.dataset.get_test_task(item)
-                context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
+                context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
                 # Do the forward pass with the target set so that we can get the feature embeddings
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels,
@@ -500,6 +507,7 @@ class Learner:
         return representers_agg
 
     def calculate_loo(self,  context_images, context_labels, target_images, target_labels):
+        target_classes = target_labels.unique()
         loss_per_qp = torch.zeros((len(target_labels), len(context_labels)))
         with torch.no_grad():
             for i in range(context_images.shape[0]):
@@ -511,18 +519,31 @@ class Learner:
                     context_labels_loo = torch.cat((context_labels[0:i], context_labels[i + 1:]), 0)
                     
                 # Handle the case where we're dropping the only instance of a class
-                #reduced_context_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(context_labels_loo, target_images, target_labels)
+                # These labels are all re-normalized
+                reduced_context_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(context_labels_loo, target_images, target_labels)
+                represented_classes = []
+                for cc in target_classes:
+                    if cc in context_labels_loo:
+                        represented_classes.append(cc.item())
 
                 # Calculate accuracy on task using only selected candidates as context points
-                # target_logits = self.model(context_images_loo, reduced_context_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
-                # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
-                # task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels)) # TODO: We should add random accuracy back in, not zero.
-                # accuracies[key].append(task_accuracy)
+                reduced_target_logits = self.model(context_images_loo, reduced_context_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
 
-                logits = self.model(context_images_loo, context_labels_loo, target_images, target_labels, MetaLearningState.META_TEST)
+                #logits = self.model(context_images_loo, context_labels_loo, target_images, target_labels, MetaLearningState.META_TEST)
+                rt = 0
                 for t in range(len(target_labels)):
-                    loo_loss =  self.loss(logits[t].unsqueeze(0), target_labels[t].unsqueeze(0))
-                    loss_per_qp[t][i] = loo_loss
+                    # If this target label wasn't removed 
+                    if target_labels[t].item() in represented_classes:
+                        loo_loss =  self.loss(reduced_target_logits[rt].unsqueeze(0), reduced_target_labels[rt].unsqueeze(0))
+                        loss_per_qp[t][i] = loo_loss
+                        rt += 1
+                    else:
+                        # Add the things that were incorrectly classified by default, because they weren't represented in the loo context set
+                        equal_chance_logits = torch.tensor([1.0/float(len(target_classes))]).repeat(len(target_classes)).to(self.device)
+                        loo_loss = self.loss(equal_chance_logits.unsqueeze(0), target_labels[t].unsqueeze(0))
+                        loss_per_qp[t][i] = loo_loss
+                        
+                
         #Somehow turn the loss into a weight:
         #weight_per_qp = loss_per_qp/loss_per_qp.max() - 1
         return loss_per_qp 
@@ -579,12 +600,12 @@ class Learner:
         image_rankings = pickle.load(open(os.path.join(self.args.checkpoint_dir, "rankings.pickle"), "rb"))
 
         for key in image_rankings[0].keys():
-            weights, img_ids = weights_from_multirankings(image_rankings, key)
+            weights, image_ids = weights_from_multirankings(image_rankings, key)
             candidate_indices = self.select_top_k(weights)
-            candidate_ids = img_ids[candidate_indices]
+            candidate_ids = image_ids[candidate_indices]
 
             task_dict = self.dataset.get_task_from_ids(candidate_ids)
-            context_images, _, _, _ = prepare_task(task_dict)
+            context_images, _, _, _ = prepare_task(task_dict, self.device)
 
             self.save_image_set(0, context_images, "selected_{}".format(key))
 
@@ -595,6 +616,10 @@ class Learner:
         if path != 'None':
             self.model.load_state_dict(torch.load(path))
 
+        save_out_interval = 500
+        if self.args.tasks < 1000:
+            save_out_interval = 100
+
         for item in self.test_set:
             accuracies = []
             if self.args.importance_mode == 'all':
@@ -604,8 +629,8 @@ class Learner:
             
             # Start with the original, random context set
             task_dict = self.dataset.get_test_task(item)
-            context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
-            img_ids = task_dict["context_ids"]
+            context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
+            image_ids = task_dict["context_ids"]
             
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 
@@ -643,29 +668,30 @@ class Learner:
                 normalized_rankings = rankings/(rankings.max() - rankings.min())
                 
                 # Discard least valuable point/s
-                candidate_indices = self.select_by_dropping(weights) #TODO Different selector
-                candidate_ids = img_ids[candidate_indices]
-                self.dataset.mark_discarded(candidate_ids)
+                candidate_indices, dropped_indices = self.select_by_dropping(weights, use_top_k=True)
+                candidate_ids = image_ids[candidate_indices]
+                dropped_ids = image_ids[dropped_indices]
+                self.dataset.mark_discarded(dropped_ids)
                 
-                if ti % 100 == 0:
-                    self.save_image_set(ti, context_images, "context_{}".format(ti))
-                    self.save_image_set(ti, context_images[candidate_indices], "discard_{}".format(ti))
+                if ti % save_out_interval == 0:
+                    self.save_image_set(ti, context_images[candidate_indices], "keep_{}".format(ti))
+                    self.save_image_set(ti, context_images[dropped_indices], "discard_{}".format(ti))
                     
                 if ti < self.args.tasks -1:
                     # Request new points to replace those
                     new_images, new_labels, new_ids = self.dataset.sample_new_context_points(self.args.top_k)
-                    # Remove the old points, replace with new points
-                    # TODO: Check that we aren't messing with split_dataset's data by doing this here
-                    img_ids = np.delete(img_ids, candidate_indices)
-                    context_images = np.delete(task_dict["context_images"], candidate_indices)
-                    context_labels = np.delete(task_dict["context_labels"], candidate_indices)
-                    context_images = np.append(context_images, new_images)
-                    context_labels = np.append(context_labels, new_labels)
-                    img_ids = np.append(img_ids, new_ids)
                     # Re-prepare data
-                    context_images, context_labels = move_set_to_cuda(np_set_to_torch(context_images, context_labels))
+                    new_images, new_labels = move_set_to_cuda(new_images, new_labels, self.device)
+
+                    for i, id in enumerate(new_ids):
+                        context_images[dropped_indices[i]] = new_images[i]
+                        context_labels[dropped_indices[i]] = new_labels[i]
+                        image_ids[dropped_indices[i]] = id
+                    # Remove the old points, replace with new points
+
                     # Get new query set as well
-                    target_images, target_labels = move_set_to_cuda(np_set_to_torch(self.dataset.get_query_set()))
+                    target_images, target_labels, _ = self.dataset.get_query_set()
+                    target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
 
             self.print_and_log_metric(accuracies, item, 'Accuracy')
             self.save_image_set(ti, context_images, "context_final".format(ti))
@@ -700,7 +726,7 @@ class Learner:
 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
-                context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
+                context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
                 if self.args.test_case == "bimodal":
                     context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
                     context_labels = context_labels.floor_divide(2)
@@ -760,14 +786,14 @@ class Learner:
             pickle.dump(image_rankings, open(os.path.join(self.args.checkpoint_dir, "rankings.pickle"), "wb"))
 
             for key in rankings.keys():
-                weights, img_ids = weights_from_multirankings(image_rankings, key)
+                weights, image_ids = weights_from_multirankings(image_rankings, key)
                 candidate_indices = self.select_top_k(weights)
-                candidate_ids = img_ids[candidate_indices]
+                candidate_ids = image_ids[candidate_indices]
                 # Evaluate those indices:
                 eval_accuracies = []
                 for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                     task_dict = self.dataset.get_task_from_ids(candidate_ids)
-                    context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
+                    context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
                     if self.args.test_case == "bimodal":
                         context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
                         context_labels = context_labels.floor_divide(2)
@@ -817,7 +843,7 @@ class Learner:
 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
-                context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
+                context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
                 if self.args.test_case == "bimodal":
                     context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
                     context_labels = context_labels.floor_divide(2)
@@ -1047,7 +1073,7 @@ class Learner:
                 task_dict = self.dataset.get_test_task(item)
                 # If mislabelling, then we calculate clean accuracy before doing any mislabeling
                 if self.args.noise_type == "mislabel":
-                    context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
+                    context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
                     # Calculate clean accuracy 
                     with torch.no_grad():
                         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
@@ -1057,7 +1083,7 @@ class Learner:
 
                 # Noisiness
                 task_dict = self.make_noisy(task_dict)
-                context_images, target_images, context_labels, target_labels = prepare_task(task_dict)
+                context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
 
                 # For now, just don't bother with "clean" accuracy; it's hard to be comparable
                 # If ood, then we need to first remove the superfluous class (i.e. make noisy), 
@@ -1205,8 +1231,11 @@ class Learner:
             selected_indices += [cand]
         return selected_indices, weight_terms, diversity_terms
 
-    def select_by_dropping(self, weights):
-        num_to_keep = int(len(weights) * (1 - self.args.drop_rate))
+    def select_by_dropping(self, weights, use_top_k=False):
+        if use_top_k:
+            num_to_keep = len(weights) - self.args.top_k
+        else:
+            num_to_keep = int(len(weights) * (1 - self.args.drop_rate))
         ranking = torch.argsort(weights, descending=True)
         return ranking[0:num_to_keep], ranking[num_to_keep:]
 
