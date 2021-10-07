@@ -617,7 +617,10 @@ class Learner:
             self.model.load_state_dict(torch.load(path))
 
         save_out_interval = 500
-        if self.args.tasks < 1000:
+        if self.args.tasks <= 1000:
+            #if self.args.top_k == 1:
+            #    save_out_interval = 1
+            #else:
             save_out_interval = 100
 
         for item in self.test_set:
