@@ -82,13 +82,18 @@ class IdentifiableDatasetWrapper:
         else:
             print("Unsupported dataset specified: {}".format(dataset_name))
 
-        #nc = 2
-        #ns = 15
-        #self.context_data.classes = self.context_data.classes[0:nc]
-        #self.context_data.data = self.context_data.data[0:ns]
-        #self.context_data.targets = self.context_data.targets[0:ns]
-        #for i in range(ns):
-        #    self.context_data.targets[i] = i % nc
+        nc = 2
+        ns = 15
+        self.context_data.classes = self.context_data.classes[0:nc]
+        self.context_data.data = self.context_data.data[0:ns]
+        self.context_data.targets = self.context_data.targets[0:ns]
+        for i in range(ns):
+            self.context_data.targets[i] = i % nc
+        self.query_data.classes = self.query_data.classes[0:nc]
+        self.query_data.data = self.query_data.data[0:ns*5]
+        self.query_data.targets = self.query_data.targets[0:ns*5]
+        for i in range(ns*5):
+            self.query_data.targets[i] = i % nc
 
         self.query_mapping = map_to_classes(self.query_data)
         # Now we want splits for this per class so we can construct tasks
@@ -215,6 +220,7 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
         self.current_context_ids = []
         self.drawable_context_ids = list(range(num_context_images))
         self.rounds_not_discarded = np.zeros(num_context_images)
+        self.returned_label_counts = {}
         
     # For the ValueTracking dataset wrapper, the requested way should match actual classes
     def get_test_task(self, *args):
@@ -223,8 +229,12 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
         # Track what images are currently in rotation
         self.current_context_ids = task_dict["context_ids"].tolist()
         # Mark the selected context images so that we don't swap them in multiple times
-        for context_id in self.current_context_ids:
+        for i, context_id in enumerate(self.current_context_ids):
             self.drawable_context_ids.remove(context_id)
+            if task_dict["context_labels"][i] in self.returned_label_counts:
+                self.returned_label_counts[task_dict["context_labels"][i]] += 1
+            else:
+                self.returned_label_counts[task_dict["context_labels"][i]] = 1
         return task_dict
         
     def mark_discarded(self, image_ids):
@@ -258,6 +268,10 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
         context_labels = torch.zeros(num_points_requested, dtype=torch.long)
         for i, id in enumerate(indices):
             context_images[i], context_labels[i] = self.context_data[id]
+            if context_labels[i] in self.returned_label_counts:
+                self.returned_label_counts[context_labels[i]] += 1
+            else:
+                self.returned_label_counts[context_labels[i]] = 1
         return context_images, context_labels, indices
         
     def get_query_set(self):

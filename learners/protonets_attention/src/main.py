@@ -1,5 +1,6 @@
 import torch
 import torchvision.transforms.functional as tvf
+from torch.distributions import Categorical
 import numpy as np
 from numpy.random import default_rng
 import argparse
@@ -616,6 +617,7 @@ class Learner:
         if path != 'None':
             self.model.load_state_dict(torch.load(path))
 
+        ranking_mode = self.args.importance_mode  
         save_out_interval = 500
         if self.args.tasks <= 1000:
             #if self.args.top_k == 1:
@@ -625,10 +627,10 @@ class Learner:
 
         for item in self.test_set:
             accuracies = []
+            entropies = []
             if self.args.importance_mode == 'all':
                 self.print_and_log_metric("Error - coreset construction by discard does not support doing all importance modes simultaneously")
-                return
-            ranking_mode = self.args.importance_mode    
+                return  
             
             # Start with the original, random context set
             task_dict = self.dataset.get_test_task(item)
@@ -642,6 +644,9 @@ class Learner:
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                     accuracies.append(task_accuracy)
                     del target_logits
+                import pdb; pdb.set_trace()
+                probs = context_labels.sum(dim=0)/float(len(context_labels.unique()))
+                entropies.append(Categorical(probs=probs).entropy)
                 
                 # Save the target/context features
                 # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
@@ -677,8 +682,8 @@ class Learner:
                 self.dataset.mark_discarded(dropped_ids)
                 
                 if ti % save_out_interval == 0:
-                    self.save_image_set(ti, context_images[candidate_indices], "keep_{}".format(ti))
-                    self.save_image_set(ti, context_images[dropped_indices], "discard_{}".format(ti))
+                    self.save_image_set(ti, context_images[candidate_indices], "keep_{}".format(ti), labels=context_labels[candidate_indices])
+                    self.save_image_set(ti, context_images[dropped_indices], "discard_{}".format(ti), labels=context_labels[dropped_indices])
                     
                 if ti < self.args.tasks -1:
                     # Request new points to replace those
@@ -697,9 +702,25 @@ class Learner:
                     target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
 
             self.print_and_log_metric(accuracies, item, 'Accuracy')
-            self.save_image_set(ti, context_images, "context_final".format(ti))
-            self.logger.log("Accuracies over tasks")
-            self.logger.log("{}".format(accuracies))
+            self.save_image_set(ti, context_images, "context_final".format(ti), labels=context_labels)
+            self.plot_and_log(accuracies, "Accuracies over tasks", "accuracies.png")
+            self.plot_and_log(entropies, "Entropy of context labels", "entropy.png")
+            self.bar_plot_and_log(list(self.dataset.returned_label_counts.keys()), self.dataset.returned_label_counts.values(), "Returned label counts: ", "returned_label_counts.png")
+            
+    def plot_and_log(self, vals, descrip, filename, bar=False):
+        self.logger.log(descrip)
+        self.logger.log("{}".format(vals))
+        plt.plot(vals)
+        plt.savefig(os.path.join(self.args.checkpoint_dir, filename))
+        plt.close()
+        
+    def bar_plot_and_log(self, keys, vals, descrip, filename, bar=False):
+        self.logger.log(descrip)
+        for key, val in zip(keys, values):
+            self.logger.log("{} : {}".format(key, val))
+        plt.bar(keys, vals)
+        plt.savefig(os.path.join(self.args.checkpoint_dir, filename))
+        plt.close()
 
     def generate_coreset(self, path):
         self.logger.print_and_log("")  # add a blank line
