@@ -317,7 +317,10 @@ class Learner:
             elif self.args.task_type == "noisy_shots":
                 self.detect_noisy_shots(self.args.test_model_path)
             elif self.args.task_type == "shot_selection":
-                self.select_shots(self.args.test_model_path)
+                if self.args.test_case == "bimodal":
+                    self.funky_bimodal_task(self.args.test_model_path)
+                else:
+                    self.select_shots(self.args.test_model_path)
             else:
                 print("Unsupported task specified")
 
@@ -852,6 +855,145 @@ class Learner:
                         del target_logits
                     
                 self.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy ({})'.format(key))
+
+    def _funky_bimodal_inner_loop(context_images, context_labels, target_images, target_labels, ranking_modes, accuracies, num_unique_labels, ti):
+        full_accuracy = -1
+        rankings_per_qp = {}
+        weights_per_qp = {}
+        rankings = {}
+        weights = {}
+        
+        if ti < 10:
+            self.save_image_set(ti, context_images, "context")
+            self.save_image_set(ti, target_images, "target")
+        
+        with torch.no_grad():
+            target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+            full_accuracy = self.accuracy_fn(target_logits, target_labels).item()
+            del target_logits
+        
+        # Save the target/context features
+        # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
+        with torch.no_grad():
+            self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+            # Make a copy of the target features, otherwise we get a reference to what the model is storing
+            # (and we're about to send another task through it, so that's not what we want)
+            context_features, target_features = self.model.context_features.clone(), self.model.target_features.clone()
+        
+        for mode in ranking_modes:
+
+            if mode == 'loo':
+                weights_per_qp['loo'] = self.calculate_loo(context_images, context_labels, target_images, target_labels)
+            elif mode == 'attention':
+                # Make a copy of the attention weights otherwise we get a reference to what the model is storing
+                with torch.no_grad():
+                    self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                attention_weights = self.model.attention_weights.copy()
+                weights_per_qp['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
+                
+            elif mode == 'representer':
+                weights_per_qp['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
+            elif mode == 'random':
+                weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
+            rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
+            # May want to normalize here:
+            weights[mode] = weights_per_qp[mode].sum(dim=0)
+
+        for key in weights.keys():
+            if self.args.selection_mode == "top_k":
+                candidate_indices = self.select_top_k(weights[key], context_labels)
+            elif self.args.selection_mode == "multinomial":
+                candidate_indices = self.select_multinomial(weights[key], context_labels)
+            elif self.args.selection_mode == "divine":
+                candidate_indices = self.select_divine(weights[key], context_features, context_labels, key)
+            candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
+
+            # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
+            reduced_candidate_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(candidate_labels, target_images, target_labels)
+
+            num_unique_labels[key].append(len(context_labels_orig[candidate_indices].unique()))\
+            
+            # Calculate accuracy on task using only selected candidates as context points
+            with torch.no_grad():
+                target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
+                task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels).item()
+                # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
+                task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels))
+                accuracies[key].append(task_accuracy)
+                    
+                # Save out the selected candidates (?)
+
+                if ti < 10:
+                    self.save_image_set(ti, candidate_images, "candidate_{}_{}".format(ti, key), labels=candidate_labels)
+                    
+        return full_accuracy, accuracies, num_unique_labels
+
+    def funky_bimodal_task(self, path):
+        self.logger.print_and_log("")  # add a blank line
+        self.logger.print_and_log('Funky bimodal task using model {0:}: '.format(path))
+        self.model = self.init_model()
+        if path != 'None':
+            self.model.load_state_dict(torch.load(path))
+        for item in self.test_set:
+            accuracies_full_bimodal = []
+            accuracies_full_unimodal = []
+            accuracies_bimodal = {} # per ranking-type
+            accuracies_unimodal = {}
+            if self.args.importance_mode == 'all':
+                ranking_modes = ['loo', 'attention', 'representer', 'random']
+            else:
+                ranking_modes = [self.args.importance_mode]
+                
+            for mode in ranking_modes:
+                accuracies_bimodal[mode] = []
+                accuracies_unimodal[mode] = []
+                
+                
+            # "accuracies_full_bimodal" will track the bimodal problem (i.e. reshaped with half as many classes)
+            num_unique_labels_bimodal = {}
+            num_unique_labels_unimodal = {}
+            for mode in ranking_modes:
+                num_unique_labels_bimodal[mode] = []
+                num_unique_labels_unimodal[mode] = []
+
+            for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
+                task_dict = self.dataset.get_test_task(item)
+                context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
+                
+                context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
+                context_labels = context_labels.floor_divide(2)
+                target_labels = target_labels.floor_divide(2)
+                
+                full_acc_bimodal, accuracies_bimodal, num_unique_labels_bimodal = self._funky_bimodal_inner_loop(context_images, context_labels, target_images, target_labels, ranking_modes, accuracies_bimodal, num_unique_labels_bimodal, ti)
+                accuracies_full_bimodal.append(full_acc_bimodal)
+                
+                import pdb; pdb.set_trace()
+                # Randomly drop one of the modes in target set
+                orig_classes = target_labels_orig.unique()
+                classes_to_keep = rng.choice(len(orig_classes), len(orig_classes) - len(target_labels.unique(), replace=False)
+                keep_indices = []
+                for c in classes_to_keep:
+                    c_indices = extract_class_indices(target_labels_orig, c)
+                    keep_indices = keep_indices + c_indices.squeeze().tolist()
+                keep_indices = np.array(keep_indices)
+                new_target_images, new_target_labels = target_images[keep_indices], target_labels[keep_indices]
+                
+                full_acc_unimodal, accuracies_unimodal, num_unique_labels_unimodal = self._funky_bimodal_inner_loop(context_images, context_labels, new_target_images, new_target_labels, ranking_modes, accuracies_unimodal, num_unique_labels_unimodal, ti)
+                accuracies_full_unimodal.append(full_acc_unimodal)
+                
+            for key in accuracies_bimodal.keys():
+                unique_np = np.array(accuracies_bimodal[key])
+                self.logger.print_and_log("Average number of unique labels (bimodal) ({}): {}+/-{}".format(key, unique_np.mean(), unique_np.std()))
+            self.print_and_log_metric(accuracies_full_bimodal, item, 'Accuracy (bimodal)')
+            for key in accuracies_bimodal.keys():
+                self.print_and_log_metric(accuracies_bimodal[key], item, 'Accuracy (bimodal) {}'.format(key))
+                
+            for key in accuracies_unimodal.keys():
+                unique_np = np.array(accuracies_unimodal[key])
+                self.logger.print_and_log("Average number of unique labels (unimodal) ({}): {}+/-{}".format(key, unique_np.mean(), unique_np.std()))
+            self.print_and_log_metric(accuracies_full_unimodal, item, 'Accuracy (unimodal)')
+            for key in accuracies_unimodal.keys():
+                self.print_and_log_metric(accuracies_unimodal[key], item, 'Accuracy (unimodal) {}'.format(key))
            
     def select_shots(self, path):
         self.logger.print_and_log("")  # add a blank line
