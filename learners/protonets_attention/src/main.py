@@ -709,8 +709,9 @@ class Learner:
 
             eval_accuracies = []
             num_eval_tasks = 100
+            #import pdb; pdb.set_trace()
             for te in range(num_eval_tasks):
-                with to.no_grad():
+                with torch.no_grad():
                     target_images, target_labels, _ = self.dataset.get_query_set()
                     target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
@@ -719,7 +720,7 @@ class Learner:
                     del target_logits
 
             self.print_and_log_metric(accuracies, item, 'Accuracy')
-            self.print_and_log_metric(eval, accuracies, item, 'Eval Accuracy')
+            self.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy')
             self.save_image_set(ti, context_images, "context_final".format(ti), labels=context_labels)
             self.plot_and_log(accuracies, "Accuracies over tasks", "accuracies.png")
             self.plot_and_log(entropies, "Entropy of context labels", "entropy.png")
@@ -1148,8 +1149,8 @@ class Learner:
                 weights = {}
 
                 if ti < 10:
-                    self.save_image_set(ti, context_images, "context")
-                    self.save_image_set(ti, target_images, "target")
+                    self.save_image_set(ti, context_images, "context", labels=context_labels)
+                    self.save_image_set(ti, target_images, "target", labels=target_labels)
 
                 # Save the target/context features
                 # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
@@ -1210,7 +1211,7 @@ class Learner:
                             
                         # Save out the selected candidates (?)
                     if ti < 10:
-                        self.save_image_set(ti, context_images[removed_indices], "removed_by_{}".format(key))
+                        self.save_image_set(ti, context_images[removed_indices], "removed_by_{}".format(key), labels=context_labels[removed_indices])
                      
             if len(accuracies_clean) > 0:
                 self.print_and_log_metric(accuracies_clean, item, 'Clean Accuracy')
@@ -1352,9 +1353,11 @@ class Learner:
 
     def reshape_attention_weights(self, attention_weights, context_labels, num_target_points):
         weights_per_query_point = torch.zeros((num_target_points, len(context_labels)), device=self.device)
-        for c in torch.unique(context_labels):
+        # The method below of accessing attention weights per class is alright because it is how the model 
+        # constructs this data structure.
+        for ci, c in enumerate(torch.unique(context_labels)):
             c_indices = extract_class_indices(context_labels, c)
-            c_weights = attention_weights[c].squeeze().clone()
+            c_weights = attention_weights[ci].squeeze().clone()
             for q in range(c_weights.shape[0]):
                 weights_per_query_point[q][c_indices] = c_weights[q]
                 
