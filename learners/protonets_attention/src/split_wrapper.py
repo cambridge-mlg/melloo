@@ -81,7 +81,7 @@ class IdentifiableDatasetWrapper:
             self.query_data = tv_datasets.MNIST(dataset_path, transform=transforms, train=False, download=True)
         else:
             print("Unsupported dataset specified: {}".format(dataset_name))
-
+        '''
         nc = 2
         ns = 15
         self.context_data.classes = self.context_data.classes[0:nc]
@@ -94,6 +94,7 @@ class IdentifiableDatasetWrapper:
         self.query_data.targets = self.query_data.targets[0:ns*5]
         for i in range(ns*5):
             self.query_data.targets[i] = i % nc
+        '''
 
         self.query_mapping = map_to_classes(self.query_data)
         # Now we want splits for this per class so we can construct tasks
@@ -144,9 +145,14 @@ class IdentifiableDatasetWrapper:
         # Use our custom, order-preserving unique function
         chosen_classes = unique(unnormalized_context_labels)
         task_dict["target_images"], unnormalized_target_labels, task_dict["target_ids"] = self._construct_query_set(chosen_classes)
-        # Here we make the asssumption that all classes are represented equally in the context and target sets (but the whole setup assumes that)
-        norm_labels = torch.arange(len(chosen_classes))
-        task_dict["context_labels"], task_dict["target_labels"] = norm_labels.repeat_interleave(self.shot), norm_labels.repeat_interleave(self.query_shot)
+        
+        # If all classes are represented, don't renormalize
+        if len(chosen_classes) == len(self.context_data.classes):
+            task_dict["context_labels"], task_dict["target_labels"] = unnormalized_context_labels, unnormalized_target_labels
+        else:
+            # Here we make the asssumption that all classes are represented equally in the context and target sets (but the whole setup assumes that)
+            norm_labels = torch.arange(len(chosen_classes))
+            task_dict["context_labels"], task_dict["target_labels"] = norm_labels.repeat_interleave(self.shot), norm_labels.repeat_interleave(self.query_shot)
 
         return task_dict
         
@@ -231,10 +237,10 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
         # Mark the selected context images so that we don't swap them in multiple times
         for i, context_id in enumerate(self.current_context_ids):
             self.drawable_context_ids.remove(context_id)
-            if task_dict["context_labels"][i] in self.returned_label_counts:
-                self.returned_label_counts[task_dict["context_labels"][i]] += 1
+            if task_dict["context_labels"][i].item() in self.returned_label_counts:
+                self.returned_label_counts[task_dict["context_labels"][i].item()] += 1
             else:
-                self.returned_label_counts[task_dict["context_labels"][i]] = 1
+                self.returned_label_counts[task_dict["context_labels"][i].item()] = 1
         return task_dict
         
     def mark_discarded(self, image_ids):
@@ -268,10 +274,10 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
         context_labels = torch.zeros(num_points_requested, dtype=torch.long)
         for i, id in enumerate(indices):
             context_images[i], context_labels[i] = self.context_data[id]
-            if context_labels[i] in self.returned_label_counts:
-                self.returned_label_counts[context_labels[i]] += 1
+            if context_labels[i].item() in self.returned_label_counts:
+                self.returned_label_counts[context_labels[i].item()] += 1
             else:
-                self.returned_label_counts[context_labels[i]] = 1
+                self.returned_label_counts[context_labels[i].item()] = 1
         return context_images, context_labels, indices
         
     def get_query_set(self):

@@ -46,6 +46,7 @@ def np_set_to_torch(images_np, labels_np, shuffle=False):
         images_np, labels_np = shuffle_set(images_np, labels_np)
     images = torch.from_numpy(images_np)
     labels = torch.from_numpy(labels_np)
+    return images, labels
     
     
 def shuffle_set(images, labels):
@@ -620,10 +621,13 @@ class Learner:
         ranking_mode = self.args.importance_mode  
         save_out_interval = 500
         if self.args.tasks <= 1000:
-            #if self.args.top_k == 1:
-            #    save_out_interval = 1
-            #else:
             save_out_interval = 100
+            '''
+            if self.args.top_k == 1:
+                save_out_interval = 1
+            else:
+                save_out_interval = 100
+            '''
 
         for item in self.test_set:
             accuracies = []
@@ -644,9 +648,10 @@ class Learner:
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                     accuracies.append(task_accuracy)
                     del target_logits
-                import pdb; pdb.set_trace()
-                probs = context_labels.sum(dim=0)/float(len(context_labels.unique()))
-                entropies.append(Categorical(probs=probs).entropy)
+
+                one_hot = torch.nn.functional.one_hot(context_labels).to("cpu")
+                probs = one_hot.sum(dim=0)/float(len(context_labels))
+                entropies.append(Categorical(probs=probs).entropy())
                 
                 # Save the target/context features
                 # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
@@ -684,6 +689,7 @@ class Learner:
                 if ti % save_out_interval == 0:
                     self.save_image_set(ti, context_images[candidate_indices], "keep_{}".format(ti), labels=context_labels[candidate_indices])
                     self.save_image_set(ti, context_images[dropped_indices], "discard_{}".format(ti), labels=context_labels[dropped_indices])
+                    self.save_image_set(ti, target_images, "target_{}".format(ti), labels=target_labels)
                     
                 if ti < self.args.tasks -1:
                     # Request new points to replace those
@@ -698,8 +704,8 @@ class Learner:
                     # Remove the old points, replace with new points
 
                     # Get new query set as well
-                    target_images, target_labels, _ = self.dataset.get_query_set()
-                    target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
+                    #target_images, target_labels, _ = self.dataset.get_query_set()
+                    #target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
 
             self.print_and_log_metric(accuracies, item, 'Accuracy')
             self.save_image_set(ti, context_images, "context_final".format(ti), labels=context_labels)
@@ -716,7 +722,7 @@ class Learner:
         
     def bar_plot_and_log(self, keys, vals, descrip, filename, bar=False):
         self.logger.log(descrip)
-        for key, val in zip(keys, values):
+        for key, val in zip(keys, vals):
             self.logger.log("{} : {}".format(key, val))
         plt.bar(keys, vals)
         plt.savefig(os.path.join(self.args.checkpoint_dir, filename))
@@ -1005,7 +1011,7 @@ class Learner:
             # Select images from the context set randomly to be mislabeled 
             mislabeled_indices = rng.choice(num_context_images, num_noisy, replace=False)
             # Mislabels selected images randomly
-            new_context_labels[mislabeled_indices] = (new_context_labels[mislabeled_indices] + rng.integers(0, num_classes, num_noisy) + 1) % num_classes
+            new_context_labels[mislabeled_indices] = (new_context_labels[mislabeled_indices] + rng.integers(1, num_classes, num_noisy)) % num_classes
         elif self.args.noise_type == "ood":
             # We want num_noisy/total patterns = error rate, where total patterns = num_clean + num_noisy
             # And num_clean = num_at_start/2
