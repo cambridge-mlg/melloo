@@ -707,7 +707,19 @@ class Learner:
                     #target_images, target_labels, _ = self.dataset.get_query_set()
                     #target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
 
+            eval_accuracies = []
+            num_eval_tasks = 100
+            for te in range(num_eval_tasks):
+                with to.no_grad():
+                    target_images, target_labels, _ = self.dataset.get_query_set()
+                    target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
+                    target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
+                    eval_accuracies.append(task_accuracy)
+                    del target_logits
+
             self.print_and_log_metric(accuracies, item, 'Accuracy')
+            self.print_and_log_metric(eval, accuracies, item, 'Eval Accuracy')
             self.save_image_set(ti, context_images, "context_final".format(ti), labels=context_labels)
             self.plot_and_log(accuracies, "Accuracies over tasks", "accuracies.png")
             self.plot_and_log(entropies, "Entropy of context labels", "entropy.png")
@@ -973,6 +985,9 @@ class Learner:
                         accuracies[key].append(task_accuracy)
                             
                         # Save out the selected candidates (?)
+
+                        if ti < 10:
+                            self.save_image_set(ti, candidate_images, "candidate_{}_{}".format(ti, key), labels=candidate_labels)
 
                         if self.args.test_case == "bimodal":
                             target_logits = self.model(candidate_images, reduced_candidate_labels_orig, reduced_target_images_orig, reduced_target_labels_orig, MetaLearningState.META_TEST)
