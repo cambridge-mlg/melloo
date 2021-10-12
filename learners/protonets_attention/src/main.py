@@ -712,7 +712,6 @@ class Learner:
 
             eval_accuracies = []
             num_eval_tasks = 100
-            #import pdb; pdb.set_trace()
             for te in range(num_eval_tasks):
                 with torch.no_grad():
                     target_images, target_labels, _ = self.dataset.get_query_set()
@@ -856,16 +855,12 @@ class Learner:
                     
                 self.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy ({})'.format(key))
 
-    def _funky_bimodal_inner_loop(context_images, context_labels, target_images, target_labels, ranking_modes, accuracies, num_unique_labels, ti):
+    def _funky_bimodal_inner_loop(self, context_images, context_labels, context_labels_orig, target_images, target_labels, ranking_modes, accuracies, num_unique_labels, ti, descrip):
         full_accuracy = -1
         rankings_per_qp = {}
         weights_per_qp = {}
         rankings = {}
         weights = {}
-        
-        if ti < 10:
-            self.save_image_set(ti, context_images, "context")
-            self.save_image_set(ti, target_images, "target")
         
         with torch.no_grad():
             target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
@@ -911,7 +906,7 @@ class Learner:
             # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
             reduced_candidate_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(candidate_labels, target_images, target_labels)
 
-            num_unique_labels[key].append(len(context_labels_orig[candidate_indices].unique()))\
+            num_unique_labels[key].append(len(context_labels_orig[candidate_indices].unique()))
             
             # Calculate accuracy on task using only selected candidates as context points
             with torch.no_grad():
@@ -924,7 +919,7 @@ class Learner:
                 # Save out the selected candidates (?)
 
                 if ti < 10:
-                    self.save_image_set(ti, candidate_images, "candidate_{}_{}".format(ti, key), labels=candidate_labels)
+                    self.save_image_set(ti, candidate_images, "candidate_{}_{}".format(descrip, key), labels=candidate_labels)
                     
         return full_accuracy, accuracies, num_unique_labels
 
@@ -964,21 +959,29 @@ class Learner:
                 context_labels = context_labels.floor_divide(2)
                 target_labels = target_labels.floor_divide(2)
                 
-                full_acc_bimodal, accuracies_bimodal, num_unique_labels_bimodal = self._funky_bimodal_inner_loop(context_images, context_labels, target_images, target_labels, ranking_modes, accuracies_bimodal, num_unique_labels_bimodal, ti)
+                if ti < 10:
+                    self.save_image_set(ti, context_images, "context")
+                    self.save_image_set(ti, target_images, "target")
+
+                full_acc_bimodal, accuracies_bimodal, num_unique_labels_bimodal = self._funky_bimodal_inner_loop(context_images, context_labels, context_labels_orig, 
+                                target_images, target_labels, ranking_modes, accuracies_bimodal, num_unique_labels_bimodal, ti, "bimodal")
                 accuracies_full_bimodal.append(full_acc_bimodal)
                 
-                import pdb; pdb.set_trace()
                 # Randomly drop one of the modes in target set
                 orig_classes = target_labels_orig.unique()
-                classes_to_keep = rng.choice(len(orig_classes), len(orig_classes) - len(target_labels.unique(), replace=False)
+                classes_to_keep = list(range(0, len(orig_classes), 2))
                 keep_indices = []
                 for c in classes_to_keep:
                     c_indices = extract_class_indices(target_labels_orig, c)
                     keep_indices = keep_indices + c_indices.squeeze().tolist()
                 keep_indices = np.array(keep_indices)
                 new_target_images, new_target_labels = target_images[keep_indices], target_labels[keep_indices]
+
+                if ti < 10:
+                    self.save_image_set(ti, target_images[keep_indices], "unimodal_target", labels=target_labels_orig[keep_indices])
                 
-                full_acc_unimodal, accuracies_unimodal, num_unique_labels_unimodal = self._funky_bimodal_inner_loop(context_images, context_labels, new_target_images, new_target_labels, ranking_modes, accuracies_unimodal, num_unique_labels_unimodal, ti)
+                full_acc_unimodal, accuracies_unimodal, num_unique_labels_unimodal = self._funky_bimodal_inner_loop(context_images, context_labels, context_labels_orig,
+                                new_target_images, new_target_labels, ranking_modes, accuracies_unimodal, num_unique_labels_unimodal, ti, "unimodal")
                 accuracies_full_unimodal.append(full_acc_unimodal)
                 
             for key in accuracies_bimodal.keys():
