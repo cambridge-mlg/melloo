@@ -18,28 +18,38 @@ learning_rate = 0.001
 
 num_classes = 10
 
-transform = transforms.Compose([
-    transforms.Resize(size=(224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize( 
-       (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010) 
-    )
-])
+def make_data_loader(batch_size, train=True, shuffle=False):
 
-train_dataset = torchvision.datasets.CIFAR10(
-    root= '/scratch/etv21/cifar10_data', train = True,
-    download =True, transform = transform)
+    horse_index = 7
+    automobile_index = 1
+
+    transform = transforms.Compose([
+        transforms.Resize(size=(224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize( 
+           (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010) 
+        )
+    ])
+
+    dataset = torchvision.datasets.CIFAR10(
+    root= '/scratch/etv21/cifar10_data', train=train,
+    download=True, transform=transform)
     
-test_dataset = torchvision.datasets.CIFAR10(
-    root= '/scratch/etv21/cifar10_data', train = False,
-    download =True, transform = transform)
+    target_tensor = torch.tensor(dataset.targets)
+    horse_mask = torch.where(target_tensor == horse_index, torch.ones(1), torch.zeroes(1))
+    automobile_mask = torch.where(target_tensor == automobile_index, torch.ones(1), torch.zeros(1))
+    binary_mask = (horse_mask + automobile_mask).numpy()
+    keep_indices = [x for x in range(0, len(binary_mask)) if binary_mask[x] == 1]
+    # Now we can use the subset dataset
     
-# TODO: We only really want the automobiles and horses classes, but for now whatever
+    binary_dataset = torch.utils.data.Subset(dataset, keep_indices)
+    return torch.utils.data.DataLoader(binary_dataset, batch_size=batch_size, shuffle=shuffle)
 
-# I'm not convinced we can use the default data loader, as we need to keep track of ids. 
+#TODO: I'm not convinced we can use the default data loader, as we need to keep track of ids. 
 
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
+train_loader = torch.utils.data.DataLoader(batch_size, train=True,, shuffle=False)
+test_loader = torch.utils.data.DataLoader(batch_size, train=False,, shuffle=True)
+
 n_total_step = len(train_loader)
 print(n_total_step)
 
@@ -71,7 +81,7 @@ for epoch in range(num_epochs):
         optimizer.step()
         optimizer.zero_grad()
         if (i+1) % 250 == 0:
-            print(f’epoch {epoch+1}/{num_epochs}, step: {i+1}/{n_total_step}: loss = {loss_value:.5f}, acc = {100*(n_corrects/labels.size(0)):.2f}%’)
+            print(f'epoch {epoch+1}/{num_epochs}, step: {i+1}/{n_total_step}: loss = {loss_value:.5f}, acc = {100*(n_corrects/labels.size(0)):.2f}%')
             
 # Test
 with torch.no_grad():
@@ -85,5 +95,5 @@ with torch.no_grad():
         labels_predicted = y_predicted.argmax(axis = 1)
         number_corrects += (labels_predicted==test_labels_set).sum().item()
         number_samples += test_labels_set.size(0)
-    print(f’Overall accuracy {(number_corrects / number_samples)*100}%’)
+    print(f'Overall accuracy {(number_corrects / number_samples)*100}%')
 
