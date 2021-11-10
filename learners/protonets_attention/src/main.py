@@ -17,6 +17,7 @@ import pickle
 import math
 import matplotlib
 import matplotlib.pyplot as plt
+import gc
 
 from scipy.stats import kendalltau
 from sklearn.metrics.pairwise import rbf_kernel
@@ -254,6 +255,7 @@ class Learner:
         parser.add_argument("--drop_rate", type=float, default=0.1, help="Percentage of points to drop (as float in [0,1])")
         parser.add_argument("--noise_type", choices=["mislabel", "ood"], default="mislabel",
                             help="Type of noise to use for noisy shot detection")
+        parser.add_argument("--DEBUG_bimodal_code", choices=["old", "funky"], default="funky")
         parser.add_argument("--error_rate", type=float, default=0.1,
                             help="Rate at which noise is introduced. For mislabelling, this is the percentage of the context set to mislabel. For ood, this how many ood patterns are shuffled into the other classes (calculated as num context patterns * error rate)")
         
@@ -317,8 +319,12 @@ class Learner:
             elif self.args.task_type == "noisy_shots":
                 self.detect_noisy_shots(self.args.test_model_path)
             elif self.args.task_type == "shot_selection":
+
                 if self.args.test_case == "bimodal":
-                    self.funky_bimodal_task(self.args.test_model_path)
+                    if self.args.DEBUG_bimodal_code == "funky":
+                        self.funky_bimodal_task(self.args.test_model_path)
+                    else:
+                        self.select_shots(self.args.test_model_path)
                 else:
                     self.select_shots(self.args.test_model_path)
             else:
@@ -480,9 +486,11 @@ class Learner:
             
         # Representer values calculation    
         dl_dphi = torch.autograd.grad(task_loss, context_logits, retain_graph=True)[0]
+        del context_logits
+        gc.collect()
         alphas = dl_dphi/(-2.0 * self.args.l2_lambda * float(len(context_labels)))
         alphas_t = alphas.transpose(1,0)
-        feature_prod = torch.matmul(context_features, target_features.transpose(1,0))
+        feature_prod = torch.matmul(context_features, target_features.transpose(1,0)).to(self.device)
         
         kernels_agg = []
         for k in range(alphas.shape[1]):
@@ -492,6 +500,7 @@ class Learner:
             kernels_agg.append(kernels_k.unsqueeze(0))
         representers = torch.cat(kernels_agg, dim=0)
         
+
         if self.args.kernel_agg == 'sum':
             representers_agg = representers.sum(dim=0).transpose(1,0).cpu()
         
@@ -707,8 +716,9 @@ class Learner:
                     # Remove the old points, replace with new points
 
                     # Get new query set as well
-                    #target_images, target_labels, _ = self.dataset.get_query_set()
-                    #target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
+                    if ti == int(self.args.tasks/2):
+                        target_images, target_labels, _ = self.dataset.get_query_set()
+                        target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
 
             eval_accuracies = []
             num_eval_tasks = 100
@@ -984,15 +994,15 @@ class Learner:
                                 new_target_images, new_target_labels, ranking_modes, accuracies_unimodal, num_unique_labels_unimodal, ti, "unimodal")
                 accuracies_full_unimodal.append(full_acc_unimodal)
                 
-            for key in accuracies_bimodal.keys():
-                unique_np = np.array(accuracies_bimodal[key])
+            for key in num_unique_labels_bimodal.keys():
+                unique_np = np.array(num_unique_labels_bimodal[key])
                 self.logger.print_and_log("Average number of unique labels (bimodal) ({}): {}+/-{}".format(key, unique_np.mean(), unique_np.std()))
             self.print_and_log_metric(accuracies_full_bimodal, item, 'Accuracy (bimodal)')
             for key in accuracies_bimodal.keys():
                 self.print_and_log_metric(accuracies_bimodal[key], item, 'Accuracy (bimodal) {}'.format(key))
                 
-            for key in accuracies_unimodal.keys():
-                unique_np = np.array(accuracies_unimodal[key])
+            for key in num_unique_labels_unimodal.keys():
+                unique_np = np.array(num_unique_labels_unimodal[key])
                 self.logger.print_and_log("Average number of unique labels (unimodal) ({}): {}+/-{}".format(key, unique_np.mean(), unique_np.std()))
             self.print_and_log_metric(accuracies_full_unimodal, item, 'Accuracy (unimodal)')
             for key in accuracies_unimodal.keys():
@@ -1042,7 +1052,7 @@ class Learner:
                 rankings = {}
                 weights = {}
                 
-                if ti < 10:
+                if ti < 10 and self.args.way * self.args.shot <= 100:
                     self.save_image_set(ti, context_images, "context")
                     self.save_image_set(ti, target_images, "target")
                 
@@ -1132,7 +1142,7 @@ class Learner:
                             
                         # Save out the selected candidates (?)
 
-                        if ti < 10:
+                        if ti < 10 and self.args.way * self.args.shot <= 100:
                             self.save_image_set(ti, candidate_images, "candidate_{}_{}".format(ti, key), labels=candidate_labels)
 
                         if self.args.test_case == "bimodal":
@@ -1259,7 +1269,6 @@ class Learner:
             for mode in ranking_modes:
                 accuracies[mode] = []
                 overlaps[mode] = []
-
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
                 # If mislabelling, then we calculate clean accuracy before doing any mislabeling
@@ -1271,6 +1280,8 @@ class Learner:
                         task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                         accuracies_clean.append(task_accuracy)
                         del target_logits
+                    del context_images
+                    del target_images
 
                 # Noisiness
                 task_dict = self.make_noisy(task_dict)
@@ -1288,12 +1299,13 @@ class Learner:
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                     accuracies_noisy.append(task_accuracy)
                     del target_logits
+                    gc.collect()
 
                 rankings_per_qp = {}
                 weights_per_qp = {}
                 weights = {}
 
-                if ti < 10:
+                if ti < 10 and self.args.way * self.args.shot <= 100:
                     self.save_image_set(ti, context_images, "context", labels=context_labels)
                     self.save_image_set(ti, target_images, "target", labels=target_labels)
 
@@ -1304,9 +1316,11 @@ class Learner:
                     self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     # Make a copy of the target features, otherwise we get a reference to what the model is storing
                     # (and we're about to send another task through it, so that's not what we want)
-                    context_features, target_features = self.model.context_features.clone(), self.model.target_features.clone()
+                    context_features, target_features = self.model.context_features.cpu(), self.model.target_features.cpu()
                 
                 for mode in ranking_modes:
+                    torch.cuda.empty_cache()
+                    print(mode)
 
                     if mode == 'loo':
                         weights_per_qp['loo'] = self.calculate_loo(context_images, context_labels, target_images, target_labels)
@@ -1314,8 +1328,7 @@ class Learner:
                         # Make a copy of the attention weights otherwise we get a reference to what the model is storing
                         with torch.no_grad():
                             self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
-                        attention_weights = self.model.attention_weights.copy()
-                        weights_per_qp['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
+                        weights_per_qp['attention'] = self.reshape_attention_weights(self.model.attention_weights, context_labels, len(target_labels))
                         
                     elif mode == 'representer':
                         weights_per_qp['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
@@ -1353,9 +1366,10 @@ class Learner:
                         # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
                         task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels)) # TODO: We should add random accuracy back in, not zero.
                         accuracies[key].append(task_accuracy)
+                        del target_logits
                             
                         # Save out the selected candidates (?)
-                    if ti < 10:
+                    if ti < 10  and self.args.way * self.args.shot <= 100:
                         self.save_image_set(ti, context_images[removed_indices], "removed_by_{}".format(key), labels=context_labels[removed_indices])
                      
             if len(accuracies_clean) > 0:
@@ -1497,12 +1511,12 @@ class Learner:
         return ave_corr, ave_intersected
 
     def reshape_attention_weights(self, attention_weights, context_labels, num_target_points):
-        weights_per_query_point = torch.zeros((num_target_points, len(context_labels)), device=self.device)
+        weights_per_query_point = torch.zeros((num_target_points, len(context_labels)), device="cpu")
         # The method below of accessing attention weights per class is alright because it is how the model 
         # constructs this data structure.
         for ci, c in enumerate(torch.unique(context_labels)):
             c_indices = extract_class_indices(context_labels, c)
-            c_weights = attention_weights[ci].squeeze().clone()
+            c_weights = attention_weights[ci].cpu().squeeze().clone()
             for q in range(c_weights.shape[0]):
                 weights_per_query_point[q][c_indices] = c_weights[q]
                 
