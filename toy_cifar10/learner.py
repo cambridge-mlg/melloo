@@ -4,6 +4,11 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 from torchvision import models
+import os
+
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  
+os.environ["CUDA_VISIBLE_DEVICES"]="1"
+
 
 import numpy as np
 
@@ -12,16 +17,31 @@ if torch.cuda.is_available():
 else:
     device = "cpu"
 
-num_epochs = 5
-batch_size  =40
+num_epochs = 2
+batch_size = 40
 learning_rate = 0.001
 
-num_classes = 10
+
+horse_index = 7
+automobile_index = 1
+keep_class_indices = [horse_index, automobile_index]
+num_classes = len(keep_class_indices)
+
+def get_indices_for_classes(target_tensor, class_indices):
+    binary_mask = torch.zeros(target_tensor.shape)
+    normalized_targets = torch.ones(target_tensor.shape)*(-1)
+    
+    for ci, class_index in enumerate(class_indices):
+        mask = torch.where(target_tensor == class_index, torch.ones(1), torch.zeros(1)).bool()
+        binary_mask = binary_mask + mask
+        normalized_targets[mask] = ci
+        
+    binary_mask = binary_mask.numpy()
+    keep_indices = [x for x in range(0, len(binary_mask)) if binary_mask[x] == 1]
+    return keep_indices, normalized_targets.int().tolist()
+        
 
 def make_data_loader(batch_size, train=True, shuffle=False):
-
-    horse_index = 7
-    automobile_index = 1
 
     transform = transforms.Compose([
         transforms.Resize(size=(224, 224)),
@@ -36,24 +56,21 @@ def make_data_loader(batch_size, train=True, shuffle=False):
     download=True, transform=transform)
     
     target_tensor = torch.tensor(dataset.targets)
-    horse_mask = torch.where(target_tensor == horse_index, torch.ones(1), torch.zeroes(1))
-    automobile_mask = torch.where(target_tensor == automobile_index, torch.ones(1), torch.zeros(1))
-    binary_mask = (horse_mask + automobile_mask).numpy()
-    keep_indices = [x for x in range(0, len(binary_mask)) if binary_mask[x] == 1]
+    keep_indices, normalized_targets = get_indices_for_classes(target_tensor, keep_class_indices)
     # Now we can use the subset dataset
-    
+    dataset.targets = normalized_targets
     binary_dataset = torch.utils.data.Subset(dataset, keep_indices)
+    
     return torch.utils.data.DataLoader(binary_dataset, batch_size=batch_size, shuffle=shuffle)
 
 #TODO: I'm not convinced we can use the default data loader, as we need to keep track of ids. 
 
-train_loader = torch.utils.data.DataLoader(batch_size, train=True,, shuffle=False)
-test_loader = torch.utils.data.DataLoader(batch_size, train=False,, shuffle=True)
+train_loader = make_data_loader(batch_size, train=True, shuffle=False)
+test_loader = make_data_loader(batch_size, train=False, shuffle=True)
 
 n_total_step = len(train_loader)
 print(n_total_step)
 
-import pdb; pdb.set_trace()
 
 # We freeze all the VGG layers except the top layer
 model = models.vgg16(pretrained = True)
@@ -68,6 +85,7 @@ model = model.to(device)
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.SGD(model.parameters(), lr = learning_rate, momentum=0.9,weight_decay=5e-4)
 
+#import pdb; pdb.set_trace()
 # Train
 for epoch in range(num_epochs):
     for i, (imgs , labels) in enumerate(train_loader):
