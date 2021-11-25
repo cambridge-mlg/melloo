@@ -7,6 +7,8 @@ from torchvision import models
 import os
 import numpy as np
 
+import protonets
+
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
@@ -141,22 +143,40 @@ def test_model(model, data_loader):
 
         # Save out embeddings
 
-
-#TODO: I'm not convinced we can use the default data loader, as we need to keep track of ids. 
-
-train_loader = make_data_loader(batch_size, train=True, shuffle=False)
-test_loader = make_data_loader(batch_size, train=False, shuffle=True)
-
-n_total_step = len(train_loader)
-print(n_total_step)
-
-
-# We freeze all the VGG layers except the top layer
-model = models.vgg16(pretrained = True)
-for param in model.parameters():
-    param.requires_grad = False
+def save_embeddings(features, labels, path):
+    pickle.dump(features, open(os.path.join(path, "/embeddings.pickle"), "wb"))
+    pickle.dump(labels, open(os.path.join(path, "/labels.pickle"), "wb"))
     
-    
-feature_embeddings, labels = get_feature_embeddings(model, train_loader)
-pickle.dump(feature_embeddings, open(root + "/embeddings.pickle", "wb"))
-pickle.dump(labels, open(root + "/labels.pickle", "wb"))
+def load_embeddings(path):
+    features = pickle.load(open(os.path.join(path, "/embeddings.pickle"), "rb"))
+    labels = pickle.load(open(os.path.join(path, "/labels.pickle"), "rb"))    
+    return features, labels
+   
+
+def initialize_embeddings(root, train):
+    if train:
+        key = "train"
+    else:
+        key = "test"
+    output_dir = os.path.join(root, key)
+    if os.path.exists(output_dir):
+        return load_embeddings(output_dir)
+    else:
+        data_loader = make_data_loader(batch_size, train=train, shuffle=False)
+        # We freeze all the VGG layers except the top layer
+        model = models.vgg16(pretrained = True)
+        for param in model.parameters():
+            param.requires_grad = False
+        features, labels = get_feature_embeddings(model, data_loader)
+        save_embeddings(features, labels, output_dir)
+        return features, labels
+
+train_features, train_labels = initialize_embeddings(root, train=True)
+test_features, test_labels = initialize_embeddings(root, train=False)
+
+protonet = Protonets(num_classes)
+
+logits = protonet(train_features, train_labels, test_features)
+predictions = logits.argmax(axis=1)
+acc = (predictions==test_labels).sum().item()/float(len(predictions))
+print(f'Overall accuracy {(acc)*100}%')
