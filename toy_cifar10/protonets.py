@@ -30,16 +30,50 @@ class ProtoNets(nn.Module):
         way = self.way
         prototypes = self._compute_prototypes(context_features, context_labels, way)
 
-        logits = euclidean_metric(target_features, prototypes)
+        logits = euclidean_metric(target_features, self.prototypes)
         return logits
 
     def _compute_prototypes(self, context_features, context_labels, way):
         prototypes = []
+        prototype_labels = []
+        prototype_counts = []
         for c in torch.unique(context_labels):
             class_features = torch.index_select(context_features, 0, self._extract_class_indices(context_labels, c))
             prototypes.append(torch.mean(class_features, dim=0, keepdim=True))
+            prototype_labels.append(c)
+            prototype_counts.append(len(class_features))
 
-        return torch.squeeze(torch.stack(prototypes))
+        self.prototypes = torch.squeeze(torch.stack(prototypes))
+        self.prototype_labels = prototype_labels
+        self.prototype_counts = prototype_counts
+        
+        return self.prototypes
+        
+    def loo(self, loo_features, loo_labels, target_features, way):
+        prototypes = self.prototypes.clone().tolist()
+        # Remove the given features from the computed prototypes
+        for c in torch.unique(loo_labels):
+            # Find corresponding prototype:
+            prototype = None
+            prototype_count = -1
+            for index, label in enumerate(self.prototype_labels):
+                if label == c:
+                    prototype = prototypes[index]
+                    prototype_count = self.prototype_counts[index]
+                    break
+                    
+            if prototype is None:
+                print("Failed to find prototype for label %".format(c)
+                return
+                
+            class_features = torch.index_select(loo_features, 0, self._extract_class_indices(loo_labels, c))
+            prototype = ((prototype * prototype_count) - torch.sum(class_features, dim=0, keepdim=True)) / (prototype_count - len(loo_features))
+            #prototypes.append(torch.mean(class_features, dim=0, keepdim=True))
+
+        new_prototypes = torch.squeeze(torch.stack(prototypes))
+
+        logits = euclidean_metric(target_features, new_prototypes)
+        return logits
 
     @staticmethod
     def _extract_class_indices(labels, which_class):

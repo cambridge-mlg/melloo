@@ -184,3 +184,12 @@ logits = protonet(train_features, train_labels, test_features)
 predictions = logits.argmax(axis=1)
 acc = (predictions==test_labels).sum().item()/float(len(predictions))
 print(f'Overall accuracy {(acc)*100}%')
+
+loo_index = 0
+loo_features = train_features[loo_index]
+loo_labels = train_labels[loo_index]
+
+logits_loo = protonet.loo(loo_features, loo_labels, test_features)
+predictions = logits_loo.argmax(axis=1)
+acc = (predictions==test_labels).sum().item()/float(len(predictions))
+print(f'Leave out 0 accuracy {(acc)*100}%')
