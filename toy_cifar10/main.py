@@ -6,7 +6,7 @@ import torchvision.transforms as transforms
 from torchvision import models
 import os
 import numpy as np
-
+import pickle
 import protonets
 
 
@@ -79,7 +79,6 @@ def get_feature_embeddings(model, data_loader):
     
     img_embeddings = None
     train_labels = None
-    import pdb; pdb.set_trace()
     
     with torch.no_grad():
         for i, (imgs , lbls) in enumerate(data_loader):
@@ -97,7 +96,6 @@ def get_feature_embeddings(model, data_loader):
                 img_embeddings = np.append(img_embeddings, batch_embeddings.to('cpu').numpy(), axis=0)
                 train_labels = np.append(train_labels, lbls.numpy())
 
-    import pdb; pdb.set_trace()
     return img_embeddings, train_labels
     
     
@@ -144,12 +142,12 @@ def test_model(model, data_loader):
         # Save out embeddings
 
 def save_embeddings(features, labels, path):
-    pickle.dump(features, open(os.path.join(path, "/embeddings.pickle"), "wb"))
-    pickle.dump(labels, open(os.path.join(path, "/labels.pickle"), "wb"))
+    pickle.dump(features, open(os.path.join(path, "embeddings.pickle"), "wb"))
+    pickle.dump(labels, open(os.path.join(path, "labels.pickle"), "wb"))
     
 def load_embeddings(path):
-    features = pickle.load(open(os.path.join(path, "/embeddings.pickle"), "rb"))
-    labels = pickle.load(open(os.path.join(path, "/labels.pickle"), "rb"))    
+    features = pickle.load(open(os.path.join(path, "embeddings.pickle"), "rb"))
+    labels = pickle.load(open(os.path.join(path, "labels.pickle"), "rb"))    
     return features, labels
    
 
@@ -162,6 +160,7 @@ def initialize_embeddings(root, train):
     if os.path.exists(output_dir):
         return load_embeddings(output_dir)
     else:
+        os.makedirs(output_dir)
         data_loader = make_data_loader(batch_size, train=train, shuffle=False)
         # We freeze all the VGG layers except the top layer
         model = models.vgg16(pretrained = True)
@@ -170,11 +169,16 @@ def initialize_embeddings(root, train):
         features, labels = get_feature_embeddings(model, data_loader)
         save_embeddings(features, labels, output_dir)
         return features, labels
+import pdb; pdb.set_trace()
 
 train_features, train_labels = initialize_embeddings(root, train=True)
 test_features, test_labels = initialize_embeddings(root, train=False)
 
-protonet = Protonets(num_classes)
+train_features, test_features = torch.from_numpy(train_features).to(device), torch.from_numpy(test_features).to(device)
+train_labels = torch.from_numpy(train_labels).type(torch.LongTensor).to(device)
+test_labels = torch.from_numpy(test_labels).type(torch.LongTensor).to(device)
+
+protonet = protonets.ProtoNets(num_classes)
 
 logits = protonet(train_features, train_labels, test_features)
 predictions = logits.argmax(axis=1)
