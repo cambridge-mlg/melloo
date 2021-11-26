@@ -125,6 +125,7 @@ def train_model_head(model, data_loader):
             optimizer.zero_grad()
             if (i+1) % 250 == 0:
                 print(f'epoch {epoch+1}/{num_epochs}, step: {i+1}/{n_total_step}: loss = {loss_value:.5f}, acc = {100*(n_corrects/labels.size(0)):.2f}%')
+    return model
                 
 def test_model(model, data_loader):                
     # What we want to do now is generate feature embeddings for all of our inputs:
@@ -204,7 +205,7 @@ test_labels = torch.from_numpy(test_labels).type(torch.LongTensor).to(device)
 
 
 
-# Clean performance
+# Clean performance on protonets
 
 protonet = protonets.ProtoNets(num_classes)
 
@@ -214,6 +215,16 @@ acc = (predictions==test_labels).sum().item()/float(len(predictions))
 print(f'Overall accuracy {(acc)*100}%')
 loss = cross_entropy(logits, test_labels)
 print(f'Overall loss {(loss)}')
+
+clean_model = models.vgg16(pretrained = True)
+for param in clean_model.parameters():
+    param.requires_grad = False
+
+train_loader = make_data_loader(batch_size, train=True, shuffle=False)
+test_loader = make_data_loader(batch_size, train=False, shuffle=False)
+clean_model = train_model_head(clean_model, train_loader)
+test_model(clean_model, test_loader)
+del clean_model
 
 import pdb; pdb.set_trace()
 
@@ -229,6 +240,14 @@ acc = (predictions==test_labels).sum().item()/float(len(predictions))
 print(f'40% Noisy accuracy {(acc)*100}%')
 loss = cross_entropy(logits, test_labels)
 print(f'40% Noisy loss {(loss)}')
+
+noisy_model = models.vgg16(pretrained = True)
+for param in noisy_model.parameters():
+    param.requires_grad = False
+
+noisy_model = train_model_head(noisy_model, train_loader)
+test_model(noisy_model, test_loader)
+del noisy_model
 
 rankings = calculate_rankings(protonet, train_features, flipped_train_labels, test_features, num_classes)
 num_to_keep = int(len(train_features) * (1 - flip_fraction ))
@@ -249,3 +268,11 @@ acc = (predictions==test_labels).sum().item()/float(len(predictions))
 print(f'Relabeled accuracy {(acc)*100}%')
 loss = cross_entropy(logits, test_labels)
 print(f'Relabeled loss {(loss)}')
+
+relabelled_model = models.vgg16(pretrained = True)
+for param in relabelled_model.parameters():
+    param.requires_grad = False
+
+relabelled_model = train_model_head(relabelled_model, train_loader)
+test_model(relabelled_model, test_loader)
+del noisy_model
