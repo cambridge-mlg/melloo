@@ -179,7 +179,7 @@ def initialize_embeddings(root, train):
         save_embeddings(features, labels, output_dir)
         return features, labels
 
-def calculate_rankings(protonet, support_features, support_labels, query_features, way):
+def calculate_rankings(protonet, support_features, support_labels, query_features, query_labels, way):
 
     # Calculate loo weights
     weights = torch.zeros(len(support_features))
@@ -191,7 +191,7 @@ def calculate_rankings(protonet, support_features, support_labels, query_feature
         loo_features = support_features[i].unsqueeze(0)
         loo_labels = support_labels[i].unsqueeze(0)
         logits_loo = protonet.loo(loo_features, loo_labels, query_features, way)
-        loss = cross_entropy(logits_loo, test_labels)
+        loss = cross_entropy(logits_loo, query_labels)
         weights[i] = loss
 
     rankings = torch.argsort(weights, descending=True)
@@ -238,6 +238,10 @@ indices_to_flip = torch.randperm(len(train_labels))[0:int(len(train_labels)*flip
 flipped_train_labels[indices_to_flip] = 1 - flipped_train_labels[indices_to_flip]
 print("Flipped sum: {}".format(flipped_train_labels.sum()))
 
+flipped_test_labels = test_labels.clone()
+test_indices_to_flip = torch.randperm(len(test_labels))[0:int(len(test_labels)*flip_fraction)]
+flipped_test_labels[test_indices_to_flip] = 1 - flipped_test_labels[test_indices_to_flip]
+
 logits = protonet(train_features, flipped_train_labels, test_features)
 predictions = logits.argmax(axis=1)
 acc = (predictions==test_labels).sum().item()/float(len(predictions))
@@ -253,7 +257,7 @@ noisy_lreg = train_model(noisy_lreg, noisy_dataloader_train)
 test_model(noisy_lreg, clean_dataloader_test)
 del noisy_lreg
 
-rankings = calculate_rankings(protonet, train_features, flipped_train_labels, test_features, num_classes)
+rankings = calculate_rankings(protonet, train_features, flipped_train_labels, test_features, flipped_test_labels, num_classes)
 
 num_correctly_identified = []
 relabelled_protonets_acc = []
