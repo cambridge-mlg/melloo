@@ -1,4 +1,5 @@
 import torch
+from torch.utils.data import Dataset
 
 class LogisticRegression(torch.nn.Module):
     def __init__(self, input_dim, output_dim):
