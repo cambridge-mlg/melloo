@@ -26,7 +26,7 @@ num_epochs = 1
 batch_size = 40
 learning_rate = 0.001
 
-flip_fraction = 0.4
+flip_fraction = 0.5
 
 horse_index = 7
 automobile_index = 1
@@ -124,7 +124,7 @@ def train_model_head(model, data_loader):
             optimizer.step()
             optimizer.zero_grad()
             if (i+1) % 250 == 0:
-                print(f'epoch {epoch+1}/{num_epochs}, step: {i+1}/{n_total_step}: loss = {loss_value:.5f}, acc = {100*(n_corrects/labels.size(0)):.2f}%')
+                print(f'epoch {epoch+1}/{num_epochs}: loss = {loss_value:.5f}, acc = {100*(n_corrects/labels.size(0)):.2f}%')
     return model
                 
 def test_model(model, data_loader):                
@@ -141,7 +141,7 @@ def test_model(model, data_loader):
             number_corrects += (labels_predicted==labels_set).sum().item()
             number_samples += labels_set.size(0)
             
-        print(f'Overall accuracy {(number_corrects / number_samples)*100}%')
+        print(f'NN accuracy {(number_corrects / number_samples)*100}%')
 
         # Save out embeddings
 
@@ -195,9 +195,9 @@ def calculate_rankings(protonet, support_features, support_labels, query_feature
 train_features, train_labels = initialize_embeddings(root, train=True)
 test_features, test_labels = initialize_embeddings(root, train=False)
 
-num_train = 10
-train_features = train_features[0:num_train]
-train_labels = train_labels[0:num_train]
+#num_train = 10
+#train_features = train_features[0:num_train]
+#train_labels = train_labels[0:num_train]
 
 train_features, test_features = torch.from_numpy(train_features).to(device), torch.from_numpy(test_features).to(device)
 train_labels = torch.from_numpy(train_labels).type(torch.LongTensor).to(device)
@@ -212,9 +212,9 @@ protonet = protonets.ProtoNets(num_classes)
 logits = protonet(train_features, train_labels, test_features)
 predictions = logits.argmax(axis=1)
 acc = (predictions==test_labels).sum().item()/float(len(predictions))
-print(f'Overall accuracy {(acc)*100}%')
+print(f'Protonets: clean accuracy {(acc)*100}%')
 loss = cross_entropy(logits, test_labels)
-print(f'Overall loss {(loss)}')
+print(f'Protonets: clean loss {(loss)}')
 
 clean_model = models.vgg16(pretrained = True)
 for param in clean_model.parameters():
@@ -226,20 +226,19 @@ clean_model = train_model_head(clean_model, train_loader)
 test_model(clean_model, test_loader)
 del clean_model
 
-import pdb; pdb.set_trace()
-
 # Flip label experiment
 
 flipped_train_labels = train_labels.clone()
 indices_to_flip = torch.randperm(len(train_labels))[0:int(len(train_labels)*flip_fraction)]
 flipped_train_labels[indices_to_flip] = 1 - flipped_train_labels[indices_to_flip]
+print("Flipped sum: {}".format(flipped_train_labels.sum()))
 
 logits = protonet(train_features, flipped_train_labels, test_features)
 predictions = logits.argmax(axis=1)
 acc = (predictions==test_labels).sum().item()/float(len(predictions))
-print(f'40% Noisy accuracy {(acc)*100}%')
+print(f'Protonets: 40% Noisy accuracy {(acc)*100}%')
 loss = cross_entropy(logits, test_labels)
-print(f'40% Noisy loss {(loss)}')
+print(f'Protonets: 40% Noisy loss {(loss)}')
 
 noisy_model = models.vgg16(pretrained = True)
 for param in noisy_model.parameters():
@@ -254,8 +253,6 @@ num_to_keep = int(len(train_features) * (1 - flip_fraction ))
 keep_indices = rankings[0:num_to_keep]
 relabel_indices = rankings[num_to_keep:]
 
-import pdb; pdb.set_trace()
-
 num_correct_indices = len(set(indices_to_flip.numpy()).intersection(set(relabel_indices.numpy())))
 print(f'Correctly identified indices {(num_correct_indices)} out of {(flip_fraction*len(train_features))}')
 
@@ -265,9 +262,9 @@ relabeled_train_labels[relabel_indices] = train_labels[relabel_indices]
 logits = protonet(train_features, relabeled_train_labels, test_features)
 predictions = logits.argmax(axis=1)
 acc = (predictions==test_labels).sum().item()/float(len(predictions))
-print(f'Relabeled accuracy {(acc)*100}%')
+print(f'Protonets: relabeled accuracy {(acc)*100}%')
 loss = cross_entropy(logits, test_labels)
-print(f'Relabeled loss {(loss)}')
+print(f'Protonets: relabeled loss {(loss)}')
 
 relabelled_model = models.vgg16(pretrained = True)
 for param in relabelled_model.parameters():
@@ -275,4 +272,5 @@ for param in relabelled_model.parameters():
 
 relabelled_model = train_model_head(relabelled_model, train_loader)
 test_model(relabelled_model, test_loader)
-del noisy_model
+del relabelled_model
+import pdb; pdb.set_trace()
