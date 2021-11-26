@@ -7,6 +7,8 @@ from torchvision import models
 import os
 import numpy as np
 import pickle
+
+from helper_classes import LogisticRegression, EmbeddedDataset
 import protonets
 
 
@@ -102,10 +104,11 @@ def get_feature_embeddings(model, data_loader):
     return img_embeddings, train_labels
     
     
-def train_model_head(model, data_loader):
-    input_last_layer = model.classifier[6].in_features
-    # Newly created final layer will automatically have gradients enabled
-    model.classifier[6] = nn.Linear(input_last_layer, num_classes)
+def train_model(model, data_loader, reset_head=False):
+    if reset_head:
+        input_last_layer = model.classifier[6].in_features
+        # Newly created final layer will automatically have gradients enabled
+        model.classifier[6] = nn.Linear(input_last_layer, num_classes)
 
     model = model.to(device)
     criterion = nn.CrossEntropyLoss()
@@ -216,15 +219,17 @@ print(f'Protonets: clean accuracy {(acc)*100}%')
 loss = cross_entropy(logits, test_labels)
 print(f'Protonets: clean loss {(loss)}')
 
-clean_model = models.vgg16(pretrained = True)
-for param in clean_model.parameters():
-    param.requires_grad = False
 
-train_loader = make_data_loader(batch_size, train=True, shuffle=False)
-test_loader = make_data_loader(batch_size, train=False, shuffle=False)
-clean_model = train_model_head(clean_model, train_loader)
-test_model(clean_model, test_loader)
-del clean_model
+clean_embedding_dataset_test = EmbeddedDataset(train_features, train_labels)
+clean_dataloader_test = torch.utils.data.DataLoader(clean_embedding_dataset_test, batch_size=batch_size, shuffle=False)
+
+clean_embedding_dataset_train = EmbeddedDataset(train_features, train_labels)
+clean_dataloader_train = torch.utils.data.DataLoader(clean_embedding_dataset_train, batch_size=batch_size, shuffle=False)
+
+clean_lreg = LogisticRegression(train_features.shape[1], num_classes)
+clean_lreg = train_model(clean_lreg, clean_dataloader_train)
+test_model(clean_lreg, clean_dataloader_test)
+del clean_lreg
 
 # Flip label experiment
 
@@ -236,17 +241,17 @@ print("Flipped sum: {}".format(flipped_train_labels.sum()))
 logits = protonet(train_features, flipped_train_labels, test_features)
 predictions = logits.argmax(axis=1)
 acc = (predictions==test_labels).sum().item()/float(len(predictions))
-print(f'Protonets: 40% Noisy accuracy {(acc)*100}%')
+print(f'Protonets: {int(len(train_labels)*flip_fraction)}% Noisy accuracy {(acc)*100}%')
 loss = cross_entropy(logits, test_labels)
-print(f'Protonets: 40% Noisy loss {(loss)}')
+print(f'Protonets: {int(len(train_labels)*flip_fraction)}% Noisy loss {(loss)}')
 
-noisy_model = models.vgg16(pretrained = True)
-for param in noisy_model.parameters():
-    param.requires_grad = False
+noisy_embedding_dataset_train = EmbeddedDataset(train_features, flipped_train_labels)
+noisy_dataloader_train = torch.utils.data.DataLoader(noisy_embedding_dataset_train, batch_size=batch_size, shuffle=False)
 
-noisy_model = train_model_head(noisy_model, train_loader)
-test_model(noisy_model, test_loader)
-del noisy_model
+noisy_lreg = LogisticRegression(train_features.shape[1], num_classes)
+noisy_lreg = train_model(noisy_lreg, noisy_dataloader_train)
+test_model(noisy_lreg, clean_dataloader_test)
+del noisy_lreg
 
 rankings = calculate_rankings(protonet, train_features, flipped_train_labels, test_features, num_classes)
 num_to_keep = int(len(train_features) * (1 - flip_fraction ))
@@ -266,11 +271,14 @@ print(f'Protonets: relabeled accuracy {(acc)*100}%')
 loss = cross_entropy(logits, test_labels)
 print(f'Protonets: relabeled loss {(loss)}')
 
-relabelled_model = models.vgg16(pretrained = True)
-for param in relabelled_model.parameters():
-    param.requires_grad = False
 
-relabelled_model = train_model_head(relabelled_model, train_loader)
-test_model(relabelled_model, test_loader)
+relabelled_embedding_dataset_train = EmbeddedDataset(train_features, relabeled_train_labels)
+relabelled_dataloader_train = torch.utils.data.DataLoader(relabelled_embedding_dataset_train, batch_size=batch_size, shuffle=False)
+
+relabelled_model = LogisticRegression(train_features.shape[1], num_classes)
+relabelled_model = train_model(relabelled_model, relabelled_dataloader_train)
+test_model(relabelled_model, clean_dataloader_test)
 del relabelled_model
+
+
 import pdb; pdb.set_trace()
