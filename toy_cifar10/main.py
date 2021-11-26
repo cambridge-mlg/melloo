@@ -26,11 +26,15 @@ num_epochs = 1
 batch_size = 40
 learning_rate = 0.001
 
+flip_fraction = 0.4
 
 horse_index = 7
 automobile_index = 1
 keep_class_indices = [horse_index, automobile_index]
 num_classes = len(keep_class_indices)
+
+def cross_entropy(logits, labels):
+    return torch.nn.functional.cross_entropy(logits, labels)
 
 def get_indices_for_classes(target_tensor, class_indices):
     binary_mask = torch.zeros(target_tensor.shape)
@@ -67,7 +71,6 @@ def make_data_loader(batch_size, train=True, shuffle=False):
     binary_dataset = torch.utils.data.Subset(dataset, keep_indices)
     
     return torch.utils.data.DataLoader(binary_dataset, batch_size=batch_size, shuffle=shuffle)
-
 
 # Warning: mutates the model
 def get_feature_embeddings(model, data_loader):
@@ -169,14 +172,39 @@ def initialize_embeddings(root, train):
         features, labels = get_feature_embeddings(model, data_loader)
         save_embeddings(features, labels, output_dir)
         return features, labels
-import pdb; pdb.set_trace()
+
+def calculate_rankings(protonet, support_features, support_labels, query_features, way):
+
+    # Calculate loo weights
+    weights = torch.zeros(len(support_features))
+
+    
+    if len(support_features) != len(support_labels):
+        import pdb; pdb.set_trace()
+    for i in range(0, len(support_features)):
+        loo_features = support_features[i].unsqueeze(0)
+        loo_labels = support_labels[i].unsqueeze(0)
+        logits_loo = protonet.loo(loo_features, loo_labels, query_features, way)
+        loss = cross_entropy(logits_loo, test_labels)
+        weights[i] = loss
+
+    rankings = torch.argsort(weights, descending=True)
+    return rankings
 
 train_features, train_labels = initialize_embeddings(root, train=True)
 test_features, test_labels = initialize_embeddings(root, train=False)
 
+num_train = 10
+train_features = train_features[0:num_train]
+train_labels = train_labels[0:num_train]
+
 train_features, test_features = torch.from_numpy(train_features).to(device), torch.from_numpy(test_features).to(device)
 train_labels = torch.from_numpy(train_labels).type(torch.LongTensor).to(device)
 test_labels = torch.from_numpy(test_labels).type(torch.LongTensor).to(device)
+
+
+
+# Clean performance
 
 protonet = protonets.ProtoNets(num_classes)
 
@@ -184,12 +212,40 @@ logits = protonet(train_features, train_labels, test_features)
 predictions = logits.argmax(axis=1)
 acc = (predictions==test_labels).sum().item()/float(len(predictions))
 print(f'Overall accuracy {(acc)*100}%')
+loss = cross_entropy(logits, test_labels)
+print(f'Overall loss {(loss)}')
 
-loo_index = 0
-loo_features = train_features[loo_index]
-loo_labels = train_labels[loo_index]
+import pdb; pdb.set_trace()
 
-logits_loo = protonet.loo(loo_features, loo_labels, test_features)
-predictions = logits_loo.argmax(axis=1)
+# Flip label experiment
+
+flipped_train_labels = train_labels.clone()
+indices_to_flip = torch.randperm(len(train_labels))[0:int(len(train_labels)*flip_fraction)]
+flipped_train_labels[indices_to_flip] = 1 - flipped_train_labels[indices_to_flip]
+
+logits = protonet(train_features, flipped_train_labels, test_features)
+predictions = logits.argmax(axis=1)
 acc = (predictions==test_labels).sum().item()/float(len(predictions))
-print(f'Leave out 0 accuracy {(acc)*100}%')
+print(f'40% Noisy accuracy {(acc)*100}%')
+loss = cross_entropy(logits, test_labels)
+print(f'40% Noisy loss {(loss)}')
+
+rankings = calculate_rankings(protonet, train_features, flipped_train_labels, test_features, num_classes)
+num_to_keep = int(len(train_features) * (1 - flip_fraction ))
+keep_indices = rankings[0:num_to_keep]
+relabel_indices = rankings[num_to_keep:]
+
+import pdb; pdb.set_trace()
+
+num_correct_indices = len(set(indices_to_flip.numpy()).intersection(set(relabel_indices.numpy())))
+print(f'Correctly identified indices {(num_correct_indices)} out of {(flip_fraction*len(train_features))}')
+
+relabeled_train_labels = flipped_train_labels.clone()
+relabeled_train_labels[relabel_indices] = train_labels[relabel_indices]
+
+logits = protonet(train_features, relabeled_train_labels, test_features)
+predictions = logits.argmax(axis=1)
+acc = (predictions==test_labels).sum().item()/float(len(predictions))
+print(f'Relabeled accuracy {(acc)*100}%')
+loss = cross_entropy(logits, test_labels)
+print(f'Relabeled loss {(loss)}')

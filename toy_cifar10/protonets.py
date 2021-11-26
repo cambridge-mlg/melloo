@@ -50,7 +50,7 @@ class ProtoNets(nn.Module):
         return self.prototypes
         
     def loo(self, loo_features, loo_labels, target_features, way):
-        prototypes = self.prototypes.clone().tolist()
+        prototypes = self.prototypes.clone()
         # Remove the given features from the computed prototypes
         for c in torch.unique(loo_labels):
             # Find corresponding prototype:
@@ -58,21 +58,19 @@ class ProtoNets(nn.Module):
             prototype_count = -1
             for index, label in enumerate(self.prototype_labels):
                 if label == c:
-                    prototype = prototypes[index]
+                    prototype = prototypes[index].squeeze()
                     prototype_count = self.prototype_counts[index]
                     break
                     
             if prototype is None:
-                print("Failed to find prototype for label %".format(c)
+                print("Failed to find prototype for label %".format(c))
                 return
                 
             class_features = torch.index_select(loo_features, 0, self._extract_class_indices(loo_labels, c))
-            prototype = ((prototype * prototype_count) - torch.sum(class_features, dim=0, keepdim=True)) / (prototype_count - len(loo_features))
-            #prototypes.append(torch.mean(class_features, dim=0, keepdim=True))
+            prototype = ((prototype * prototype_count) - torch.sum(class_features, dim=0)) / (prototype_count - len(loo_features))
+            prototypes[index] = prototype
 
-        new_prototypes = torch.squeeze(torch.stack(prototypes))
-
-        logits = euclidean_metric(target_features, new_prototypes)
+        logits = euclidean_metric(target_features, prototypes)
         return logits
 
     @staticmethod
