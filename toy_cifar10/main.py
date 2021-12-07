@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import numpy.random as rand
 
 from helper_classes import LogisticRegression, EmbeddedDataset
+from plot_decision_regions import PlotSettings, plot_decision_regions
 import protonets
 
 
@@ -255,8 +256,12 @@ train_features, test_features = torch.from_numpy(train_features).to(device), tor
 train_labels = torch.from_numpy(train_labels).type(torch.LongTensor).to(device)
 test_labels = torch.from_numpy(test_labels).type(torch.LongTensor).to(device)
 
-# Clean performance on protonets
+subset_indices = to.LongTensor([0, 1, 2, 3, 4, 1998, 1999, 2000, 2001, 2002, 2003, 2004, 3998, 3999])
+test_labels_subset = to.index_select(test_labels, dim=0, subset_indices)
+test_features_subset = to.index_select(test_features, dim=0, subset_indices)
 
+# Clean performance on protonets
+plot_config = self._PlotSettings()
 protonet = protonets.ProtoNets(num_classes)
 
 logits = protonet(train_features, train_labels, test_features)
@@ -266,6 +271,7 @@ print(f'Protonets: clean accuracy {(acc)*100}%')
 loss = cross_entropy(logits, test_labels, "clean_proto")
 print(f'Protonets: clean loss {(loss)}')
 
+plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, "clean.pdf", plot_config, protonets, device)
 
 clean_embedding_dataset_test = EmbeddedDataset(test_features, test_labels)
 clean_dataloader_test = torch.utils.data.DataLoader(clean_embedding_dataset_test, batch_size=batch_size, shuffle=False)
@@ -295,6 +301,8 @@ acc = (predictions==test_labels).sum().item()/float(len(predictions))
 print(f'Protonets: {flip_fraction*100}% Noisy accuracy {(acc)*100}%')
 loss = cross_entropy(logits, test_labels, "noisy_proto")
 print(f'Protonets: {flip_fraction*100}% Noisy loss {(loss)}')
+
+plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, "noisy_{}.pdf".format(flip_fraction*100), plot_config, protonets, device)
 
 noisy_embedding_dataset_train = EmbeddedDataset(train_features, flipped_train_labels)
 noisy_dataloader_train = torch.utils.data.DataLoader(noisy_embedding_dataset_train, batch_size=batch_size, shuffle=False)
