@@ -7,6 +7,10 @@ from torchvision import models
 import os
 import numpy as np
 import pickle
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy.random as rand
 
 from helper_classes import LogisticRegression, EmbeddedDataset
 import protonets
@@ -14,7 +18,6 @@ import protonets
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
-
 
 root = '/scratch/etv21/cifar10_data'
 
@@ -29,15 +32,23 @@ batch_size = 40
 learning_rate = 0.001
 
 flip_fraction = 0.4
-check_fractions = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
+check_fractions = [flip_fraction] #[0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
 
 horse_index = 7
 automobile_index = 1
 keep_class_indices = [horse_index, automobile_index]
 num_classes = len(keep_class_indices)
 
-def cross_entropy(logits, labels):
-    return torch.nn.functional.cross_entropy(logits, labels)
+def cross_entropy(logits, labels, fig_prefix=None):
+    unreduced_loss = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
+    if False: # fig_prefix is not None:
+        plt.hist(unreduced_loss.cpu().numpy(), 50, density=True, range=(0, 0.5))
+        plt.xlabel('Loss')
+        plt.title('Histogram of test losses (before mean)')
+        plt.grid(True)
+        plt.savefig(os.path.join(root, fig_prefix + "_loss_hist.pdf"))
+        plt.close()
+    return unreduced_loss.mean()
 
 def get_indices_for_classes(target_tensor, class_indices):
     binary_mask = torch.zeros(target_tensor.shape)
@@ -160,12 +171,16 @@ def load_embeddings(path):
     return features, labels
    
 
-def initialize_embeddings(root, train):
+def initialize_embeddings(root, train, toy=False):
     if train:
         key = "train"
     else:
         key = "test"
     output_dir = os.path.join(root, key)
+    
+    if toy:
+        return generate_gaussian_data(train)
+
     if os.path.exists(output_dir):
         return load_embeddings(output_dir)
     else:
@@ -179,8 +194,40 @@ def initialize_embeddings(root, train):
         save_embeddings(features, labels, output_dir)
         return features, labels
 
-def calculate_rankings(protonet, support_features, support_labels, query_features, query_labels, way):
+def generate_gaussian_data(train=True, train_error_rate= 0.01, test_error_rate = 0.024):
+    train_per_class = 5000
+    test_per_class = 1000
+    
+    if train:
+        num_instances = train_per_class
+        error_rate = train_error_rate
+    else:
+        num_instances = test_per_class
+        error_rate = test_error_rate
 
+    unpertured_prototype_distance = np.sqrt(384.6158)/2.0
+    unperturbed_symmetric_coords = unpertured_prototype_distance/np.sqrt(2)
+    prototype_0 = np.array([unperturbed_symmetric_coords, unperturbed_symmetric_coords])
+    prototype_1 = np.array([-unperturbed_symmetric_coords, -unperturbed_symmetric_coords])
+    '''
+    if flip_fraction == 0.4:
+        perturbed_prototype_distance = 16.1239
+    else:
+        perturbed_prototype_distance = 1.0131
+    perturbed_symmetric_coords = perturbed_prototype_distance/np.sqrt(2)
+    pert_prototype_0 = np.array(perturbed_symmetric_coords, perturbed_symmetric_coords)
+    pert_prototype_1 = np.array(-perturbed_symmetric_coords, -perturbed_symmetric_coords)
+    '''
+    
+    points = rand.normal(loc=prototype_0, size=(num_instances, 2)).astype('f')
+    points = np.append(points, rand.normal(loc=prototype_1, size=(num_instances, 2)).astype('f'), axis=0)
+    import pdb; pdb.set_trace()
+    labels_0 = np.append(np.zeros(int(num_instances*(1 - error_rate))), np.ones(int(num_instances*error_rate)))
+    labels_1 = np.append(np.ones(int(num_instances*(1 - error_rate))), np.zeros(int(num_instances*error_rate)))
+    return points, np.append(labels_0, labels_1, axis=0)
+
+
+def calculate_rankings(protonet, support_features, support_labels, query_features, query_labels, way):
     # Calculate loo weights
     weights = torch.zeros(len(support_features))
 
@@ -197,8 +244,8 @@ def calculate_rankings(protonet, support_features, support_labels, query_feature
     rankings = torch.argsort(weights, descending=True)
     return rankings
 
-train_features, train_labels = initialize_embeddings(root, train=True)
-test_features, test_labels = initialize_embeddings(root, train=False)
+train_features, train_labels = initialize_embeddings(root, train=True, toy=True)
+test_features, test_labels = initialize_embeddings(root, train=False, toy=True)
 
 #num_train = 10
 #train_features = train_features[0:num_train]
@@ -216,7 +263,7 @@ logits = protonet(train_features, train_labels, test_features)
 predictions = logits.argmax(axis=1)
 acc = (predictions==test_labels).sum().item()/float(len(predictions))
 print(f'Protonets: clean accuracy {(acc)*100}%')
-loss = cross_entropy(logits, test_labels)
+loss = cross_entropy(logits, test_labels, "clean_proto")
 print(f'Protonets: clean loss {(loss)}')
 
 
@@ -238,15 +285,15 @@ indices_to_flip = torch.randperm(len(train_labels))[0:int(len(train_labels)*flip
 flipped_train_labels[indices_to_flip] = 1 - flipped_train_labels[indices_to_flip]
 print("Flipped sum: {}".format(flipped_train_labels.sum()))
 
-flipped_test_labels = test_labels.clone()
-test_indices_to_flip = torch.randperm(len(test_labels))[0:int(len(test_labels)*flip_fraction)]
-flipped_test_labels[test_indices_to_flip] = 1 - flipped_test_labels[test_indices_to_flip]
+#flipped_test_labels = test_labels.clone()
+#test_indices_to_flip = torch.randperm(len(test_labels))[0:int(len(test_labels)*flip_fraction)]
+#flipped_test_labels[test_indices_to_flip] = 1 - flipped_test_labels[test_indices_to_flip]
 
 logits = protonet(train_features, flipped_train_labels, test_features)
 predictions = logits.argmax(axis=1)
 acc = (predictions==test_labels).sum().item()/float(len(predictions))
 print(f'Protonets: {flip_fraction*100}% Noisy accuracy {(acc)*100}%')
-loss = cross_entropy(logits, test_labels)
+loss = cross_entropy(logits, test_labels, "noisy_proto")
 print(f'Protonets: {flip_fraction*100}% Noisy loss {(loss)}')
 
 noisy_embedding_dataset_train = EmbeddedDataset(train_features, flipped_train_labels)
@@ -257,7 +304,8 @@ noisy_lreg = train_model(noisy_lreg, noisy_dataloader_train)
 test_model(noisy_lreg, clean_dataloader_test)
 del noisy_lreg
 
-rankings = calculate_rankings(protonet, train_features, flipped_train_labels, test_features, flipped_test_labels, num_classes)
+rankings = calculate_rankings(protonet, train_features, flipped_train_labels, test_features, test_labels, num_classes)
+#rankings = calculate_rankings(protonet, train_features, flipped_train_labels, test_features, flipped_test_labels, num_classes)
 
 num_correctly_identified = []
 relabelled_protonets_acc = []
@@ -279,7 +327,7 @@ for check_fraction in check_fractions:
     predictions = logits.argmax(axis=1)
     acc = (predictions==test_labels).sum().item()/float(len(predictions))
     #print(f'Protonets: {check_fraction*100}% relabeled accuracy {(acc)*100}%')
-    loss = cross_entropy(logits, test_labels)
+    loss = cross_entropy(logits, test_labels, "relabeled_proto")
     #print(f'Protonets: relabeled loss {(loss)}')
     relabelled_protonets_acc.append(acc)
     relabelled_protonets_loss.append(loss.item())
@@ -300,4 +348,3 @@ print("Relabelled protonets acc: {}".format(relabelled_protonets_acc))
 print("Relabelled protonets loss: {}".format(relabelled_protonets_loss))
 print("Relabelled LReg acc: {}".format(relabelled_lreg_acc))
 
-import pdb; pdb.set_trace()

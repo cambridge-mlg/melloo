@@ -29,7 +29,7 @@ class ProtoNets(nn.Module):
 
         way = self.way
         prototypes = self._compute_prototypes(context_features, context_labels, way)
-
+        print("Prototype distances: {}".format(euclidean_metric(prototypes, prototypes)[0][1].item()))
         logits = euclidean_metric(target_features, self.prototypes)
         return logits
 
