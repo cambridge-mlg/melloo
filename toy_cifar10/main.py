@@ -35,6 +35,7 @@ learning_rate = 0.001
 flip_fraction = 0.4
 check_fractions = [flip_fraction] #[0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
 toy_is_noisy = False
+is_toy = False
 
 logfile = open(os.path.join(root, "log.txt"), 'a+')
 
@@ -281,8 +282,8 @@ def train_logistic_regression_head(train_features, train_labels, test_features, 
     clean_lreg = train_model(clean_lreg, clean_dataloader_train)
     return test_model(clean_lreg, clean_dataloader_test)
 
-train_features, train_labels = initialize_embeddings(root, train=True, toy=True)
-test_features, test_labels = initialize_embeddings(root, train=False, toy=True)
+train_features, train_labels = initialize_embeddings(root, train=True, toy=is_toy)
+test_features, test_labels = initialize_embeddings(root, train=False, toy=is_toy)
 
 #num_train = 10
 #train_features = train_features[0:num_train]
@@ -292,27 +293,31 @@ train_features, test_features = torch.from_numpy(train_features).to(device), tor
 train_labels = torch.from_numpy(train_labels).type(torch.LongTensor).to(device)
 test_labels = torch.from_numpy(test_labels).type(torch.LongTensor).to(device)
 
-subset_indices = torch.LongTensor([0, 1, 2, 3, 4, 998, 999, 1000, 1001, 1002, 1003, 1004, 1998, 1999])
-test_labels_subset = test_labels[subset_indices]
-test_features_subset = test_features[subset_indices]
+if is_toy:
+    subset_indices = torch.LongTensor([0, 1, 2, 3, 4, 998, 999, 1000, 1001, 1002, 1003, 1004, 1998, 1999])
+    test_labels_subset = test_labels[subset_indices]
+    test_features_subset = test_features[subset_indices]
 
-confusing_test_features = torch.concat((test_features[1000 - int(0.024*1000):1000], test_features[2000 - int(0.024*1000):]), dim=0)
-confusing_labels = torch.concat((test_labels[1000 - int(0.024*1000):1000], test_labels[2000 - int(0.024*1000):]), dim=0)
-easy_test_features = torch.concat((test_features[0:1000 - int(0.024*1000)], test_features[1000:2000 - int(0.024*1000)]), dim=0)
-easy_labels = torch.concat((test_labels[0:1000 - int(0.024*1000)], test_labels[1000:2000 - int(0.024*1000)]), dim=0)
+    confusing_test_features = torch.concat((test_features[1000 - int(0.024*1000):1000], test_features[2000 - int(0.024*1000):]), dim=0)
+    confusing_labels = torch.concat((test_labels[1000 - int(0.024*1000):1000], test_labels[2000 - int(0.024*1000):]), dim=0)
+    easy_test_features = torch.concat((test_features[0:1000 - int(0.024*1000)], test_features[1000:2000 - int(0.024*1000)]), dim=0)
+    easy_labels = torch.concat((test_labels[0:1000 - int(0.024*1000)], test_labels[1000:2000 - int(0.024*1000)]), dim=0)
+    plot_config = PlotSettings()
 
 # Clean performance on protonets
-plot_config = PlotSettings()
+
 protonet = protonets.ProtoNets(num_classes)
 
 logits = protonet(train_features, train_labels, test_features)
 print_accuracy(logits, test_labels, "Protonets: clean")
-plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, "clean.pdf", plot_config, protonet, device)
 
-confusing_logits = protonet.classify(confusing_test_features)
-print_accuracy(confusing_logits, confusing_labels, "Protonets, confusing")
-easy_logits = protonet.classify(easy_test_features)
-print_accuracy(easy_logits, easy_labels, "Protonets, confusing")
+if is_toy:
+    plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, "clean.pdf", plot_config, protonet, device)
+
+    confusing_logits = protonet.classify(confusing_test_features)
+    print_accuracy(confusing_logits, confusing_labels, "Protonets, confusing")
+    easy_logits = protonet.classify(easy_test_features)
+    print_accuracy(easy_logits, easy_labels, "Protonets, confusing")
 
 #train_logistic_regression_head(train_features, train_labels, test_features, test_labels)
 
@@ -329,7 +334,9 @@ flipped_train_labels[indices_to_flip] = 1 - flipped_train_labels[indices_to_flip
 
 logits = protonet(train_features, flipped_train_labels, test_features)
 print_accuracy(logits, test_labels, f'Protonets: {flip_fraction*100}% Noisy')
-plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, "noisy_{}.pdf".format(flip_fraction*100), plot_config, protonet, device)
+
+if is_toy:
+    plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, "noisy_{}.pdf".format(flip_fraction*100), plot_config, protonet, device)
 
 #train_logistic_regression_head(train_features, flipped_train_labels, test_features, test_labels)
 

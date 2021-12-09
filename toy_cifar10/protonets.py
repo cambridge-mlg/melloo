@@ -60,11 +60,21 @@ class ProtoNets(nn.Module):
             # Find corresponding prototype:
             prototype = None
             prototype_count = -1
+            prototype_index = -1
+            other_prototype = None
+            other_prototype_count = -1
+            other_prototype_index = -1
+            assert len(self.prototype_labels) == 2
             for index, label in enumerate(self.prototype_labels):
                 if label == c:
                     prototype = prototypes[index].squeeze()
                     prototype_count = self.prototype_counts[index]
-                    break
+                    prototype_index = index
+                else:
+                    other_prototype = prototypes[index].squeeze()
+                    other_prototype_count = self.prototype_counts[index]
+                    other_prototype_index = index
+                
                     
             if prototype is None:
                 print("Failed to find prototype for label %".format(c))
@@ -72,7 +82,9 @@ class ProtoNets(nn.Module):
                 
             class_features = torch.index_select(loo_features, 0, self._extract_class_indices(loo_labels, c))
             prototype = ((prototype * prototype_count) - torch.sum(class_features, dim=0)) / (prototype_count - len(loo_features))
-            prototypes[index] = prototype
+            prototypes[prototype_index] = prototype
+            other_prototype = ((other_prototype * other_prototype_count) + torch.sum(class_features, dim=0)) / (other_prototype_count + len(loo_features))
+            prototypes[other_prototype_index] = other_prototype
 
         logits = euclidean_metric(target_features, prototypes)
         return logits
