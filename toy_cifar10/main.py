@@ -34,11 +34,19 @@ learning_rate = 0.001
 
 flip_fraction = 0.4
 check_fractions = [flip_fraction] #[0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
+toy_is_noisy = False
+
+logfile = open(os.path.join(root, "log.txt"), 'a+')
+
 
 horse_index = 7
 automobile_index = 1
 keep_class_indices = [horse_index, automobile_index]
 num_classes = len(keep_class_indices)
+
+logfile.write("=======================\nToy Protonets\n====================\n")
+logfile.write(f'Params: flip_fraction: {flip_fraction}, toy is noisy: {toy_is_noisy}, num_classes: {num_classes}, num_epochs: {num_epochs}, batch_size: {batch_size}, learning_rate: {learning_rate}\n')
+
 
 def cross_entropy(logits, labels, fig_prefix=None):
     unreduced_loss = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
@@ -141,6 +149,7 @@ def train_model(model, data_loader, reset_head=False, hush=False):
             optimizer.zero_grad()
             if not hush and epoch == num_epochs-1 and (i+1) % 250 == 0:
                 print(f'epoch {epoch+1}/{num_epochs}: loss = {loss_value:.5f}, acc = {100*(n_corrects/labels.size(0)):.2f}%')
+                logfile.write(f'epoch {epoch+1}/{num_epochs}: loss = {loss_value:.5f}, acc = {100*(n_corrects/labels.size(0)):.2f}%\n')
     return model
                 
 def test_model(model, data_loader, hush=False):                
@@ -159,6 +168,7 @@ def test_model(model, data_loader, hush=False):
             
         if not hush:
             print(f'Logistic regression accuracy {(number_corrects / number_samples)*100}%')
+            logfile.write(f'Logistic regression accuracy {(number_corrects / number_samples)*100}%\n')
         return (number_corrects / number_samples)*100
 
 
@@ -205,6 +215,8 @@ def generate_gaussian_data(train=True, train_error_rate= 0.01, test_error_rate =
     else:
         num_instances = test_per_class
         error_rate = test_error_rate
+    if not toy_is_noisy:
+        error_rate = 0
 
     unpertured_prototype_distance = np.sqrt(384.6158)/2.0
     unperturbed_symmetric_coords = unpertured_prototype_distance/np.sqrt(2)
@@ -222,7 +234,6 @@ def generate_gaussian_data(train=True, train_error_rate= 0.01, test_error_rate =
     
     points = rand.normal(loc=prototype_0, size=(num_instances, 2)).astype('f')
     points = np.append(points, rand.normal(loc=prototype_1, size=(num_instances, 2)).astype('f'), axis=0)
-    import pdb; pdb.set_trace()
     labels_0 = np.append(np.zeros(int(num_instances*(1 - error_rate))), np.ones(int(num_instances*error_rate)))
     labels_1 = np.append(np.ones(int(num_instances*(1 - error_rate))), np.zeros(int(num_instances*error_rate)))
     return points, np.append(labels_0, labels_1, axis=0)
@@ -245,6 +256,31 @@ def calculate_rankings(protonet, support_features, support_labels, query_feature
     rankings = torch.argsort(weights, descending=True)
     return rankings
 
+# Protonets: {flip_fraction*100}% Noisy
+def print_accuracy(logits, test_labels, descrip, hush=False):
+    predictions = logits.argmax(axis=1)
+    acc = (predictions==test_labels).sum().item()/float(len(predictions))
+    loss = cross_entropy(logits, test_labels)
+
+    if not hush:
+        print(f'{descrip} accuracy {(acc)*100}%')
+        print(f'{descrip} loss {(loss)}')
+    logfile.write(f'{descrip} accuracy {(acc)*100}%\n')
+    logfile.write(f'{descrip} loss {(loss)}\n')
+    return acc, loss
+
+def train_logistic_regression_head(train_features, train_labels, test_features, test_labels):
+
+    clean_embedding_dataset_test = EmbeddedDataset(test_features, test_labels)
+    clean_dataloader_test = torch.utils.data.DataLoader(clean_embedding_dataset_test, batch_size=batch_size, shuffle=False)
+
+    clean_embedding_dataset_train = EmbeddedDataset(train_features, train_labels)
+    clean_dataloader_train = torch.utils.data.DataLoader(clean_embedding_dataset_train, batch_size=batch_size, shuffle=False)
+
+    clean_lreg = LogisticRegression(train_features.shape[1], num_classes)
+    clean_lreg = train_model(clean_lreg, clean_dataloader_train)
+    return test_model(clean_lreg, clean_dataloader_test)
+
 train_features, train_labels = initialize_embeddings(root, train=True, toy=True)
 test_features, test_labels = initialize_embeddings(root, train=False, toy=True)
 
@@ -256,61 +292,46 @@ train_features, test_features = torch.from_numpy(train_features).to(device), tor
 train_labels = torch.from_numpy(train_labels).type(torch.LongTensor).to(device)
 test_labels = torch.from_numpy(test_labels).type(torch.LongTensor).to(device)
 
-subset_indices = to.LongTensor([0, 1, 2, 3, 4, 1998, 1999, 2000, 2001, 2002, 2003, 2004, 3998, 3999])
-test_labels_subset = to.index_select(test_labels, dim=0, subset_indices)
-test_features_subset = to.index_select(test_features, dim=0, subset_indices)
+subset_indices = torch.LongTensor([0, 1, 2, 3, 4, 998, 999, 1000, 1001, 1002, 1003, 1004, 1998, 1999])
+test_labels_subset = test_labels[subset_indices]
+test_features_subset = test_features[subset_indices]
+
+confusing_test_features = torch.concat((test_features[1000 - int(0.024*1000):1000], test_features[2000 - int(0.024*1000):]), dim=0)
+confusing_labels = torch.concat((test_labels[1000 - int(0.024*1000):1000], test_labels[2000 - int(0.024*1000):]), dim=0)
+easy_test_features = torch.concat((test_features[0:1000 - int(0.024*1000)], test_features[1000:2000 - int(0.024*1000)]), dim=0)
+easy_labels = torch.concat((test_labels[0:1000 - int(0.024*1000)], test_labels[1000:2000 - int(0.024*1000)]), dim=0)
 
 # Clean performance on protonets
-plot_config = self._PlotSettings()
+plot_config = PlotSettings()
 protonet = protonets.ProtoNets(num_classes)
 
 logits = protonet(train_features, train_labels, test_features)
-predictions = logits.argmax(axis=1)
-acc = (predictions==test_labels).sum().item()/float(len(predictions))
-print(f'Protonets: clean accuracy {(acc)*100}%')
-loss = cross_entropy(logits, test_labels, "clean_proto")
-print(f'Protonets: clean loss {(loss)}')
+print_accuracy(logits, test_labels, "Protonets: clean")
+plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, "clean.pdf", plot_config, protonet, device)
 
-plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, "clean.pdf", plot_config, protonets, device)
+confusing_logits = protonet.classify(confusing_test_features)
+print_accuracy(confusing_logits, confusing_labels, "Protonets, confusing")
+easy_logits = protonet.classify(easy_test_features)
+print_accuracy(easy_logits, easy_labels, "Protonets, confusing")
 
-clean_embedding_dataset_test = EmbeddedDataset(test_features, test_labels)
-clean_dataloader_test = torch.utils.data.DataLoader(clean_embedding_dataset_test, batch_size=batch_size, shuffle=False)
-
-clean_embedding_dataset_train = EmbeddedDataset(train_features, train_labels)
-clean_dataloader_train = torch.utils.data.DataLoader(clean_embedding_dataset_train, batch_size=batch_size, shuffle=False)
-
-clean_lreg = LogisticRegression(train_features.shape[1], num_classes)
-clean_lreg = train_model(clean_lreg, clean_dataloader_train)
-test_model(clean_lreg, clean_dataloader_test)
-del clean_lreg
+#train_logistic_regression_head(train_features, train_labels, test_features, test_labels)
 
 # Flip label experiment
 
 flipped_train_labels = train_labels.clone()
 indices_to_flip = torch.randperm(len(train_labels))[0:int(len(train_labels)*flip_fraction)]
 flipped_train_labels[indices_to_flip] = 1 - flipped_train_labels[indices_to_flip]
-print("Flipped sum: {}".format(flipped_train_labels.sum()))
+#print("Flipped sum: {}".format(flipped_train_labels.sum()))
 
 #flipped_test_labels = test_labels.clone()
 #test_indices_to_flip = torch.randperm(len(test_labels))[0:int(len(test_labels)*flip_fraction)]
 #flipped_test_labels[test_indices_to_flip] = 1 - flipped_test_labels[test_indices_to_flip]
 
 logits = protonet(train_features, flipped_train_labels, test_features)
-predictions = logits.argmax(axis=1)
-acc = (predictions==test_labels).sum().item()/float(len(predictions))
-print(f'Protonets: {flip_fraction*100}% Noisy accuracy {(acc)*100}%')
-loss = cross_entropy(logits, test_labels, "noisy_proto")
-print(f'Protonets: {flip_fraction*100}% Noisy loss {(loss)}')
+print_accuracy(logits, test_labels, f'Protonets: {flip_fraction*100}% Noisy')
+plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, "noisy_{}.pdf".format(flip_fraction*100), plot_config, protonet, device)
 
-plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, "noisy_{}.pdf".format(flip_fraction*100), plot_config, protonets, device)
-
-noisy_embedding_dataset_train = EmbeddedDataset(train_features, flipped_train_labels)
-noisy_dataloader_train = torch.utils.data.DataLoader(noisy_embedding_dataset_train, batch_size=batch_size, shuffle=False)
-
-noisy_lreg = LogisticRegression(train_features.shape[1], num_classes)
-noisy_lreg = train_model(noisy_lreg, noisy_dataloader_train)
-test_model(noisy_lreg, clean_dataloader_test)
-del noisy_lreg
+#train_logistic_regression_head(train_features, flipped_train_labels, test_features, test_labels)
 
 rankings = calculate_rankings(protonet, train_features, flipped_train_labels, test_features, test_labels, num_classes)
 #rankings = calculate_rankings(protonet, train_features, flipped_train_labels, test_features, flipped_test_labels, num_classes)
@@ -332,27 +353,16 @@ for check_fraction in check_fractions:
     relabeled_train_labels[relabel_indices] = train_labels[relabel_indices]
 
     logits = protonet(train_features, relabeled_train_labels, test_features)
-    predictions = logits.argmax(axis=1)
-    acc = (predictions==test_labels).sum().item()/float(len(predictions))
-    #print(f'Protonets: {check_fraction*100}% relabeled accuracy {(acc)*100}%')
-    loss = cross_entropy(logits, test_labels, "relabeled_proto")
-    #print(f'Protonets: relabeled loss {(loss)}')
+    acc, loss = print_accuracy(logits, test_labels, 'Protonets: {check_fraction*100}% relabeled', hush=True)
     relabelled_protonets_acc.append(acc)
     relabelled_protonets_loss.append(loss.item())
 
+    #test_acc = train_logistic_regression_head(train_features, relabeled_train_labels, test_features, test_labels)
+    #relabelled_lreg_acc.append(test_acc)
 
-    relabelled_embedding_dataset_train = EmbeddedDataset(train_features, relabeled_train_labels)
-    relabelled_dataloader_train = torch.utils.data.DataLoader(relabelled_embedding_dataset_train, batch_size=batch_size, shuffle=False)
-
-    relabelled_model = LogisticRegression(train_features.shape[1], num_classes)
-    relabelled_model = train_model(relabelled_model, relabelled_dataloader_train, hush=True)
-    lr_acc = test_model(relabelled_model, clean_dataloader_test, hush=True)
-    relabelled_lreg_acc.append(lr_acc)
-    del relabelled_model
-
-print("Check fractions: {}".format(check_fractions))
-print("Num correctly identified: {}".format(num_correctly_identified))
-print("Relabelled protonets acc: {}".format(relabelled_protonets_acc))
-print("Relabelled protonets loss: {}".format(relabelled_protonets_loss))
-print("Relabelled LReg acc: {}".format(relabelled_lreg_acc))
+logfile.write("Check fractions: {}\n".format(check_fractions))
+logfile.write("Num correctly identified: {}\n".format(num_correctly_identified))
+logfile.write("Relabelled protonets acc: {}\n".format(relabelled_protonets_acc))
+logfile.write("Relabelled protonets loss: {}\n".format(relabelled_protonets_loss))
+logfile.write("Relabelled LReg acc: {}\n".format(relabelled_lreg_acc))
 
