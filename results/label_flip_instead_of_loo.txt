@@ -1,0 +1,51 @@
+50% Noisy, Label flip instead of drop, Sort Descending
+
+Prototype distances: -384.6157531738281
+Protonets: clean accuracy 97.65%
+Protonets: clean loss 1.5524117946624756
+Prototype distances: -0.890430212020874
+Protonets: 50.0% Noisy accuracy 32.550000000000004%
+Protonets: 50.0% Noisy loss 3.021153450012207
+Correctly identified indices 4857 out of 5000.0
+Prototype distances: -387.4046325683594
+
+40% Noisy, Label flip instead of drop, Sort Descending
+
+Prototype distances: -384.6157531738281
+Protonets: clean accuracy 97.65%
+Protonets: clean loss 1.5524117946624756
+Prototype distances: -17.214637756347656
+Protonets: 40.0% Noisy accuracy 97.7%
+Protonets: 40.0% Noisy loss 0.337659627199173
+Correctly identified indices 712 out of 4000.0
+Prototype distances: -37.63186264038086
+
+40% Noisy, Label flip instead of drop, Sort Ascending
+Prototype distances: -384.6157531738281
+Protonets: clean accuracy 97.65%
+Protonets: clean loss 1.5524117946624756
+Prototype distances: -16.550769805908203
+Protonets: 40.0% Noisy accuracy 97.6%
+Protonets: 40.0% Noisy loss 0.3346414268016815
+Correctly identified indices 2467 out of 4000.0
+Prototype distances: -237.06027221679688
+
+50% Noisy, Label flip instead of drop, Sort Ascending
+Prototype distances: -384.6157531738281
+Protonets: clean accuracy 97.65%
+Protonets: clean loss 1.5524117946624756
+Prototype distances: -0.9782267808914185
+Protonets: 50.0% Noisy accuracy 67.25%
+Protonets: 50.0% Noisy loss 1.1861916780471802
+Correctly identified indices 132 out of 5000.0
+Prototype distances: -1.1928443908691406
+
+(Another run of 50% Noisy, Label flip instead of drop, Sort Ascending)
+Prototype distances: -384.6157531738281
+Protonets: clean accuracy 97.65%
+Protonets: clean loss 1.5524117946624756
+Prototype distances: -0.9236966371536255
+Protonets: 50.0% Noisy accuracy 40.699999999999996%
+Protonets: 50.0% Noisy loss 2.3677866458892822
+Correctly identified indices 117 out of 5000.0
+Prototype distances: -1.0969345569610596

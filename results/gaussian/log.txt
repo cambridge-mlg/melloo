@@ -1,0 +1,85 @@
+
+1 = 40% noisy, initial noise present noise in dataset
+2 = 50% noisy, initial noise present
+3 = 50 % noisy, no initial noise
+4 = 40% noisy, no initial noise
+
+Point of initial noise: Look at the average "clean" loss
+=======================
+Toy Protonets
+====================
+Params: flip_fraction: 0.4, toy is noisy: True, num_classes: 2, num_epochs: 5, batch_size: 40, learning_rate: 0.001
+Protonets: clean accuracy 97.6%
+Protonets: clean loss 9.081043243408203
+
+Protonets, confusing accuracy 0.0%
+Protonets, confusing loss 378.3768005371094
+Protonets, unconfusing accuracy 100.0%
+Protonets, unconfusing loss 0.0
+
+Protonets: 40.0% Noisy accuracy 97.6%
+Protonets: 40.0% Noisy loss 1.8272063732147217
+Protonets: 40% relabeled accuracy 97.6%
+Protonets: 40% relabeled loss 1.764760136604309
+Check fractions: [0.4]
+Num correctly identified: [32]
+Relabelled protonets acc: [0.976]
+Relabelled protonets loss: [1.764760136604309]
+Relabelled LReg acc: []
+=======================
+Toy Protonets
+====================
+Params: flip_fraction: 0.5, toy is noisy: True, num_classes: 2, num_epochs: 5, batch_size: 40, learning_rate: 0.001
+Protonets: clean accuracy 97.6%
+Protonets: clean loss 9.195198059082031
+Protonets, confusing accuracy 0.0%
+Protonets, confusing loss 383.13323974609375
+Protonets, unconfusing accuracy 100.0%
+Protonets, unconfusing loss 0.0
+Protonets: 50.0% Noisy accuracy 2.4%
+Protonets: 50.0% Noisy loss 1.3184603452682495
+Protonets: 50% relabeled accuracy 97.6%
+Protonets: 50% relabeled loss 9.274925231933594
+Check fractions: [0.5]
+Num correctly identified: [4946]
+Relabelled protonets acc: [0.976]
+Relabelled protonets loss: [9.274925231933594]
+Relabelled LReg acc: []
+=======================
+Toy Protonets
+====================
+Params: flip_fraction: 0.5, toy is noisy: False, num_classes: 2, num_epochs: 5, batch_size: 40, learning_rate: 0.001
+Protonets: clean accuracy 100.0%
+Protonets: clean loss 0.0
+Protonets, confusing accuracy 100.0%
+Protonets, confusing loss 0.0
+Protonets, unconfusing accuracy 100.0%
+Protonets, unconfusing loss 0.0
+Protonets: 50.0% Noisy accuracy 100.0%
+Protonets: 50.0% Noisy loss 0.5942326784133911
+Protonets: 50% relabeled accuracy 100.0%
+Protonets: 50% relabeled loss 0.0
+Check fractions: [0.5]
+Num correctly identified: [5000]
+Relabelled protonets acc: [1.0]
+Relabelled protonets loss: [0.0]
+Relabelled LReg acc: []
+=======================
+Toy Protonets
+====================
+Params: flip_fraction: 0.4, toy is noisy: False, num_classes: 2, num_epochs: 5, batch_size: 40, learning_rate: 0.001
+Protonets: clean accuracy 100.0%
+Protonets: clean loss 0.0
+Protonets, confusing accuracy 100.0%
+Protonets, confusing loss 0.0
+Protonets, unconfusing accuracy 100.0%
+Protonets, unconfusing loss 0.0
+Protonets: 40.0% Noisy accuracy 100.0%
+Protonets: 40.0% Noisy loss 0.0
+Protonets: 40% relabeled accuracy 100.0%
+Protonets: 40% relabeled loss 0.0
+Check fractions: [0.4]
+Num correctly identified: [1578]
+Relabelled protonets acc: [1.0]
+Relabelled protonets loss: [0.0]
+Relabelled LReg acc: []

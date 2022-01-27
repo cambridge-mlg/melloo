@@ -1,0 +1,51 @@
+=============================
+50 % Perturbed
+=============================
+
+Prototype distances: tensor([[  -0.0000, -384.6158],
+        [-384.6158,   -0.0000]], device='cuda:0')
+Protonets: clean accuracy 97.65%
+Protonets: clean loss 1.5524117946624756
+epoch 5/5: loss = 0.31800, acc = 100.00%
+Logistic regression accuracy 98.9%
+Flipped sum: 5040
+Prototype distances: tensor([[-0.0000, -1.0131],
+        [-1.0131, -0.0000]], device='cuda:0')
+Protonets: 50.0% Noisy accuracy 50.14999999999999%
+Protonets: 50.0% Noisy loss 2.2644786834716797
+epoch 5/5: loss = 0.67936, acc = 55.00%
+Logistic regression accuracy 52.15%
+Prototype distances: tensor([[  -0.0000, -385.6544],
+        [-385.6544,   -0.0000]], device='cuda:0')
+Check fractions: [0.5]
+Num correctly identified: [4872]
+Relabelled protonets acc: [0.976]
+Relabelled protonets loss: [1.6147807836532593]
+Relabelled LReg acc: [98.6]
+
+=============================
+40 % Perturbed
+=============================
+
+
+
+Prototype distances: tensor([[  -0.0000, -384.6158],
+        [-384.6158,   -0.0000]], device='cuda:0')
+Protonets: clean accuracy 97.65%
+Protonets: clean loss 1.5524117946624756
+epoch 5/5: loss = 0.31872, acc = 100.00%
+Logistic regression accuracy 98.85000000000001%
+Flipped sum: 4942
+Prototype distances: tensor([[ -0.0000, -16.1239],
+        [-16.1239,  -0.0000]], device='cuda:0')
+Protonets: 40.0% Noisy accuracy 97.55%
+Protonets: 40.0% Noisy loss 0.367827832698822
+epoch 5/5: loss = 0.65534, acc = 67.50%
+Logistic regression accuracy 84.3%
+Prototype distances: tensor([[ -0.0000, -46.1023],
+        [-46.1023,  -0.0000]], device='cuda:0')
+Check fractions: [0.4]
+Num correctly identified: [947]
+Relabelled protonets acc: [0.981]
+Relabelled protonets loss: [0.36225080490112305]
+Relabelled LReg acc: [92.65]
