@@ -1,0 +1,83 @@
+==============================
+Toy Protonets - No Rescaling
+==============================
+Params: flip_fraction: 0.4, toy is noisy: True, num_classes: 2, num_epochs: 5, batch_size: 40, learning_rate: 0.001
+Protonets: clean accuracy 97.6%
+Protonets: clean loss 9.0514554977417
+
+	Protonets, confusing accuracy 0.0%
+	Protonets, confusing loss 377.14398193359375
+	Protonets, easy accuracy 100.0%
+	Protonets, easy loss 0.0
+	
+Protonets: 40.0% Noisy accuracy 97.6%
+Protonets: 40.0% Noisy loss 1.805366039276123
+Protonets: 40% relabeled accuracy 97.6%
+Protonets: 40% relabeled loss 1.7611206769943237
+
+Check fractions: [0.4]
+Num correctly identified: [22]
+Relabelled protonets acc: [0.976]
+Relabelled protonets loss: [1.7611206769943237]
+
+
+
+=========================================
+Toy Protonets - Rescale by d^2/sigma^2
+=========================================
+Params: flip_fraction: 0.4, toy is noisy: True, num_classes: 2, num_epochs: 5, batch_size: 40, learning_rate: 0.001
+Protonets: clean accuracy 97.6%
+Protonets: clean loss 9.019781112670898
+
+	Protonets, confusing accuracy 0.0%
+	Protonets, confusing loss 128.5885009765625				<--- Significantly lower than the unscaled case.
+	Protonets, easy accuracy 100.0%
+	Protonets, easy loss 0.0
+
+Protonets: 40.0% Noisy accuracy 97.6%
+Protonets: 40.0% Noisy loss 1.800053596496582
+Protonets: 40% relabeled accuracy 97.6%
+Protonets: 40% relabeled loss 1.7509456872940063
+
+Check fractions: [0.4]
+Num correctly identified: [25]								<--- Not significantly improved
+Relabelled protonets acc: [0.976]
+Relabelled protonets loss: [1.7509456872940063]
+
+
+=========================================
+Toy Protonets - No Rescaling
+=========================================
+Params: flip_fraction: 0.5, toy is noisy: True, num_classes: 2, num_epochs: 5, batch_size: 40, learning_rate: 0.001
+Prototype distances: -368.0360412597656
+Protonets: clean accuracy 97.6%
+Protonets: clean loss 9.016694068908691
+Protonets, confusing accuracy 0.0%
+Protonets, confusing loss 375.695556640625
+Protonets, easy accuracy 100.0%
+Protonets, easy loss 0.0
+Prototype distances: -0.0015005151508376002
+Protonets: 50.0% Noisy accuracy 97.6%
+Protonets: 50.0% Noisy loss 0.40374624729156494
+Correctly identified indices 4948 out of 5000.0
+Prototype distances: -375.811767578125
+
+
+
+
+=========================================
+Toy Protonets - Rescale by d^2/sigma^2
+=========================================
+Params: flip_fraction: 0.5, toy is noisy: True, num_classes: 2, num_epochs: 5, batch_size: 40, learning_rate: 0.001
+Prototype distances: -370.7200622558594
+Protonets: clean accuracy 97.6%
+Protonets: clean loss 9.06049919128418
+Protonets, confusing accuracy 0.0%
+Protonets, confusing loss 130.40493774414062
+Protonets, easy accuracy 100.0%
+Protonets, easy loss 0.0
+Prototype distances: -0.004994275979697704
+Protonets: 50.0% Noisy accuracy 97.6%
+Protonets: 50.0% Noisy loss 0.2613920271396637
+Correctly identified indices 4946 out of 5000.0
+Prototype distances: -379.00177001953125
