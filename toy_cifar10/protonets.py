@@ -1,5 +1,8 @@
 import torch
 import torch.nn as nn
+import numpy as np
+
+cluster_distance = 800
 
 def euclidean_metric(target_features, class_prototypes):
     num_target_features = target_features.shape[0]
@@ -29,27 +32,47 @@ class ProtoNets(nn.Module):
 
         way = self.way
         prototypes = self._compute_prototypes(context_features, context_labels, way)
+
         print("Prototype distances: {}".format(euclidean_metric(prototypes, prototypes)[0][1].item()))
         logits = euclidean_metric(target_features, self.prototypes)
         return logits
         
     def classify(self, target_features):
         logits = euclidean_metric(target_features, self.prototypes)
+        # Scale by squared standard deviation
+        #logits = logits/(self.std_devs**2).to(logits.device)
         return logits
 
     def _compute_prototypes(self, context_features, context_labels, way):
         prototypes = []
         prototype_labels = []
         prototype_counts = []
+        cluster_std_devs = []
+        #unpertured_prototype_distance = np.sqrt(cluster_distance)/2.0
+        #unperturbed_symmetric_coords = unpertured_prototype_distance/np.sqrt(2)
+        #prototype_0 = np.array([unperturbed_symmetric_coords, unperturbed_symmetric_coords])
+        #prototype_1 = np.array([-unperturbed_symmetric_coords, -unperturbed_symmetric_coords])
         for c in torch.unique(context_labels):
             class_features = torch.index_select(context_features, 0, self._extract_class_indices(context_labels, c))
-            prototypes.append(torch.mean(class_features, dim=0, keepdim=True))
+            class_mean = torch.mean(class_features, dim=0, keepdim=True)
+            '''
+            if c == 0:
+                class_mean = torch.Tensor(prototype_0).unsqueeze(0).to(context_features.device)
+            else:
+                class_mean = torch.Tensor(prototype_1).unsqueeze(0).to(context_features.device)
+            '''
+
+            class_stddev = torch.std(class_features)
+            #class_stddev = torch.Tensor([1]).to(context_features.device) #torch.std(class_features)
+            prototypes.append(class_mean)
+            cluster_std_devs.append(class_stddev)
             prototype_labels.append(c)
             prototype_counts.append(len(class_features))
 
         self.prototypes = torch.squeeze(torch.stack(prototypes))
         self.prototype_labels = prototype_labels
         self.prototype_counts = prototype_counts
+        self.std_devs = torch.Tensor(cluster_std_devs)
         
         return self.prototypes
         

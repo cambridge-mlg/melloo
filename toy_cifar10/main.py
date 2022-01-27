@@ -20,7 +20,8 @@ import protonets
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
-root = '/scratch/etv21/cifar10_data'
+root = '/scratch/etv21/gaussian_debug'
+data_root = '/scratch/etv21/cifar10_data'
 
 
 if torch.cuda.is_available():
@@ -34,8 +35,11 @@ learning_rate = 0.001
 
 flip_fraction = 0.4
 check_fractions = [flip_fraction] #[0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
-toy_is_noisy = False
-is_toy = False
+toy_is_noisy = True
+# If is_toy, then we use 2-D Gaussians
+# If not, then we use the CIFAR-10 classes specified later on
+is_toy = True
+cluster_distance = 384.6158
 
 logfile = open(os.path.join(root, "log.txt"), 'a+')
 
@@ -85,7 +89,7 @@ def make_data_loader(batch_size, train=True, shuffle=False):
     ])
 
     dataset = torchvision.datasets.CIFAR10(
-    root = root, train=train,
+    root = data_root, train=train,
     download =True, transform=transform)
     
     target_tensor = torch.tensor(dataset.targets)
@@ -219,7 +223,7 @@ def generate_gaussian_data(train=True, train_error_rate= 0.01, test_error_rate =
     if not toy_is_noisy:
         error_rate = 0
 
-    unpertured_prototype_distance = np.sqrt(384.6158)/2.0
+    unpertured_prototype_distance = np.sqrt(cluster_distance)/2.0 #384.6158
     unperturbed_symmetric_coords = unpertured_prototype_distance/np.sqrt(2)
     prototype_0 = np.array([unperturbed_symmetric_coords, unperturbed_symmetric_coords])
     prototype_1 = np.array([-unperturbed_symmetric_coords, -unperturbed_symmetric_coords])
@@ -243,7 +247,8 @@ def generate_gaussian_data(train=True, train_error_rate= 0.01, test_error_rate =
 def calculate_rankings(protonet, support_features, support_labels, query_features, query_labels, way):
     # Calculate loo weights
     weights = torch.zeros(len(support_features))
-
+    clean_logits = protonet.classify(query_features)
+    clean_loss = cross_entropy(clean_logits, query_labels)
     
     if len(support_features) != len(support_labels):
         import pdb; pdb.set_trace()
@@ -282,8 +287,9 @@ def train_logistic_regression_head(train_features, train_labels, test_features, 
     clean_lreg = train_model(clean_lreg, clean_dataloader_train)
     return test_model(clean_lreg, clean_dataloader_test)
 
-train_features, train_labels = initialize_embeddings(root, train=True, toy=is_toy)
-test_features, test_labels = initialize_embeddings(root, train=False, toy=is_toy)
+train_features, train_labels = initialize_embeddings(data_root, train=True, toy=is_toy)
+test_features, test_labels = initialize_embeddings(data_root, train=False, toy=is_toy)
+
 
 #num_train = 10
 #train_features = train_features[0:num_train]
@@ -294,14 +300,17 @@ train_labels = torch.from_numpy(train_labels).type(torch.LongTensor).to(device)
 test_labels = torch.from_numpy(test_labels).type(torch.LongTensor).to(device)
 
 if is_toy:
-    subset_indices = torch.LongTensor([0, 1, 2, 3, 4, 998, 999, 1000, 1001, 1002, 1003, 1004, 1998, 1999])
-    test_labels_subset = test_labels[subset_indices]
-    test_features_subset = test_features[subset_indices]
-
-    confusing_test_features = torch.concat((test_features[1000 - int(0.024*1000):1000], test_features[2000 - int(0.024*1000):]), dim=0)
-    confusing_labels = torch.concat((test_labels[1000 - int(0.024*1000):1000], test_labels[2000 - int(0.024*1000):]), dim=0)
-    easy_test_features = torch.concat((test_features[0:1000 - int(0.024*1000)], test_features[1000:2000 - int(0.024*1000)]), dim=0)
-    easy_labels = torch.concat((test_labels[0:1000 - int(0.024*1000)], test_labels[1000:2000 - int(0.024*1000)]), dim=0)
+    # Select some points to plot
+    #subset_indices = torch.LongTensor([0, 1, 2, 3, 4, 998, 999, 1000, 1001, 1002, 1003, 1004, 1998, 1999])
+    test_labels_subset = test_labels #[subset_indices]
+    test_features_subset = test_features #[subset_indices]
+    
+    if toy_is_noisy:
+        # The last 0.024 of each class will be "confusing" points if noisy, extract those
+        confusing_test_features = torch.cat((test_features[1000 - int(0.024*1000):1000], test_features[2000 - int(0.024*1000):]), dim=0)
+        confusing_labels = torch.cat((test_labels[1000 - int(0.024*1000):1000], test_labels[2000 - int(0.024*1000):]), dim=0)
+        easy_test_features = torch.cat((test_features[0:1000 - int(0.024*1000)], test_features[1000:2000 - int(0.024*1000)]), dim=0)
+        easy_labels = torch.cat((test_labels[0:1000 - int(0.024*1000)], test_labels[1000:2000 - int(0.024*1000)]), dim=0)
     plot_config = PlotSettings()
 
 # Clean performance on protonets
@@ -312,12 +321,12 @@ logits = protonet(train_features, train_labels, test_features)
 print_accuracy(logits, test_labels, "Protonets: clean")
 
 if is_toy:
-    plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, "clean.pdf", plot_config, protonet, device)
-
-    confusing_logits = protonet.classify(confusing_test_features)
-    print_accuracy(confusing_logits, confusing_labels, "Protonets, confusing")
-    easy_logits = protonet.classify(easy_test_features)
-    print_accuracy(easy_logits, easy_labels, "Protonets, confusing")
+    plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset,os.path.join(root, "clean_test.pdf"), plot_config, protonet, device)
+    if toy_is_noisy:
+        confusing_logits = protonet.classify(confusing_test_features)
+        print_accuracy(confusing_logits, confusing_labels, "Protonets, confusing")
+        easy_logits = protonet.classify(easy_test_features)
+        print_accuracy(easy_logits, easy_labels, "Protonets, easy")
 
 #train_logistic_regression_head(train_features, train_labels, test_features, test_labels)
 
@@ -336,7 +345,7 @@ logits = protonet(train_features, flipped_train_labels, test_features)
 print_accuracy(logits, test_labels, f'Protonets: {flip_fraction*100}% Noisy')
 
 if is_toy:
-    plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, "noisy_{}.pdf".format(flip_fraction*100), plot_config, protonet, device)
+    plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, os.path.join(root, "noisy_{}.pdf").format(flip_fraction*100), plot_config, protonet, device)
 
 #train_logistic_regression_head(train_features, flipped_train_labels, test_features, test_labels)
 
@@ -354,7 +363,7 @@ for check_fraction in check_fractions:
     relabel_indices = rankings[num_to_keep:]
     num_correct_indices = len(set(indices_to_flip.numpy()).intersection(set(relabel_indices.numpy())))
     num_correctly_identified.append(num_correct_indices)
-    #print(f'Correctly identified indices {(num_correct_indices)} out of {(flip_fraction*len(train_features))}')
+    print(f'Correctly identified indices {(num_correct_indices)} out of {(flip_fraction*len(train_features))}')
 
     relabeled_train_labels = flipped_train_labels.clone()
     relabeled_train_labels[relabel_indices] = train_labels[relabel_indices]
