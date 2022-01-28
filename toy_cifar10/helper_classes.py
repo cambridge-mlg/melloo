@@ -20,3 +20,12 @@ class EmbeddedDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.feature_embeddings[idx], self.labels[idx]
+
+def euclidean_metric(target_features, class_prototypes):
+    num_target_features = target_features.shape[0]
+    num_prototypes = class_prototypes.shape[0]
+
+    distances = (target_features.unsqueeze(1).expand(num_target_features, num_prototypes, -1) -
+                 class_prototypes.unsqueeze(0).expand(num_target_features, num_prototypes, -1)).pow(2).sum(dim=2)
+    return -distances
+    
