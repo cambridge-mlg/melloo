@@ -12,6 +12,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy.random as rand
 
+from mahalanobis import MahalanobisPredictor
 from helper_classes import LogisticRegression, EmbeddedDataset
 from plot_decision_regions import PlotSettings, plot_decision_regions
 import protonets
@@ -35,22 +36,24 @@ learning_rate = 0.001
 
 flip_fraction = 0.4
 check_fractions = [flip_fraction] #[0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
-toy_is_noisy = True
-# If is_toy, then we use 2-D Gaussians
+scale_logits = True
+classifier_type = 'Protonets' # Can also be Mahalanobis
+# If is_toy, then we use 2-D Gaussians1
 # If not, then we use the CIFAR-10 classes specified later on
 is_toy = True
+noisy_context = True
+noisy_target = False
 cluster_distance = 384.6158
 
 logfile = open(os.path.join(root, "log.txt"), 'a+')
-
 
 horse_index = 7
 automobile_index = 1
 keep_class_indices = [horse_index, automobile_index]
 num_classes = len(keep_class_indices)
 
-logfile.write("=======================\nToy Protonets\n====================\n")
-logfile.write(f'Params: flip_fraction: {flip_fraction}, toy is noisy: {toy_is_noisy}, num_classes: {num_classes}, num_epochs: {num_epochs}, batch_size: {batch_size}, learning_rate: {learning_rate}\n')
+logfile.write(f'=======================\nToy {classifier_type}\n====================\n')
+logfile.write(f'Params: classifier: {classifier_type}, flip_fraction: {flip_fraction}, scale logits: {scale_logits}, context is noisy: {noisy_context}, target is noisy: {noisy_target}, num_classes: {num_classes}, num_epochs: {num_epochs}, batch_size: {batch_size}, learning_rate: {learning_rate}\n')
 
 
 def cross_entropy(logits, labels, fig_prefix=None):
@@ -153,7 +156,7 @@ def train_model(model, data_loader, reset_head=False, hush=False):
             optimizer.step()
             optimizer.zero_grad()
             if not hush and epoch == num_epochs-1 and (i+1) % 250 == 0:
-                print(f'epoch {epoch+1}/{num_epochs}: loss = {loss_value:.5f}, acc = {100*(n_corrects/labels.size(0)):.2f}%')
+                print(f'epoch {epoch+1}/{num_epochs}: loss = {loss_value:.5f}, acc = {100*(n_corrects/labels.size(0)):.2f}%\n')
                 logfile.write(f'epoch {epoch+1}/{num_epochs}: loss = {loss_value:.5f}, acc = {100*(n_corrects/labels.size(0)):.2f}%\n')
     return model
                 
@@ -172,7 +175,7 @@ def test_model(model, data_loader, hush=False):
             number_samples += labels_set.size(0)
             
         if not hush:
-            print(f'Logistic regression accuracy {(number_corrects / number_samples)*100}%')
+            print(f'Logistic regression accuracy {(number_corrects / number_samples)*100}%\n')
             logfile.write(f'Logistic regression accuracy {(number_corrects / number_samples)*100}%\n')
         return (number_corrects / number_samples)*100
 
@@ -211,31 +214,27 @@ def initialize_embeddings(root, train, toy=False):
         return features, labels
 
 def generate_gaussian_data(train=True, train_error_rate= 0.01, test_error_rate = 0.024):
+    assert is_toy
     train_per_class = 5000
     test_per_class = 1000
     
     if train:
         num_instances = train_per_class
-        error_rate = train_error_rate
+        if noisy_context:
+            error_rate = train_error_rate
+        else:
+            error_rate = 0
     else:
         num_instances = test_per_class
-        error_rate = test_error_rate
-    if not toy_is_noisy:
-        error_rate = 0
+        if noisy_target:
+            error_rate = test_error_rate
+        else:
+            error_rate = 0
 
     unpertured_prototype_distance = np.sqrt(cluster_distance)/2.0 #384.6158
     unperturbed_symmetric_coords = unpertured_prototype_distance/np.sqrt(2)
     prototype_0 = np.array([unperturbed_symmetric_coords, unperturbed_symmetric_coords])
     prototype_1 = np.array([-unperturbed_symmetric_coords, -unperturbed_symmetric_coords])
-    '''
-    if flip_fraction == 0.4:
-        perturbed_prototype_distance = 16.1239
-    else:
-        perturbed_prototype_distance = 1.0131
-    perturbed_symmetric_coords = perturbed_prototype_distance/np.sqrt(2)
-    pert_prototype_0 = np.array(perturbed_symmetric_coords, perturbed_symmetric_coords)
-    pert_prototype_1 = np.array(-perturbed_symmetric_coords, -perturbed_symmetric_coords)
-    '''
     
     points = rand.normal(loc=prototype_0, size=(num_instances, 2)).astype('f')
     points = np.append(points, rand.normal(loc=prototype_1, size=(num_instances, 2)).astype('f'), axis=0)
@@ -244,33 +243,47 @@ def generate_gaussian_data(train=True, train_error_rate= 0.01, test_error_rate =
     return points, np.append(labels_0, labels_1, axis=0)
 
 
-def calculate_rankings(protonet, support_features, support_labels, query_features, query_labels, way):
+def calculate_rankings(model, support_features, support_labels, query_features, query_labels, way):
     # Calculate loo weights
     weights = torch.zeros(len(support_features))
-    clean_logits = protonet.classify(query_features)
+    clean_logits = model.predict(query_features)
     clean_loss = cross_entropy(clean_logits, query_labels)
     
     if len(support_features) != len(support_labels):
         import pdb; pdb.set_trace()
-    for i in range(0, len(support_features)):
-        loo_features = support_features[i].unsqueeze(0)
-        loo_labels = support_labels[i].unsqueeze(0)
-        logits_loo = protonet.loo(loo_features, loo_labels, query_features, way)
-        loss = cross_entropy(logits_loo, query_labels)
-        weights[i] = loss
+    if scale_logits:
+        # If we're scaling, we have to recalculate means + stds with every loo
+        for i in range(0, len(support_features)):
+            if i == 0:
+                loo_features = support_features[1:]
+                loo_labels = support_labels[1:]
+            else:
+                loo_features = torch.cat((support_features[0:i], support_features[i + 1:]), 0)
+                loo_labels = torch.cat((support_labels[0:i], support_labels[i + 1:]), 0)
+            logits_loo = model.loo(loo_features, loo_labels, query_features, way)
+            loss = cross_entropy(logits_loo, query_labels)
+            weights[i] = loss
+    else:
+        # If not, we can use the "efficient drop" and only specify the one we want to drop:
+        for i in range(0, len(support_features)):
+            loo_features = support_features[i].unsqueeze(0)
+            loo_labels = support_labels[i].unsqueeze(0)
+            logits_loo = model.loo(loo_features, loo_labels, query_features, way)
+            loss = cross_entropy(logits_loo, query_labels)
+            weights[i] = loss
 
     rankings = torch.argsort(weights, descending=True)
     return rankings
 
-# Protonets: {flip_fraction*100}% Noisy
+# Model: {flip_fraction*100}% Noisy
 def print_accuracy(logits, test_labels, descrip, hush=False):
     predictions = logits.argmax(axis=1)
     acc = (predictions==test_labels).sum().item()/float(len(predictions))
     loss = cross_entropy(logits, test_labels)
 
     if not hush:
-        print(f'{descrip} accuracy {(acc)*100}%')
-        print(f'{descrip} loss {(loss)}')
+        print(f'{descrip} accuracy {(acc)*100}%\n')
+        print(f'{descrip} loss {(loss)}\n')
     logfile.write(f'{descrip} accuracy {(acc)*100}%\n')
     logfile.write(f'{descrip} loss {(loss)}\n')
     return acc, loss
@@ -305,7 +318,7 @@ if is_toy:
     test_labels_subset = test_labels #[subset_indices]
     test_features_subset = test_features #[subset_indices]
     
-    if toy_is_noisy:
+    if noisy_target:
         # The last 0.024 of each class will be "confusing" points if noisy, extract those
         confusing_test_features = torch.cat((test_features[1000 - int(0.024*1000):1000], test_features[2000 - int(0.024*1000):]), dim=0)
         confusing_labels = torch.cat((test_labels[1000 - int(0.024*1000):1000], test_labels[2000 - int(0.024*1000):]), dim=0)
@@ -313,20 +326,22 @@ if is_toy:
         easy_labels = torch.cat((test_labels[0:1000 - int(0.024*1000)], test_labels[1000:2000 - int(0.024*1000)]), dim=0)
     plot_config = PlotSettings()
 
-# Clean performance on protonets
+# Clean performance on model
+if classifier_type == 'Protonets':
+    model = protonets.ProtoNets(num_classes, scale_by_std=scale_logits)
+else 
+    model = MahalanobisPredictor()
 
-protonet = protonets.ProtoNets(num_classes)
-
-logits = protonet(train_features, train_labels, test_features)
-print_accuracy(logits, test_labels, "Protonets: clean")
+logits = model(train_features, train_labels, test_features)
+print_accuracy(logits, test_labels, f'{classifier_type}: clean\n')
 
 if is_toy:
-    plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset,os.path.join(root, "clean_test.pdf"), plot_config, protonet, device)
-    if toy_is_noisy:
-        confusing_logits = protonet.classify(confusing_test_features)
-        print_accuracy(confusing_logits, confusing_labels, "Protonets, confusing")
-        easy_logits = protonet.classify(easy_test_features)
-        print_accuracy(easy_logits, easy_labels, "Protonets, easy")
+    plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset,os.path.join(root, "clean_test.pdf"), plot_config, model, device)
+    if noisy_target:
+        confusing_logits = model.predict(confusing_test_features)
+        print_accuracy(confusing_logits, confusing_labels, f'{classifier_type}, target accuracy confusing\n')
+        easy_logits = model.predict(easy_test_features)
+        print_accuracy(easy_logits, easy_labels, f'{classifier_type}, target accuracy easy\n')
 
 #train_logistic_regression_head(train_features, train_labels, test_features, test_labels)
 
@@ -341,20 +356,20 @@ flipped_train_labels[indices_to_flip] = 1 - flipped_train_labels[indices_to_flip
 #test_indices_to_flip = torch.randperm(len(test_labels))[0:int(len(test_labels)*flip_fraction)]
 #flipped_test_labels[test_indices_to_flip] = 1 - flipped_test_labels[test_indices_to_flip]
 
-logits = protonet(train_features, flipped_train_labels, test_features)
-print_accuracy(logits, test_labels, f'Protonets: {flip_fraction*100}% Noisy')
+logits = model(train_features, flipped_train_labels, test_features)
+print_accuracy(logits, test_labels, f'{classifier_type}: {flip_fraction*100}% Noisy\n')
 
 if is_toy:
-    plot_decision_regions(protonet.prototypes, test_features_subset, test_labels_subset, os.path.join(root, "noisy_{}.pdf").format(flip_fraction*100), plot_config, protonet, device)
+    plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset, os.path.join(root, "noisy_{}.pdf").format(flip_fraction*100), plot_config, model, device)
 
 #train_logistic_regression_head(train_features, flipped_train_labels, test_features, test_labels)
 
-rankings = calculate_rankings(protonet, train_features, flipped_train_labels, test_features, test_labels, num_classes)
-#rankings = calculate_rankings(protonet, train_features, flipped_train_labels, test_features, flipped_test_labels, num_classes)
+rankings = calculate_rankings(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
+#rankings = calculate_rankings(model, train_features, flipped_train_labels, test_features, flipped_test_labels, num_classes)
 
 num_correctly_identified = []
-relabelled_protonets_acc = []
-relabelled_protonets_loss = []
+relabelled_model_acc = []
+relabelled_model_loss = []
 relabelled_lreg_acc = []
 
 for check_fraction in check_fractions:
@@ -363,22 +378,22 @@ for check_fraction in check_fractions:
     relabel_indices = rankings[num_to_keep:]
     num_correct_indices = len(set(indices_to_flip.numpy()).intersection(set(relabel_indices.numpy())))
     num_correctly_identified.append(num_correct_indices)
-    print(f'Correctly identified indices {(num_correct_indices)} out of {(flip_fraction*len(train_features))}')
+    print(f'Correctly identified indices {(num_correct_indices)} out of {(flip_fraction*len(train_features))}\n')
 
     relabeled_train_labels = flipped_train_labels.clone()
     relabeled_train_labels[relabel_indices] = train_labels[relabel_indices]
 
-    logits = protonet(train_features, relabeled_train_labels, test_features)
-    acc, loss = print_accuracy(logits, test_labels, 'Protonets: {check_fraction*100}% relabeled', hush=True)
-    relabelled_protonets_acc.append(acc)
-    relabelled_protonets_loss.append(loss.item())
+    logits = model(train_features, relabeled_train_labels, test_features)
+    acc, loss = print_accuracy(logits, test_labels, f'{classifier_type}: {check_fraction*100}% relabeled\n', hush=True)
+    relabelled_model_acc.append(acc)
+    relabelled_model_loss.append(loss.item())
 
     #test_acc = train_logistic_regression_head(train_features, relabeled_train_labels, test_features, test_labels)
     #relabelled_lreg_acc.append(test_acc)
 
 logfile.write("Check fractions: {}\n".format(check_fractions))
 logfile.write("Num correctly identified: {}\n".format(num_correctly_identified))
-logfile.write("Relabelled protonets acc: {}\n".format(relabelled_protonets_acc))
-logfile.write("Relabelled protonets loss: {}\n".format(relabelled_protonets_loss))
+logfile.write("Relabelled {} acc: {}\n".format(classifier_type, relabelled_model_acc))
+logfile.write("Relabelled {} loss: {}\n".format(classifier_type, relabelled_model_loss))
 logfile.write("Relabelled LReg acc: {}\n".format(relabelled_lreg_acc))
 
