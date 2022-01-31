@@ -23,9 +23,8 @@ class ProtoNets(nn.Module):
         :param target_images: (torch.tensor) Images in the target set (batch x C x H x W).
         :return: (torch.tensor) Categorical distribution on label set for each image in target set (batch x num_labels).
         """
-
         way = self.way
-        prototypes = self._compute_prototypes(context_features, context_labels, way)
+        prototypes, stds = self._compute_prototypes(context_features, context_labels, way)
 
         print("Prototype distances: {}".format(euclidean_metric(prototypes, prototypes)[0][1].item()))
         return self.predict(target_features)
@@ -68,13 +67,15 @@ class ProtoNets(nn.Module):
             prototype_labels.append(c)
             prototype_counts.append(len(class_features))
 
+        prototypes = torch.squeeze(torch.stack(prototypes))
+        cluster_stds = torch.Tensor(cluster_stds)
         if save_prototypes:
-            self.prototypes = torch.squeeze(torch.stack(prototypes))
+            self.prototypes = prototypes
             self.prototype_labels = prototype_labels
             self.prototype_counts = prototype_counts
-            self.stds = torch.Tensor(cluster_stds)
+            self.stds = cluster_stds
         
-        return prototypes, stds
+        return prototypes, cluster_stds
         
         
     def loo(self, loo_features, loo_labels, target_features, way):
@@ -124,7 +125,7 @@ class ProtoNets(nn.Module):
         
     # Recalculate all values with the given points. i.e. points are ones remaining after the ones to be left out have been removed
     def _loo_std_scale(self, loo_features, loo_labels, target_features, way):
-        new_prototypes, new_stds = self._compute_prototypes(loo_features, loo_labels, target_features, way, save_prototypes=False)
+        new_prototypes, new_stds = self._compute_prototypes(loo_features, loo_labels, way, save_prototypes=False)
         logits = self._predict(target_features, new_prototypes, new_stds)
         return logits
 

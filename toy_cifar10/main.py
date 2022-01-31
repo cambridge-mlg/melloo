@@ -21,7 +21,7 @@ import protonets
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
-root = '/scratch/etv21/gaussian_debug'
+root = '/scratch/etv21/debug'
 data_root = '/scratch/etv21/cifar10_data'
 
 
@@ -42,7 +42,7 @@ classifier_type = 'Protonets' # Can also be Mahalanobis
 # If not, then we use the CIFAR-10 classes specified later on
 is_toy = True
 noisy_context = True
-noisy_target = False
+noisy_target = True
 cluster_distance = 384.6158
 
 logfile = open(os.path.join(root, "log.txt"), 'a+')
@@ -52,7 +52,7 @@ automobile_index = 1
 keep_class_indices = [horse_index, automobile_index]
 num_classes = len(keep_class_indices)
 
-logfile.write(f'=======================\nToy {classifier_type}\n====================\n')
+logfile.write(f"=======================\nToy {classifier_type}\n====================\n")
 logfile.write(f'Params: classifier: {classifier_type}, flip_fraction: {flip_fraction}, scale logits: {scale_logits}, context is noisy: {noisy_context}, target is noisy: {noisy_target}, num_classes: {num_classes}, num_epochs: {num_epochs}, batch_size: {batch_size}, learning_rate: {learning_rate}\n')
 
 
@@ -329,19 +329,19 @@ if is_toy:
 # Clean performance on model
 if classifier_type == 'Protonets':
     model = protonets.ProtoNets(num_classes, scale_by_std=scale_logits)
-else 
+else: 
     model = MahalanobisPredictor()
 
 logits = model(train_features, train_labels, test_features)
-print_accuracy(logits, test_labels, f'{classifier_type}: clean\n')
+print_accuracy(logits, test_labels, f'{classifier_type}: clean')
 
 if is_toy:
     plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset,os.path.join(root, "clean_test.pdf"), plot_config, model, device)
     if noisy_target:
         confusing_logits = model.predict(confusing_test_features)
-        print_accuracy(confusing_logits, confusing_labels, f'{classifier_type}, target accuracy confusing\n')
+        print_accuracy(confusing_logits, confusing_labels, f'{classifier_type}, target accuracy confusing')
         easy_logits = model.predict(easy_test_features)
-        print_accuracy(easy_logits, easy_labels, f'{classifier_type}, target accuracy easy\n')
+        print_accuracy(easy_logits, easy_labels, f'{classifier_type}, target accuracy easy')
 
 #train_logistic_regression_head(train_features, train_labels, test_features, test_labels)
 
@@ -357,7 +357,7 @@ flipped_train_labels[indices_to_flip] = 1 - flipped_train_labels[indices_to_flip
 #flipped_test_labels[test_indices_to_flip] = 1 - flipped_test_labels[test_indices_to_flip]
 
 logits = model(train_features, flipped_train_labels, test_features)
-print_accuracy(logits, test_labels, f'{classifier_type}: {flip_fraction*100}% Noisy\n')
+print_accuracy(logits, test_labels, f'{classifier_type}: {flip_fraction*100}% Noisy')
 
 if is_toy:
     plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset, os.path.join(root, "noisy_{}.pdf").format(flip_fraction*100), plot_config, model, device)
@@ -384,7 +384,7 @@ for check_fraction in check_fractions:
     relabeled_train_labels[relabel_indices] = train_labels[relabel_indices]
 
     logits = model(train_features, relabeled_train_labels, test_features)
-    acc, loss = print_accuracy(logits, test_labels, f'{classifier_type}: {check_fraction*100}% relabeled\n', hush=True)
+    acc, loss = print_accuracy(logits, test_labels, f'{classifier_type}: {check_fraction*100}% relabeled', hush=True)
     relabelled_model_acc.append(acc)
     relabelled_model_loss.append(loss.item())
 

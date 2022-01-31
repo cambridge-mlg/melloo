@@ -43,7 +43,7 @@ def plot_decision_regions(centroids, points, labels, out_name, plot_conf, model,
 
     # All the points in the grid need to have an associated probability for each class
     # to generate the colours
-    grid_logits = F.softmax(model.classify(grid_tensor).cpu(), dim=1)
+    grid_logits = F.softmax(model.predict(grid_tensor).cpu(), dim=1)
 
     # normalize within each row
     grid_pred = torch.argmax(grid_logits, dim=-1)
