@@ -209,7 +209,12 @@ def initialize_embeddings(root, train, toy=False):
         return generate_gaussian_data(train)
 
     if os.path.exists(output_dir):
-        return load_embeddings(output_dir)
+        features, labels = load_embeddings(output_dir)
+        way = len(labels.unique())
+        if way != num_classes:
+            print("Error, embeddings don't match the requested number of classes ({} vs {})".format(way, num_classes))
+            return -1
+        return features, labels
     else:
         os.makedirs(output_dir)
         data_loader = make_data_loader(batch_size, train=train, shuffle=False)
@@ -355,7 +360,7 @@ else:
 logits = model(train_features, train_labels, test_features)
 print_accuracy(logits, test_labels, f'{classifier_type}: initial')
 if classifier_type == 'Protonets':
-    print_prototype_info(euclidean_metric(model.prototypes, model.prototypes)[0][1].item(), model.stds, f'{classifier_type}: initial')
+    print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), model.stds, f'{classifier_type}: initial')
 
 if is_toy:
     plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset,os.path.join(root, "initial_test.pdf"), plot_config, model, device)
@@ -370,7 +375,8 @@ if is_toy:
 # Flip label experiment
 flipped_train_labels = train_labels.clone()
 indices_to_flip = torch.randperm(len(train_labels))[0:int(len(train_labels)*flip_fraction)]
-flipped_train_labels[indices_to_flip] = 1 - flipped_train_labels[indices_to_flip]
+flip_offset = torch.randint(low=1, high=num_classes, size=len(indices_to_flip))
+flipped_train_labels[indices_to_flip] = (flipped_train_labels[indices_to_flip] + flip_offset) % num_classes
 #print("Flipped sum: {}".format(flipped_train_labels.sum()))
 
 #flipped_test_labels = test_labels.clone()
@@ -379,7 +385,7 @@ flipped_train_labels[indices_to_flip] = 1 - flipped_train_labels[indices_to_flip
 logits = model(train_features, flipped_train_labels, test_features)
 print_accuracy(logits, test_labels, f'{classifier_type}: {flip_fraction*100}% Noisy')
 if classifier_type == 'Protonets':
-    print_prototype_info(euclidean_metric(model.prototypes, model.prototypes)[0][1].item(), model.stds, f'{classifier_type}: Noisy')
+    print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), model.stds, f'{classifier_type}: Noisy')
 
 
 if is_toy:
@@ -413,7 +419,7 @@ for check_fraction in check_fractions:
     logits = model(train_features, relabeled_train_labels, test_features)
     acc, loss = print_accuracy(logits, test_labels, f'{classifier_type}: {check_fraction*100}% relabeled', hush=True)
     if classifier_type == 'Protonets':
-        print_prototype_info(euclidean_metric(model.prototypes, model.prototypes)[0][1].item(), model.stds, f'{classifier_type}: {check_fraction*100}% relabeled')
+        print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), model.stds, f'{classifier_type}: {check_fraction*100}% relabeled')
 
     relabelled_model_acc.append(acc)
     relabelled_model_loss.append(loss.item())
