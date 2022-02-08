@@ -39,7 +39,7 @@ def plot_decision_regions(centroids, points, labels, out_name, plot_conf, model,
         np.linspace(-plot_conf.sym_bound, plot_conf.sym_bound, plot_conf.resolution)
     )
     grid_points = np.c_[xx.ravel(), yy.ravel()]
-    grid_tensor = torch.from_numpy(grid_points).type(torch.DoubleTensor).to(device)
+    grid_tensor = torch.from_numpy(grid_points).type(torch.FloatTensor).to(device)
 
     # All the points in the grid need to have an associated probability for each class
     # to generate the colours

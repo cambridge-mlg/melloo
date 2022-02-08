@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from helper_classes import euclidean_metric
 """
 The code in this file is substantially based on the code for "Improved Few-Shot Visual Classification"
@@ -22,8 +23,7 @@ class MahalanobisPredictor(nn.Module):
         :return: (torch.tensor) Categorical distribution on label set for each image in target set (batch x num_labels).
         """
         means, precisions = self._compute_class_means_and_precisions(context_features, context_labels)
-
-        print("Prototype distances: {}".format(euclidean_metric(means, means)[0][1].item()))
+        print("MPrototype distances: {}".format(euclidean_metric(means, means)[0][1].item()))
         return self.predict(target_features)
 
     def predict(self, target_features):
@@ -39,9 +39,12 @@ class MahalanobisPredictor(nn.Module):
         including the class precision estimates in the calculations, reshaping the distances
         and multiplying by -1 to produce the sample logits
         """
+
         repeated_target = target_features.repeat(1, number_of_classes).view(-1, class_means.size(1))
         repeated_class_means = class_means.repeat(number_of_targets, 1)
         repeated_difference = (repeated_class_means - repeated_target)
+        #import pdb; pdb.set_trace()
+
         repeated_difference = repeated_difference.view(number_of_targets, number_of_classes,
                                                        repeated_difference.size(1)).permute(1, 0, 2)
         first_half = torch.matmul(repeated_difference, class_precision_matrices)
@@ -49,9 +52,9 @@ class MahalanobisPredictor(nn.Module):
 
         return logits
 
-    def loo(self, loo_features, loo_labels, target_features, way):
+    def loo(self, context_features, context_labels, target_features, way):
         means, precisions = self._compute_class_means_and_precisions(context_features, context_labels, save_prototypes=False)
-        return self._predict(target_features, means, target_features, precisions)
+        return self._predict(target_features, means, precisions)
 
     def _compute_class_means_and_precisions(self, features, labels, save_prototypes=True):
         means = []

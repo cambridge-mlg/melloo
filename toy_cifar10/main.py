@@ -16,7 +16,12 @@ from mahalanobis import MahalanobisPredictor
 from helper_classes import LogisticRegression, EmbeddedDataset
 from plot_decision_regions import PlotSettings, plot_decision_regions
 import protonets
+from helper_classes import euclidean_metric
 
+
+#torch.use_deterministic_algorithms(True)
+torch.manual_seed(2) #0
+rand.seed(20160704) #20160702
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
@@ -34,26 +39,29 @@ num_epochs = 5
 batch_size = 40
 learning_rate = 0.001
 
-flip_fraction = 0.4
+flip_fraction = 0.2
 check_fractions = [flip_fraction] #[0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
 scale_logits = True
-classifier_type = 'Protonets' # Can also be Mahalanobis
+classifier_type = 'Protonets' #'Mahalanobis' #'Protonets' # Can also be Mahalanobis
+ranking_method = 'loo' #'loo' or 'random'
 # If is_toy, then we use 2-D Gaussians1
 # If not, then we use the CIFAR-10 classes specified later on
-is_toy = True
+is_toy = False
 noisy_context = True
-noisy_target = True
+noisy_target =True
 cluster_distance = 384.6158
 
 logfile = open(os.path.join(root, "log.txt"), 'a+')
 
 horse_index = 7
 automobile_index = 1
-keep_class_indices = [horse_index, automobile_index]
+frog_index = 6
+
+keep_class_indices = [horse_index, automobile_index, frog_index]
 num_classes = len(keep_class_indices)
 
 logfile.write(f"=======================\nToy {classifier_type}\n====================\n")
-logfile.write(f'Params: classifier: {classifier_type}, flip_fraction: {flip_fraction}, scale logits: {scale_logits}, context is noisy: {noisy_context}, target is noisy: {noisy_target}, num_classes: {num_classes}, num_epochs: {num_epochs}, batch_size: {batch_size}, learning_rate: {learning_rate}\n')
+logfile.write(f'Params: classifier: {classifier_type}, flip_fraction: {flip_fraction}, scale logits: {scale_logits}, ranking_method: {ranking_method}, context is noisy: {noisy_context}, target is noisy: {noisy_target}, num_classes: {num_classes}, num_epochs: {num_epochs}, batch_size: {batch_size}, learning_rate: {learning_rate}\n')
 
 
 def cross_entropy(logits, labels, fig_prefix=None):
@@ -243,6 +251,11 @@ def generate_gaussian_data(train=True, train_error_rate= 0.01, test_error_rate =
     return points, np.append(labels_0, labels_1, axis=0)
 
 
+def calculate_random_rankings(support_labels):
+    random_rankings = torch.randperm(len(support_labels))
+    return random_rankings
+
+
 def calculate_rankings(model, support_features, support_labels, query_features, query_labels, way):
     # Calculate loo weights
     weights = torch.zeros(len(support_features))
@@ -282,11 +295,18 @@ def print_accuracy(logits, test_labels, descrip, hush=False):
     loss = cross_entropy(logits, test_labels)
 
     if not hush:
-        print(f'{descrip} accuracy {(acc)*100}%\n')
-        print(f'{descrip} loss {(loss)}\n')
+        print(f'{descrip} accuracy {(acc)*100}%')
+        print(f'{descrip} loss {(loss)}')
     logfile.write(f'{descrip} accuracy {(acc)*100}%\n')
     logfile.write(f'{descrip} loss {(loss)}\n')
     return acc, loss
+
+def print_prototype_info(prototype_dist, prototype_stds, descrip):
+    print(f'{descrip} Euclidean distace b/w prototypes {prototype_dist}')
+    print(f'{descrip} prototype stds {(prototype_stds)}')
+    logfile.write(f'{descrip} Euclidean distace b/w prototypes {prototype_dist}\n')
+    logfile.write(f'{descrip} prototype stds {(prototype_stds)}\n')
+
 
 def train_logistic_regression_head(train_features, train_labels, test_features, test_labels):
 
@@ -333,10 +353,12 @@ else:
     model = MahalanobisPredictor()
 
 logits = model(train_features, train_labels, test_features)
-print_accuracy(logits, test_labels, f'{classifier_type}: clean')
+print_accuracy(logits, test_labels, f'{classifier_type}: initial')
+if classifier_type == 'Protonets':
+    print_prototype_info(euclidean_metric(model.prototypes, model.prototypes)[0][1].item(), model.stds, f'{classifier_type}: initial')
 
 if is_toy:
-    plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset,os.path.join(root, "clean_test.pdf"), plot_config, model, device)
+    plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset,os.path.join(root, "initial_test.pdf"), plot_config, model, device)
     if noisy_target:
         confusing_logits = model.predict(confusing_test_features)
         print_accuracy(confusing_logits, confusing_labels, f'{classifier_type}, target accuracy confusing')
@@ -346,7 +368,6 @@ if is_toy:
 #train_logistic_regression_head(train_features, train_labels, test_features, test_labels)
 
 # Flip label experiment
-
 flipped_train_labels = train_labels.clone()
 indices_to_flip = torch.randperm(len(train_labels))[0:int(len(train_labels)*flip_fraction)]
 flipped_train_labels[indices_to_flip] = 1 - flipped_train_labels[indices_to_flip]
@@ -355,16 +376,22 @@ flipped_train_labels[indices_to_flip] = 1 - flipped_train_labels[indices_to_flip
 #flipped_test_labels = test_labels.clone()
 #test_indices_to_flip = torch.randperm(len(test_labels))[0:int(len(test_labels)*flip_fraction)]
 #flipped_test_labels[test_indices_to_flip] = 1 - flipped_test_labels[test_indices_to_flip]
-
 logits = model(train_features, flipped_train_labels, test_features)
 print_accuracy(logits, test_labels, f'{classifier_type}: {flip_fraction*100}% Noisy')
+if classifier_type == 'Protonets':
+    print_prototype_info(euclidean_metric(model.prototypes, model.prototypes)[0][1].item(), model.stds, f'{classifier_type}: Noisy')
+
 
 if is_toy:
     plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset, os.path.join(root, "noisy_{}.pdf").format(flip_fraction*100), plot_config, model, device)
 
 #train_logistic_regression_head(train_features, flipped_train_labels, test_features, test_labels)
 
-rankings = calculate_rankings(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
+
+if ranking_method == 'loo':
+    rankings = calculate_rankings(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
+elif ranking_method == 'random':
+    rankings = calculate_random_rankings(flipped_train_labels)
 #rankings = calculate_rankings(model, train_features, flipped_train_labels, test_features, flipped_test_labels, num_classes)
 
 num_correctly_identified = []
@@ -378,13 +405,16 @@ for check_fraction in check_fractions:
     relabel_indices = rankings[num_to_keep:]
     num_correct_indices = len(set(indices_to_flip.numpy()).intersection(set(relabel_indices.numpy())))
     num_correctly_identified.append(num_correct_indices)
-    print(f'Correctly identified indices {(num_correct_indices)} out of {(flip_fraction*len(train_features))}\n')
+    print(f'Correctly identified indices {(num_correct_indices)} out of {(flip_fraction*len(train_features))}')
 
     relabeled_train_labels = flipped_train_labels.clone()
     relabeled_train_labels[relabel_indices] = train_labels[relabel_indices]
 
     logits = model(train_features, relabeled_train_labels, test_features)
     acc, loss = print_accuracy(logits, test_labels, f'{classifier_type}: {check_fraction*100}% relabeled', hush=True)
+    if classifier_type == 'Protonets':
+        print_prototype_info(euclidean_metric(model.prototypes, model.prototypes)[0][1].item(), model.stds, f'{classifier_type}: {check_fraction*100}% relabeled')
+
     relabelled_model_acc.append(acc)
     relabelled_model_loss.append(loss.item())
 
