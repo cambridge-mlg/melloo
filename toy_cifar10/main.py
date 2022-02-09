@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.linalg
 import torchvision
 import torchvision.transforms as transforms
 from torchvision import models
@@ -26,7 +27,7 @@ rand.seed(20160704) #20160702
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
-root = '/scratch/etv21/debug'
+root = '/scratch/etv21/loo_cifar_hists2'
 data_root = '/scratch/etv21/cifar10_data'
 
 
@@ -57,7 +58,10 @@ horse_index = 7
 automobile_index = 1
 frog_index = 6
 
-keep_class_indices = [horse_index, automobile_index, frog_index]
+context_size=-1
+target_size=-1
+
+keep_class_indices = [horse_index, automobile_index]
 num_classes = len(keep_class_indices)
 
 logfile.write(f"=======================\nToy {classifier_type}\n====================\n")
@@ -66,13 +70,24 @@ logfile.write(f'Params: classifier: {classifier_type}, flip_fraction: {flip_frac
 
 def cross_entropy(logits, labels, fig_prefix=None):
     unreduced_loss = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
-    if False: # fig_prefix is not None:
-        plt.hist(unreduced_loss.cpu().numpy(), 50, density=True, range=(0, 0.5))
+    if fig_prefix is not None:
+        plt.hist(unreduced_loss.cpu().numpy(), 100, density=True)
         plt.xlabel('Loss')
-        plt.title('Histogram of test losses (before mean)')
+        plt.title('Histogram of test losses (max {:.3f})'.format(unreduced_loss.max()))
         plt.grid(True)
-        plt.savefig(os.path.join(root, fig_prefix + "_loss_hist.pdf"))
+        plt.savefig(os.path.join(root, fig_prefix.replace(":", "-") + "_loss_hist.png"))
+        worst_indices =  torch.topk(unreduced_loss, 10).indices.tolist()
+        #print("Top 10 loss indices: {}", worst_indices)
         plt.close()
+        worst_50 =  torch.topk(unreduced_loss, 50).indices.tolist()
+        plt.hist(unreduced_loss[worst_50].cpu().numpy(), 10, density=True)
+        plt.xlabel('Loss')
+        plt.title('Histogram of worst test losses (max {:.3f})'.format(unreduced_loss[worst_50].max()))
+        plt.grid(True)
+        plt.savefig(os.path.join(root, fig_prefix.replace(":", "-") + "_worst_loss_hist.png"))
+        plt.close()
+
+        return unreduced_loss.mean(), worst_indices
     return unreduced_loss.mean()
 
 def get_indices_for_classes(target_tensor, class_indices):
@@ -198,7 +213,7 @@ def load_embeddings(path):
     return features, labels
    
 
-def initialize_embeddings(root, train, toy=False):
+def initialize_embeddings(root, train, toy=False, task_size=-1):
     if train:
         key = "train"
     else:
@@ -210,11 +225,10 @@ def initialize_embeddings(root, train, toy=False):
 
     if os.path.exists(output_dir):
         features, labels = load_embeddings(output_dir)
-        way = len(labels.unique())
+        way = len(np.unique(labels))
         if way != num_classes:
             print("Error, embeddings don't match the requested number of classes ({} vs {})".format(way, num_classes))
             return -1
-        return features, labels
     else:
         os.makedirs(output_dir)
         data_loader = make_data_loader(batch_size, train=train, shuffle=False)
@@ -224,7 +238,11 @@ def initialize_embeddings(root, train, toy=False):
             param.requires_grad = False
         features, labels = get_feature_embeddings(model, data_loader)
         save_embeddings(features, labels, output_dir)
+    if task_size == -1:
         return features, labels
+    else: 
+        assert len(features) >= task_size and len(labels) >= task_size
+        return features[:task_size], labels[:task_size]
 
 def generate_gaussian_data(train=True, train_error_rate= 0.01, test_error_rate = 0.024):
     assert is_toy
@@ -267,6 +285,8 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
     clean_logits = model.predict(query_features)
     clean_loss = cross_entropy(clean_logits, query_labels)
     
+    worst_targets = []
+
     if len(support_features) != len(support_labels):
         import pdb; pdb.set_trace()
     if scale_logits:
@@ -279,7 +299,8 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
                 loo_features = torch.cat((support_features[0:i], support_features[i + 1:]), 0)
                 loo_labels = torch.cat((support_labels[0:i], support_labels[i + 1:]), 0)
             logits_loo = model.loo(loo_features, loo_labels, query_features, way)
-            loss = cross_entropy(logits_loo, query_labels)
+            loss, biggest_offending_targets = cross_entropy(logits_loo, query_labels, fig_prefix="Loo {}".format(i))
+            worst_targets.append(biggest_offending_targets)
             weights[i] = loss
     else:
         # If not, we can use the "efficient drop" and only specify the one we want to drop:
@@ -290,6 +311,12 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
             loss = cross_entropy(logits_loo, query_labels)
             weights[i] = loss
 
+    plt.hist(worst_targets.cpu().numpy(), len(query_labels), density=True)
+    plt.xlabel('Index')
+    plt.title('Hist of top 5 target indices with worst losses')
+    plt.grid(True)
+    plt.savefig(os.path.join(root, "worst_target_index.png"))
+    plt.close()
     rankings = torch.argsort(weights, descending=True)
     return rankings
 
@@ -297,7 +324,7 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
 def print_accuracy(logits, test_labels, descrip, hush=False):
     predictions = logits.argmax(axis=1)
     acc = (predictions==test_labels).sum().item()/float(len(predictions))
-    loss = cross_entropy(logits, test_labels)
+    loss, worst_indices = cross_entropy(logits, test_labels, fig_prefix=descrip)
 
     if not hush:
         print(f'{descrip} accuracy {(acc)*100}%')
@@ -307,8 +334,8 @@ def print_accuracy(logits, test_labels, descrip, hush=False):
     return acc, loss
 
 def print_prototype_info(prototype_dist, prototype_stds, descrip):
-    print(f'{descrip} Euclidean distace b/w prototypes {prototype_dist}')
-    print(f'{descrip} prototype stds {(prototype_stds)}')
+    #print(f'{descrip} Euclidean distace b/w prototypes {prototype_dist}')
+    #print(f'{descrip} prototype stds {(prototype_stds)}')
     logfile.write(f'{descrip} Euclidean distace b/w prototypes {prototype_dist}\n')
     logfile.write(f'{descrip} prototype stds {(prototype_stds)}\n')
 
@@ -325,14 +352,13 @@ def train_logistic_regression_head(train_features, train_labels, test_features, 
     clean_lreg = train_model(clean_lreg, clean_dataloader_train)
     return test_model(clean_lreg, clean_dataloader_test)
 
-train_features, train_labels = initialize_embeddings(data_root, train=True, toy=is_toy)
-test_features, test_labels = initialize_embeddings(data_root, train=False, toy=is_toy)
+train_features, train_labels = initialize_embeddings(data_root, train=True, toy=is_toy, task_size=context_size)
+test_features, test_labels = initialize_embeddings(data_root, train=False, toy=is_toy, task_size=target_size)
 
 
 #num_train = 10
 #train_features = train_features[0:num_train]
 #train_labels = train_labels[0:num_train]
-
 train_features, test_features = torch.from_numpy(train_features).to(device), torch.from_numpy(test_features).to(device)
 train_labels = torch.from_numpy(train_labels).type(torch.LongTensor).to(device)
 test_labels = torch.from_numpy(test_labels).type(torch.LongTensor).to(device)
@@ -359,8 +385,16 @@ else:
 
 logits = model(train_features, train_labels, test_features)
 print_accuracy(logits, test_labels, f'{classifier_type}: initial')
+#right_mask = (logits.argmax(axis=1) == test_labels)
+#print("Dropping points that we get wrong from test set: ({} many)".format((~right_mask).sum()))
+
+#test_features = test_features[right_mask]
+#test_labels = test_labels[right_mask]
+
 if classifier_type == 'Protonets':
     print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), model.stds, f'{classifier_type}: initial')
+else:
+    print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), torch.linalg.inv(model.precisions), f'{classifier_type}: initial')
 
 if is_toy:
     plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset,os.path.join(root, "initial_test.pdf"), plot_config, model, device)
@@ -375,7 +409,7 @@ if is_toy:
 # Flip label experiment
 flipped_train_labels = train_labels.clone()
 indices_to_flip = torch.randperm(len(train_labels))[0:int(len(train_labels)*flip_fraction)]
-flip_offset = torch.randint(low=1, high=num_classes, size=len(indices_to_flip))
+flip_offset = torch.from_numpy(rand.randint(low=1, high=num_classes, size=(len(indices_to_flip)))).type(torch.LongTensor).to(device)
 flipped_train_labels[indices_to_flip] = (flipped_train_labels[indices_to_flip] + flip_offset) % num_classes
 #print("Flipped sum: {}".format(flipped_train_labels.sum()))
 
@@ -386,6 +420,8 @@ logits = model(train_features, flipped_train_labels, test_features)
 print_accuracy(logits, test_labels, f'{classifier_type}: {flip_fraction*100}% Noisy')
 if classifier_type == 'Protonets':
     print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), model.stds, f'{classifier_type}: Noisy')
+else:
+    print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), torch.linalg.inv(model.precisions), f'{classifier_type}: Noisy')
 
 
 if is_toy:
@@ -417,9 +453,11 @@ for check_fraction in check_fractions:
     relabeled_train_labels[relabel_indices] = train_labels[relabel_indices]
 
     logits = model(train_features, relabeled_train_labels, test_features)
-    acc, loss = print_accuracy(logits, test_labels, f'{classifier_type}: {check_fraction*100}% relabeled', hush=True)
+    acc, loss = print_accuracy(logits, test_labels, f'{classifier_type}: {check_fraction*100}% relabeled', hush=False)
     if classifier_type == 'Protonets':
         print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), model.stds, f'{classifier_type}: {check_fraction*100}% relabeled')
+    else:
+        print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), torch.linalg.inv(model.precisions), f'{classifier_type}: {check_fraction*100}% relabeled')
 
     relabelled_model_acc.append(acc)
     relabelled_model_loss.append(loss.item())
