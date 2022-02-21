@@ -20,7 +20,7 @@ import protonets
 from helper_classes import euclidean_metric
 from tqdm import tqdm
 from argparse import ArgumentParser
-
+from PIL import Image
 
 #torch.use_deterministic_algorithms(True)
 torch.manual_seed(2) #0
@@ -32,7 +32,7 @@ os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
 parser = ArgumentParser()
 parser.add_argument("-r", "--root", default="/scratch/etv21/debug", help="root where output will be written to")
-parser.add_argument("-dr", "--data_root", default='/scratch/etv21/cifar10_data', help="Directory where data/embeddings will be looked for")
+parser.add_argument("-dr", "--data_root", default='/scratch/etv21/cifar10_data_full', help="Directory where data/embeddings will be looked for")
 
 
 
@@ -41,7 +41,7 @@ parser.add_argument("--flip_fraction", type=float, default=0.2, help="Fraction o
 parser.add_argument("--scale_logits", action='store_true', help="Whether to scale protonet logits by std dev")
 parser.add_argument("--classifier_type", default="Protonets", choices=['Protonets', 'Mahalanobis'], help="What type of classifier to use")
 parser.add_argument("--ranking_method", default="loo", choices=['loo', 'random'], help="What ranking algorithm to use")
-parser.add_argument("--drop_strategy", default="Worst", choices=['None', 'Worst', "Wrong"], help="Whether to discard points from the target set and, if so, how")
+parser.add_argument("--drop_strategy", default="None", choices=['None', 'Worst', "Wrong"], help="Whether to discard points from the target set and, if so, how")
 
 
 parser.add_argument("--context_size", type=int, default=-1, help="Size of context set")
@@ -76,12 +76,19 @@ horse_index = 7
 automobile_index = 1
 frog_index = 6
 
-keep_class_indices = [horse_index, automobile_index]
+keep_class_indices = list(range(5)) #[horse_index, automobile_index]
 num_classes = len(keep_class_indices)
+
 
 logfile.write(f"=======================\nToy {args.classifier_type}\n====================\n")
 logfile.write(f'Params: classifier: {args.classifier_type}, flip_fraction: {args.flip_fraction}, scale logits: {args.scale_logits}, ranking_method: {args.ranking_method}, context is noisy: {args.noisy_context}, target is noisy: {args.noisy_target}, num_classes: {num_classes}, num_epochs: {num_epochs}, batch_size: {batch_size}, learning_rate: {learning_rate}\n')
 
+def save_image(image_array, save_path):
+    image_array = image_array.cpu().numpy()
+    image_array = image_array.squeeze()
+    image_array = image_array.transpose([1, 2, 0])
+    im = Image.fromarray(np.clip((image_array + 1.0) * 127.5 + 0.5, 0, 255).astype(np.uint8), mode='RGB')
+    im.save(save_path)
 
 def cross_entropy(logits, labels, fig_prefix=None, return_worst=-1):
     unreduced_loss = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
@@ -132,7 +139,7 @@ def make_data_loader(batch_size, train=True, shuffle=False):
     ])
 
     dataset = torchvision.datasets.CIFAR10(
-    root = data_root, train=train,
+    root = args.data_root, train=train,
     download =True, transform=transform)
 
     target_tensor = torch.tensor(dataset.targets)
@@ -229,6 +236,20 @@ def load_embeddings(path):
     labels = pickle.load(open(os.path.join(path, "labels.pickle"), "rb"))
     return features, labels
 
+def save_out_images(data_root, train, descrip, index_list):
+    import pdb; pdb.set_trace()
+    if train:
+        key = "train"
+    else:
+        key = "test"
+    output_dir = os.path.join(data_root, key)
+
+    data_loader = make_data_loader(batch_size, train=train, shuffle=False)
+    for i, (imgs , lbls) in enumerate(data_loader):
+        for j in range(len(imgs)):
+            index = len(imgs)*i + j
+            if index in index_list:
+                save_image(imgs[j], descrip + "{}_index_{}.png".format(key, index))
 
 def initialize_embeddings(root, train, toy=False, task_size=-1):
     if train:
@@ -259,7 +280,17 @@ def initialize_embeddings(root, train, toy=False, task_size=-1):
         return features, labels
     else:
         assert len(features) >= task_size and len(labels) >= task_size
-        return features[:task_size], labels[:task_size]
+        assert task_size % num_classes == 0
+        num_shots = int(task_size / num_classes)
+        task_features = []
+        task_labels = []
+        to_labels = torch.from_numpy(labels)
+        for class_index in keep_class_indices:
+            mask = torch.where(to_labels == class_index, torch.ones(1), torch.zeros(1)).bool()
+            task_features.append((features[mask])[:num_shots])
+            task_labels.append((labels[mask])[:num_shots])
+
+        return np.concatenate(task_features), np.concatenate(task_labels)
 
 def generate_gaussian_data(train=True, train_error_rate= 0.01, test_error_rate = 0.024):
     assert args.is_toy
@@ -320,7 +351,7 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
                 loss, biggest_offending_targets = cross_entropy(logits_loo, query_labels, fig_prefix="Loo {}".format(i), return_worst=10)
             else:
                 loss, biggest_offending_targets = cross_entropy(logits_loo, query_labels, return_worst=10)
-            worst_targets.append(biggest_offending_targets)
+            worst_targets.extend(biggest_offending_targets)
             weights[i] = loss
     else:
         # If not, we can use the "efficient drop" and only specify the one we want to drop:
@@ -346,11 +377,15 @@ def print_accuracy(logits, test_labels, descrip, hush=False):
     acc = (predictions==test_labels).sum().item()/float(len(predictions))
     loss, worst_indices = cross_entropy(logits, test_labels, fig_prefix=descrip, return_worst=10)
 
+
     if not hush:
         print(f'{descrip} accuracy {(acc)*100}%')
         print(f'{descrip} loss {(loss)}')
+        print(f'{descrip} worst indices {worst_indices}')
+
     logfile.write(f'{descrip} accuracy {(acc)*100}%\n')
     logfile.write(f'{descrip} loss {(loss)}\n')
+    logfile.write(f'{descrip} worst indices {worst_indices}')
     return acc, loss
 
 def print_prototype_info(prototype_dist, prototype_stds, descrip):
@@ -371,6 +406,18 @@ def train_logistic_regression_head(train_features, train_labels, test_features, 
     clean_lreg = LogisticRegression(train_features.shape[1], num_classes)
     clean_lreg = train_model(clean_lreg, clean_dataloader_train)
     return test_model(clean_lreg, clean_dataloader_test)
+
+'''
+save_out_indices_protonets = [745, 58, 849, 1553, 106, 1429, 1886, 413, 1249, 1656]
+save_out_indices_mahal = [106, 1149, 58, 1021, 568, 1553, 1989, 745, 939, 1114]
+save_out_other_indices = [0, 1, 2, 3, 4, 1001, 1002, 1003, 1004]
+save_out_images(args.data_root, False, "protonets", save_out_indices_protonets)
+save_out_images(args.data_root, False, "mahal", save_out_indices_mahal)
+save_out_images(args.data_root, False, "sample", save_out_other_indices)
+
+exit()
+'''
+
 
 train_features, train_labels = initialize_embeddings(args.data_root, train=True, toy=args.is_toy, task_size=args.context_size)
 test_features, test_labels = initialize_embeddings(args.data_root, train=False, toy=args.is_toy, task_size=args.target_size)
@@ -411,7 +458,7 @@ if args.drop_strategy != "None":
     if args.drop_strategy == "Wrong":
         keep_mask = (logits.argmax(axis=1) == test_labels)
     elif args.drop_strategy == "Worst":
-        _, worst_indices = cross_entropy(logits, test_labels, return_worst=10)
+        _, worst_indices = cross_entropy(logits, test_labels, return_worst=100)
         keep_mask = torch.ones(test_labels.shape, dtype=np.bool)
         keep_mask[worst_indices] = False
 
