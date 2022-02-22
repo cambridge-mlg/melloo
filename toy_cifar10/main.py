@@ -23,8 +23,8 @@ from argparse import ArgumentParser
 from PIL import Image
 
 #torch.use_deterministic_algorithms(True)
-torch.manual_seed(2) #0
-rand.seed(20160704) #20160702
+#torch.manual_seed(2) #0
+#rand.seed(20160704) #20160702
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
@@ -32,7 +32,7 @@ os.environ["CUDA_VISIBLE_DEVICES"]="1"
 
 parser = ArgumentParser()
 parser.add_argument("-r", "--root", default="/scratch/etv21/debug", help="root where output will be written to")
-parser.add_argument("-dr", "--data_root", default='/scratch/etv21/cifar10_data_full', help="Directory where data/embeddings will be looked for")
+parser.add_argument("-dr", "--data_root", default='/scratch/etv21/cifar10_data', help="Directory where data/embeddings will be looked for")
 
 
 
@@ -46,6 +46,9 @@ parser.add_argument("--drop_strategy", default="None", choices=['None', 'Worst',
 
 parser.add_argument("--context_size", type=int, default=-1, help="Size of context set")
 parser.add_argument("--target_size", type=int, default=-1, help="Size of target set")
+parser.add_argument("--way", type=int, default=2, help="Way")
+
+parser.add_argument("-n","--num_tasks", type=int, default=10, help="Num tasks")
 
 parser.add_argument("--is_toy", action='store_true', help="Whether to use the toy gaussian dataset")
 parser.add_argument("--noisy_context", action='store_true', help="Whether to put noisy labels in toy gaussian dataset's context set")
@@ -76,8 +79,10 @@ horse_index = 7
 automobile_index = 1
 frog_index = 6
 
-keep_class_indices = list(range(5)) #[horse_index, automobile_index]
-num_classes = len(keep_class_indices)
+keep_class_indices = [horse_index, automobile_index]
+
+num_classes = args.way #len(keep_class_indices)
+
 
 
 logfile.write(f"=======================\nToy {args.classifier_type}\n====================\n")
@@ -101,10 +106,11 @@ def cross_entropy(logits, labels, fig_prefix=None, return_worst=-1):
         plt.savefig(os.path.join(args.root, fig_prefix.replace(":", "-") + "_loss_hist.png"))
         #print("Top 10 loss indices: {}", worst_indices)
         plt.close()
-        worst_50 =  torch.topk(unreduced_loss, 50).indices.tolist()
+        max_num = min(len(labels), 50)
+        worst_50 =  torch.topk(unreduced_loss, max_num).indices.tolist()
         plt.hist(unreduced_loss[worst_50].cpu().numpy(), 10, density=True)
         plt.xlabel('Loss')
-        plt.title('Histogram of worst test losses (max {:.3f})'.format(unreduced_loss[worst_50].max()))
+        plt.title('Histogram of worst {} test losses (max {:.3f})'.format(max_num, unreduced_loss[worst_50].max()))
         plt.grid(True)
         plt.savefig(os.path.join(args.root, fig_prefix.replace(":", "-") + "_worst_loss_hist.png"))
         plt.close()
@@ -143,6 +149,7 @@ def make_data_loader(batch_size, train=True, shuffle=False):
     download =True, transform=transform)
 
     target_tensor = torch.tensor(dataset.targets)
+    assert num_classes == len(keep_class_indices)
     keep_indices, normalized_targets = get_indices_for_classes(target_tensor, keep_class_indices)
     # Now we can use the subset dataset
     dataset.targets = normalized_targets
@@ -267,6 +274,8 @@ def initialize_embeddings(root, train, toy=False, task_size=-1):
         if way != num_classes:
             print("Error, embeddings don't match the requested number of classes ({} vs {})".format(way, num_classes))
             return -1
+        else:
+            print("Loaded classes with labels {}".format(np.unique(labels)))
     else:
         os.makedirs(output_dir)
         data_loader = make_data_loader(batch_size, train=train, shuffle=False)
@@ -285,8 +294,9 @@ def initialize_embeddings(root, train, toy=False, task_size=-1):
         task_features = []
         task_labels = []
         to_labels = torch.from_numpy(labels)
-        for class_index in keep_class_indices:
-            mask = torch.where(to_labels == class_index, torch.ones(1), torch.zeros(1)).bool()
+        classes = np.unique(labels)
+        for class_label in classes:
+            mask = torch.where(to_labels == class_label, torch.ones(1), torch.zeros(1)).bool()
             task_features.append((features[mask])[:num_shots])
             task_labels.append((labels[mask])[:num_shots])
 
@@ -417,11 +427,13 @@ save_out_images(args.data_root, False, "sample", save_out_other_indices)
 
 exit()
 '''
-
+import pdb; pdb.set_trace()
 
 train_features, train_labels = initialize_embeddings(args.data_root, train=True, toy=args.is_toy, task_size=args.context_size)
 test_features, test_labels = initialize_embeddings(args.data_root, train=False, toy=args.is_toy, task_size=args.target_size)
 
+assert len(train_labels) == args.context_size
+assert len(test_labels) == args.target_size
 
 #num_train = 10
 #train_features = train_features[0:num_train]
