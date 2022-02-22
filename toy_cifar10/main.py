@@ -71,8 +71,6 @@ num_epochs = 5
 batch_size = 40
 learning_rate = 0.001
 
-check_fractions = [args.flip_fraction] #[0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
-
 logfile = open(os.path.join(args.root, "log.txt"), 'a+')
 
 horse_index = 7
@@ -114,6 +112,7 @@ def cross_entropy(logits, labels, fig_prefix=None, return_worst=-1):
         plt.grid(True)
         plt.savefig(os.path.join(args.root, fig_prefix.replace(":", "-") + "_worst_loss_hist.png"))
         plt.close()
+        
     if return_worst > 0:
         worst_indices =  torch.topk(unreduced_loss, return_worst).indices.tolist()
         return unreduced_loss.mean(), worst_indices
@@ -387,16 +386,16 @@ def print_accuracy(logits, test_labels, descrip, hush=False):
     acc = (predictions==test_labels).sum().item()/float(len(predictions))
     loss, worst_indices = cross_entropy(logits, test_labels, fig_prefix=descrip, return_worst=10)
 
-
     if not hush:
         print(f'{descrip} accuracy {(acc)*100}%')
         print(f'{descrip} loss {(loss)}')
         print(f'{descrip} worst indices {worst_indices}')
 
-    logfile.write(f'{descrip} accuracy {(acc)*100}%\n')
-    logfile.write(f'{descrip} loss {(loss)}\n')
-    logfile.write(f'{descrip} worst indices {worst_indices}')
-    return acc, loss
+    #logfile.write(f'{descrip} accuracy {(acc)*100}%\n')
+    #logfile.write(f'{descrip} loss {(loss)}\n')
+    #logfile.write(f'{descrip} worst indices {worst_indices}')
+    
+    return acc, loss, worst_indices
 
 def print_prototype_info(prototype_dist, prototype_stds, descrip):
     #print(f'{descrip} Euclidean distace b/w prototypes {prototype_dist}')
@@ -416,6 +415,17 @@ def train_logistic_regression_head(train_features, train_labels, test_features, 
     clean_lreg = LogisticRegression(train_features.shape[1], num_classes)
     clean_lreg = train_model(clean_lreg, clean_dataloader_train)
     return test_model(clean_lreg, clean_dataloader_test)
+    
+def print_and_log_values(value_list, descrip):
+    vals = np.array(value_list)
+    print("{} - {} +/- {} in range {} to {}".format(descrip, vals.mean(), vals.std(), vals.min(), vals.max()))
+    logfile.write("{} - {} +/- {} in range {} to {}".format(descrip, vals.mean(), vals.std(), vals.min(), vals.max()))
+    plt.hist(vals)
+    plt.title('{}'.format(descrip))
+    plt.grid(True)
+    plt.savefig(os.path.join(args.root, descrip.replace(":", "-") + "_summary_hist.png"))
+    plt.close()
+    
 
 '''
 save_out_indices_protonets = [745, 58, 849, 1553, 106, 1429, 1886, 413, 1249, 1656]
@@ -427,137 +437,147 @@ save_out_images(args.data_root, False, "sample", save_out_other_indices)
 
 exit()
 '''
-import pdb; pdb.set_trace()
 
-train_features, train_labels = initialize_embeddings(args.data_root, train=True, toy=args.is_toy, task_size=args.context_size)
-test_features, test_labels = initialize_embeddings(args.data_root, train=False, toy=args.is_toy, task_size=args.target_size)
+worst_initial_indices_all, flipped_indices_all, selected_indices_all = [], [], []
+initial_accs, flipped_accs, relabeled_accs = [], [], []
+initial_losses, flipped_losses, relabeled_losses = [], [], []
+correct_indices_all = []
 
-assert len(train_labels) == args.context_size
-assert len(test_labels) == args.target_size
 
-#num_train = 10
-#train_features = train_features[0:num_train]
-#train_labels = train_labels[0:num_train]
-train_features, test_features = torch.from_numpy(train_features).to(device), torch.from_numpy(test_features).to(device)
-train_labels = torch.from_numpy(train_labels).type(torch.LongTensor).to(device)
-test_labels = torch.from_numpy(test_labels).type(torch.LongTensor).to(device)
+def do_task():
 
-if args.is_toy:
-    # Select some points to plot
-    #subset_indices = torch.LongTensor([0, 1, 2, 3, 4, 998, 999, 1000, 1001, 1002, 1003, 1004, 1998, 1999])
-    test_labels_subset = test_labels #[subset_indices]
-    test_features_subset = test_features #[subset_indices]
+    train_features, train_labels = initialize_embeddings(args.data_root, train=True, toy=args.is_toy, task_size=args.context_size)
+    test_features, test_labels = initialize_embeddings(args.data_root, train=False, toy=args.is_toy, task_size=args.target_size)
 
-    if args.noisy_target:
-        # The last 0.024 of each class will be "confusing" points if noisy, extract those
-        confusing_test_features = torch.cat((test_features[1000 - int(0.024*1000):1000], test_features[2000 - int(0.024*1000):]), dim=0)
-        confusing_labels = torch.cat((test_labels[1000 - int(0.024*1000):1000], test_labels[2000 - int(0.024*1000):]), dim=0)
-        easy_test_features = torch.cat((test_features[0:1000 - int(0.024*1000)], test_features[1000:2000 - int(0.024*1000)]), dim=0)
-        easy_labels = torch.cat((test_labels[0:1000 - int(0.024*1000)], test_labels[1000:2000 - int(0.024*1000)]), dim=0)
-    plot_config = PlotSettings()
+    assert len(train_labels) == args.context_size
+    assert len(test_labels) == args.target_size
 
-# Clean performance on model
-if args.classifier_type == 'Protonets':
-    model = protonets.ProtoNets(num_classes, scale_by_std=args.scale_logits)
-else:
-    model = MahalanobisPredictor()
+    #num_train = 10
+    #train_features = train_features[0:num_train]
+    #train_labels = train_labels[0:num_train]
+    train_features, test_features = torch.from_numpy(train_features).to(device), torch.from_numpy(test_features).to(device)
+    train_labels = torch.from_numpy(train_labels).type(torch.LongTensor).to(device)
+    test_labels = torch.from_numpy(test_labels).type(torch.LongTensor).to(device)
 
-logits = model(train_features, train_labels, test_features)
-print_accuracy(logits, test_labels, f'{args.classifier_type}: initial')
+    if args.is_toy:
+        # Select some points to plot
+        #subset_indices = torch.LongTensor([0, 1, 2, 3, 4, 998, 999, 1000, 1001, 1002, 1003, 1004, 1998, 1999])
+        test_labels_subset = test_labels #[subset_indices]
+        test_features_subset = test_features #[subset_indices]
 
-if args.drop_strategy != "None":
+        if args.noisy_target:
+            # The last 0.024 of each class will be "confusing" points if noisy, extract those
+            confusing_test_features = torch.cat((test_features[1000 - int(0.024*1000):1000], test_features[2000 - int(0.024*1000):]), dim=0)
+            confusing_labels = torch.cat((test_labels[1000 - int(0.024*1000):1000], test_labels[2000 - int(0.024*1000):]), dim=0)
+            easy_test_features = torch.cat((test_features[0:1000 - int(0.024*1000)], test_features[1000:2000 - int(0.024*1000)]), dim=0)
+            easy_labels = torch.cat((test_labels[0:1000 - int(0.024*1000)], test_labels[1000:2000 - int(0.024*1000)]), dim=0)
+        plot_config = PlotSettings()
 
-    if args.drop_strategy == "Wrong":
-        keep_mask = (logits.argmax(axis=1) == test_labels)
-    elif args.drop_strategy == "Worst":
-        _, worst_indices = cross_entropy(logits, test_labels, return_worst=100)
-        keep_mask = torch.ones(test_labels.shape, dtype=np.bool)
-        keep_mask[worst_indices] = False
+    # Clean performance on model
+    if args.classifier_type == 'Protonets':
+        model = protonets.ProtoNets(num_classes, scale_by_std=args.scale_logits)
+    else:
+        model = MahalanobisPredictor()
 
-    print("Dropping points that we get wrong from test set: ({} many)".format((~keep_mask).sum()))
-
-    test_features = test_features[keep_mask]
-    test_labels = test_labels[keep_mask]
     logits = model(train_features, train_labels, test_features)
-    print_accuracy(logits, test_labels, f'{args.classifier_type}: all correct')
+    initial_acc, initial_loss, initial_worst_indices = print_accuracy(logits, test_labels, f'{args.classifier_type}: initial')
+    initial_accs.append(initial_acc); initial_losses.append(initial_loss); worst_initial_indices_all.append(initial_worst_indices)
+
+    if args.drop_strategy != "None":
+
+        if args.drop_strategy == "Wrong":
+            keep_mask = (logits.argmax(axis=1) == test_labels)
+        elif args.drop_strategy == "Worst":
+            _, worst_indices = cross_entropy(logits, test_labels, return_worst=100)
+            keep_mask = torch.ones(test_labels.shape, dtype=np.bool)
+            keep_mask[worst_indices] = False
+
+        print("Dropping points that we get wrong from test set: ({} many)".format((~keep_mask).sum()))
+
+        test_features = test_features[keep_mask]
+        test_labels = test_labels[keep_mask]
+        logits = model(train_features, train_labels, test_features)
+        print_accuracy(logits, test_labels, f'{args.classifier_type}: all correct')
 
 
-if args.classifier_type == 'Protonets':
-    print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), model.stds, f'{args.classifier_type}: initial')
-else:
-    print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), torch.linalg.inv(model.precisions), f'{args.classifier_type}: initial')
+    if args.is_toy:
+        plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset,os.path.join(args.root, "initial_test.pdf"), plot_config, model, device)
+        if args.noisy_target:
+            confusing_logits = model.predict(confusing_test_features)
+            print_accuracy(confusing_logits, confusing_labels, f'{args.classifier_type}, target accuracy confusing')
+            easy_logits = model.predict(easy_test_features)
+            print_accuracy(easy_logits, easy_labels, f'{args.classifier_type}, target accuracy easy')
 
-if args.is_toy:
-    plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset,os.path.join(args.root, "initial_test.pdf"), plot_config, model, device)
-    if args.noisy_target:
-        confusing_logits = model.predict(confusing_test_features)
-        print_accuracy(confusing_logits, confusing_labels, f'{args.classifier_type}, target accuracy confusing')
-        easy_logits = model.predict(easy_test_features)
-        print_accuracy(easy_logits, easy_labels, f'{args.classifier_type}, target accuracy easy')
+    #train_logistic_regression_head(train_features, train_labels, test_features, test_labels)
 
-#train_logistic_regression_head(train_features, train_labels, test_features, test_labels)
+    # Flip label experiment
+    flipped_train_labels = train_labels.clone()
+    indices_to_flip = torch.randperm(len(train_labels))[0:int(len(train_labels)*args.flip_fraction)]
+    flipped_indices_all.append(indices_to_flip)
+    flip_offset = torch.from_numpy(rand.randint(low=1, high=num_classes, size=(len(indices_to_flip)))).type(torch.LongTensor).to(device)
+    flipped_train_labels[indices_to_flip] = (flipped_train_labels[indices_to_flip] + flip_offset) % num_classes
+    #print("Flipped sum: {}".format(flipped_train_labels.sum()))
 
-# Flip label experiment
-flipped_train_labels = train_labels.clone()
-indices_to_flip = torch.randperm(len(train_labels))[0:int(len(train_labels)*args.flip_fraction)]
-flip_offset = torch.from_numpy(rand.randint(low=1, high=num_classes, size=(len(indices_to_flip)))).type(torch.LongTensor).to(device)
-flipped_train_labels[indices_to_flip] = (flipped_train_labels[indices_to_flip] + flip_offset) % num_classes
-#print("Flipped sum: {}".format(flipped_train_labels.sum()))
-
-#flipped_test_labels = test_labels.clone()
-#test_indices_to_flip = torch.randperm(len(test_labels))[0:int(len(test_labels)*args.flip_fraction)]
-#flipped_test_labels[test_indices_to_flip] = 1 - flipped_test_labels[test_indices_to_flip]
-logits = model(train_features, flipped_train_labels, test_features)
-print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% Noisy')
-if args.classifier_type == 'Protonets':
-    print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), model.stds, f'{args.classifier_type}: Noisy')
-else:
-    print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), torch.linalg.inv(model.precisions), f'{args.classifier_type}: Noisy')
+    #flipped_test_labels = test_labels.clone()
+    #test_indices_to_flip = torch.randperm(len(test_labels))[0:int(len(test_labels)*args.flip_fraction)]
+    #flipped_test_labels[test_indices_to_flip] = 1 - flipped_test_labels[test_indices_to_flip]
+    logits = model(train_features, flipped_train_labels, test_features)
+    flipped_acc, flipped_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% Noisy')
+    flipped_accs.append(flipped_acc); flipped_losses.append(flipped_loss)
+    
 
 
-if args.is_toy:
-    plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset, os.path.join(args.root, "noisy_{}.pdf").format(args.flip_fraction*100), plot_config, model, device)
+    if args.is_toy:
+        plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset, os.path.join(args.root, "noisy_{}.pdf").format(args.flip_fraction*100), plot_config, model, device)
 
-#train_logistic_regression_head(train_features, flipped_train_labels, test_features, test_labels)
+    #train_logistic_regression_head(train_features, flipped_train_labels, test_features, test_labels)
 
 
-if args.ranking_method == 'loo':
-    rankings = calculate_rankings(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
-elif args.ranking_method == 'random':
-    rankings = calculate_random_rankings(flipped_train_labels)
-#rankings = calculate_rankings(model, train_features, flipped_train_labels, test_features, flipped_test_labels, num_classes)
+    if args.ranking_method == 'loo':
+        rankings = calculate_rankings(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
+    elif args.ranking_method == 'random':
+        rankings = calculate_random_rankings(flipped_train_labels)
+    #rankings = calculate_rankings(model, train_features, flipped_train_labels, test_features, flipped_test_labels, num_classes)
 
-num_correctly_identified = []
-relabelled_model_acc = []
-relabelled_model_loss = []
-relabelled_lreg_acc = []
+    #num_correctly_identified = []
+    #relabelled_model_acc = []
+    #relabelled_model_loss = []
+    #relabelled_lreg_acc = []
 
-for check_fraction in check_fractions:
-    num_to_keep = int(len(train_features) * (1 - check_fraction ))
+    num_to_keep = int(len(train_features) * (1 - args.flip_fraction ))
     keep_indices = rankings[0:num_to_keep]
     relabel_indices = rankings[num_to_keep:]
+    selected_indices_all.append(relabel_indices)
+    
     num_correct_indices = len(set(indices_to_flip.numpy()).intersection(set(relabel_indices.numpy())))
-    num_correctly_identified.append(num_correct_indices)
-    print(f'Correctly identified indices {(num_correct_indices)} out of {(args.flip_fraction*len(train_features))}')
+    num_correctly_identified = num_correct_indices
+    #print(f'Correctly identified indices {(num_correct_indices)} out of {(args.flip_fraction*len(train_features))}')
+    correct_indices_all.append(num_correct_indices)
 
     relabeled_train_labels = flipped_train_labels.clone()
     relabeled_train_labels[relabel_indices] = train_labels[relabel_indices]
 
     logits = model(train_features, relabeled_train_labels, test_features)
-    acc, loss = print_accuracy(logits, test_labels, f'{args.classifier_type}: {check_fraction*100}% relabeled', hush=False)
-    if args.classifier_type == 'Protonets':
-        print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), model.stds, f'{args.classifier_type}: {check_fraction*100}% relabeled')
-    else:
-        print_prototype_info(euclidean_metric(model.prototypes, model.prototypes), torch.linalg.inv(model.precisions), f'{args.classifier_type}: {check_fraction*100}% relabeled')
-
-    relabelled_model_acc.append(acc)
-    relabelled_model_loss.append(loss.item())
+    relabelled_model_acc, relabelled_model_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% relabeled', hush=False)
 
     #test_acc = train_logistic_regression_head(train_features, relabeled_train_labels, test_features, test_labels)
     #relabelled_lreg_acc.append(test_acc)
 
-logfile.write("Check fractions: {}\n".format(check_fractions))
-logfile.write("Num correctly identified: {}\n".format(num_correctly_identified))
-logfile.write("Relabelled {} acc: {}\n".format(args.classifier_type, relabelled_model_acc))
-logfile.write("Relabelled {} loss: {}\n".format(args.classifier_type, relabelled_model_loss))
-logfile.write("Relabelled LReg acc: {}\n".format(relabelled_lreg_acc))
+    #logfile.write("Check fractions: {}\n".format(args.flip_fractions))
+    #logfile.write("Num correctly identified: {}\n".format(num_correctly_identified))
+    #logfile.write("Relabelled {} acc: {}\n".format(args.classifier_type, relabelled_model_acc))
+    #logfile.write("Relabelled {} loss: {}\n".format(args.classifier_type, relabelled_model_loss))
+    
+import pdb; pdb.set_trace()
+for n in range(args.num_tasks):
+    do_task()
+    
+print_and_log_values(initial_accs, "Initial accuracies")
+print_and_log_values(initial_losses, "Initial losses")
+print_and_log_values(flipped_accs, "Flipped accuracies")
+print_and_log_values(flipped_losses, "Flipped losses")
+print_and_log_values(relabeled_accs, "Relabeled accuracies")
+print_and_log_values(relabeled_losses, "Relabeled losses")
+print_and_log_values(correct_indices_all, "Correctly selected indices")
+print("Number of flipped indices: {}".format(int(len(args.context_size)*args.flip_fraction)))
+logfile.write("Number of flipped indices: {}".format(int(len(args.context_size)*args.flip_fraction)))
