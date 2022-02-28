@@ -41,7 +41,7 @@ parser.add_argument("--flip_fraction", type=float, default=0.2, help="Fraction o
 parser.add_argument("--scale_logits", action='store_true', help="Whether to scale protonet logits by std dev")
 parser.add_argument("--classifier_type", default="Protonets", choices=['Protonets', 'Mahalanobis'], help="What type of classifier to use")
 parser.add_argument("--ranking_method", default="loo", choices=['loo', 'random'], help="What ranking algorithm to use")
-parser.add_argument("--ranking_recursive", action='store_false', help="Whether to calculate rankings (greedy) recursively or just once")
+parser.add_argument("--ranking_recursive", action='store_true', help="Whether to calculate rankings (greedy) recursively or just once")
 parser.add_argument("--drop_strategy", default="None", choices=['None', 'Worst', "Wrong"], help="Whether to discard points from the target set and, if so, how")
 
 
@@ -61,7 +61,6 @@ parser.add_argument("--cluster_dist", type=float, default=384.6158, help="Distan
 parser.set_defaults(scale_logits=True, noisy_context=True, noisy_target=True)
 
 args = parser.parse_args()
-
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -348,6 +347,7 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
     full_loss = cross_entropy(full_logits, query_labels)
 
     worst_targets = []
+    last_of_class_indices = []
 
     if len(support_features) != len(support_labels):
         import pdb; pdb.set_trace()
@@ -360,6 +360,11 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
             else:
                 loo_features = torch.cat((support_features[0:i], support_features[i + 1:]), 0)
                 loo_labels = torch.cat((support_labels[0:i], support_labels[i + 1:]), 0)
+            # If we're trying to drop the last instance of a class
+            if len(loo_labels.unique()) < way:
+                # Don't actually do the loo, just give it a high loss
+                weights[i] = full_loss
+                continue
             logits_loo = model.loo(loo_features, loo_labels, query_features, way)
             loss, biggest_offending_targets = cross_entropy(logits_loo, query_labels, return_worst=10)
             worst_targets.extend(biggest_offending_targets)
@@ -395,9 +400,9 @@ def get_relabel_indices(model, support_features, support_labels, query_features,
     num_to_keep = int(len(support_features) * (1 - args.flip_fraction ))
     
     if args.ranking_method == 'loo':
-        rankings = calculate_rankings(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
+        rankings = calculate_rankings(model, support_features, support_labels, query_features, query_labels, way)
     elif args.ranking_method == 'random':
-        rankings = calculate_random_rankings(flipped_train_labels)
+        rankings = calculate_random_rankings(support_labels)
         
     relabel_indices = rankings[num_to_keep:]
     
@@ -405,8 +410,6 @@ def get_relabel_indices(model, support_features, support_labels, query_features,
 
 
 def get_recursive_relabel_indices(model, support_features, support_labels, query_features, query_labels, way):
-    import pdb; pdb.set_trace()
-    
     num_to_keep = int(len(support_features) * (1 - args.flip_fraction ))
     num_to_check = len(support_features) - num_to_keep
     
@@ -423,10 +426,19 @@ def get_recursive_relabel_indices(model, support_features, support_labels, query
         
         # Drop the last one, which brings about smallest loss when dropped
         relabel_index = rankings[-1]
+        if k != 0 and relabel_index.item() != 0:
+            # This relabel_index can be off by up to k (because the mask will remove those elements before passing the data to the rankings calculator)
+            # Count how many elements are masked out before this element
+            mask_offset = len(keep_mask[0:relabel_index + k]) - (keep_mask[0:relabel_index + k]).sum()
+            relabel_index = relabel_index + mask_offset
+
         keep_mask[relabel_index] = False
+
         relabel_indices.append(relabel_index)
+        logits = model.loo(support_features[keep_mask], support_labels[keep_mask], query_features, way)
+        #print(cross_entropy(logits, query_labels))
         
-    return relabel_indices
+    return torch.tensor(relabel_indices, dtype=torch.long)
         
 
 # Model: {flip_fraction*100}% Noisy
@@ -491,7 +503,7 @@ worst_initial_indices_all, flipped_indices_all, selected_indices_all = [], [], [
 initial_accs, flipped_accs, relabeled_accs = [], [], []
 initial_losses, flipped_losses, relabeled_losses = [], [], []
 correct_indices_all = []
-
+dropped_accs, dropped_losses = [], []
 
 def do_task():
 
@@ -581,12 +593,18 @@ def do_task():
 
     #train_logistic_regression_head(train_features, flipped_train_labels, test_features, test_labels)
 
-    
     if not args.ranking_recursive:
         relabel_indices = get_relabel_indices(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
     else:
         relabel_indices = get_recursive_relabel_indices(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
-    
+    drop_mask = torch.ones(train_labels.shape, dtype=torch.bool)
+    drop_mask[relabel_indices] = False
+
+    logits = model(train_features[drop_mask], flipped_train_labels[drop_mask], test_features)
+    drop_acc, drop_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% dropped', hush=True)
+    dropped_accs.append(drop_acc); dropped_losses.append(drop_loss)
+
+
     selected_indices_all.append(relabel_indices)
     
     num_correct_indices = len(set(indices_to_flip.numpy()).intersection(set(relabel_indices.numpy())))
@@ -616,6 +634,11 @@ print_and_log_values(np.array(initial_accs)*100, "Initial accuracies")
 print_and_log_values(initial_losses, "Initial losses")
 print_and_log_values(np.array(flipped_accs)*100, "Flipped accuracies")
 print_and_log_values(flipped_losses, "Flipped losses")
+
+print_and_log_values(np.array(dropped_accs)*100, "Dropped accuracies")
+print_and_log_values(dropped_losses, "Dropped losses")
+
+
 print_and_log_values(np.array(relabeled_accs)*100, "Relabeled accuracies")
 print_and_log_values(relabeled_losses, "Relabeled losses")
 print_and_log_values(correct_indices_all, "Num correctly selected indices")
