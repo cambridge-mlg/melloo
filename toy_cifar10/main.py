@@ -505,7 +505,7 @@ initial_losses, flipped_losses, relabeled_losses = [], [], []
 correct_indices_all = []
 dropped_accs, dropped_losses = [], []
 
-def do_task():
+def do_task(task_num):
 
     train_features, train_labels = initialize_embeddings(args.data_root, train=True, toy=args.is_toy, task_size=args.context_size)
     test_features, test_labels = initialize_embeddings(args.data_root, train=False, toy=args.is_toy, task_size=args.target_size)
@@ -601,6 +601,7 @@ def do_task():
     drop_mask[relabel_indices] = False
 
     logits = model(train_features[drop_mask], flipped_train_labels[drop_mask], test_features)
+    flipped_loss_per_target = cross_entropy(logits, test_labels, reduction="none")
     drop_acc, drop_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% dropped', hush=True)
     dropped_accs.append(drop_acc); dropped_losses.append(drop_loss)
 
@@ -616,8 +617,18 @@ def do_task():
     relabeled_train_labels[relabel_indices] = train_labels[relabel_indices]
 
     logits = model(train_features, relabeled_train_labels, test_features)
+    relabeled_loss_per_target = cross_entropy(logits, test_labels, reduction="none")
     relabelled_model_acc, relabelled_model_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% relabeled', hush=True)
     relabeled_accs.append(relabelled_model_acc); relabeled_losses.append(relabelled_model_loss)
+
+    plt.scatter(flipped_logg_per_target, relabeled_loss_per_target)
+    plt.xlabel('Loss when context points flipped')
+    plt.xlabel('Loss when context points relabeled')
+    plt.title('Scatter plot of target point losses')
+    plt.grid(True)
+    plt.savefig(os.path.join(args.root, "target_scatter_{}.png".format(task_num)))
+    plt.close()
+   
 
     #test_acc = train_logistic_regression_head(train_features, relabeled_train_labels, test_features, test_labels)
     #relabelled_lreg_acc.append(test_acc)
@@ -628,7 +639,7 @@ def do_task():
     #logfile.write("Relabelled {} loss: {}\n".format(args.classifier_type, relabelled_model_loss))
     
 for n in tqdm(range(args.num_tasks)):
-    do_task()
+    do_task(n)
     
 print_and_log_values(np.array(initial_accs)*100, "Initial accuracies")
 print_and_log_values(initial_losses, "Initial losses")
