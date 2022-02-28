@@ -41,7 +41,9 @@ parser.add_argument("--flip_fraction", type=float, default=0.2, help="Fraction o
 parser.add_argument("--scale_logits", action='store_true', help="Whether to scale protonet logits by std dev")
 parser.add_argument("--classifier_type", default="Protonets", choices=['Protonets', 'Mahalanobis'], help="What type of classifier to use")
 parser.add_argument("--ranking_method", default="loo", choices=['loo', 'random'], help="What ranking algorithm to use")
+parser.add_argument("--ranking_recursive", action='store_false', help="Whether to calculate rankings (greedy) recursively or just once")
 parser.add_argument("--drop_strategy", default="None", choices=['None', 'Worst', "Wrong"], help="Whether to discard points from the target set and, if so, how")
+
 
 
 parser.add_argument("--context_size", type=int, default=-1, help="Size of context set")
@@ -339,7 +341,7 @@ def calculate_random_rankings(support_labels):
     return random_rankings
 
 
-def calculate_rankings(model, support_features, support_labels, query_features, query_labels, way):
+def calculate_rankings(model, support_features, support_labels, query_features, query_labels, way, plot_worst=True):
     # Calculate loo weights
     weights = torch.zeros(len(support_features))
     full_logits = model.predict(query_features)
@@ -359,10 +361,7 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
                 loo_features = torch.cat((support_features[0:i], support_features[i + 1:]), 0)
                 loo_labels = torch.cat((support_labels[0:i], support_labels[i + 1:]), 0)
             logits_loo = model.loo(loo_features, loo_labels, query_features, way)
-            if i < 100:
-                loss, biggest_offending_targets = cross_entropy(logits_loo, query_labels, return_worst=10)
-            else:
-                loss, biggest_offending_targets = cross_entropy(logits_loo, query_labels, return_worst=10)
+            loss, biggest_offending_targets = cross_entropy(logits_loo, query_labels, return_worst=10)
             worst_targets.extend(biggest_offending_targets)
             #predictions = logits_loo.argmax(axis=1)
             #acc = (predictions==query_labels).sum().item()/float(len(predictions))
@@ -377,14 +376,58 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
             loss = cross_entropy(logits_loo, query_labels)
             weights[i] = loss
 
-    plt.hist(worst_targets, len(query_labels), density=True)
-    plt.xlabel('Index')
-    plt.title('Hist of top 5 target indices with worst losses')
-    plt.grid(True)
-    plt.savefig(os.path.join(args.root, "worst_target_index.png"))
-    plt.close()
+    if plot_worst:
+        plt.hist(worst_targets, len(query_labels), density=True)
+        plt.xlabel('Index')
+        plt.title('Hist of top 5 target indices with worst losses')
+        plt.grid(True)
+        plt.savefig(os.path.join(args.root, "worst_target_index.png"))
+        plt.close()
+    # Sort from    big (bad) loss to low (good) loss
+    #                  ^                    ^
+    # dropping pt made loss worse ..... better
+    # Relabeling code will choose last x many to relabel
     rankings = torch.argsort(weights, descending=True)
     return rankings
+
+
+def get_relabel_indices(model, support_features, support_labels, query_features, query_labels, way):
+    num_to_keep = int(len(support_features) * (1 - args.flip_fraction ))
+    
+    if args.ranking_method == 'loo':
+        rankings = calculate_rankings(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
+    elif args.ranking_method == 'random':
+        rankings = calculate_random_rankings(flipped_train_labels)
+        
+    relabel_indices = rankings[num_to_keep:]
+    
+    return relabel_indices
+
+
+def get_recursive_relabel_indices(model, support_features, support_labels, query_features, query_labels, way):
+    import pdb; pdb.set_trace()
+    
+    num_to_keep = int(len(support_features) * (1 - args.flip_fraction ))
+    num_to_check = len(support_features) - num_to_keep
+    
+    if args.ranking_method == 'loo':
+        rankings_calculator = calculate_rankings
+    elif args.ranking_method == 'random':
+        rankings_calculator = calculate_random_rankings
+    
+    relabel_indices = []
+    keep_mask = torch.ones(support_labels.shape, dtype=torch.bool)
+    for k in range(num_to_check):
+        
+        rankings = rankings_calculator(model, support_features[keep_mask], support_labels[keep_mask], query_features, query_labels, way, plot_worst=False)
+        
+        # Drop the last one, which brings about smallest loss when dropped
+        relabel_index = rankings[-1]
+        keep_mask[relabel_index] = False
+        relabel_indices.append(relabel_index)
+        
+    return relabel_indices
+        
 
 # Model: {flip_fraction*100}% Noisy
 def print_accuracy(logits, test_labels, descrip, hush=True):
@@ -538,21 +581,12 @@ def do_task():
 
     #train_logistic_regression_head(train_features, flipped_train_labels, test_features, test_labels)
 
-
-    if args.ranking_method == 'loo':
-        rankings = calculate_rankings(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
-    elif args.ranking_method == 'random':
-        rankings = calculate_random_rankings(flipped_train_labels)
-    #rankings = calculate_rankings(model, train_features, flipped_train_labels, test_features, flipped_test_labels, num_classes)
-
-    #num_correctly_identified = []
-    #relabelled_model_acc = []
-    #relabelled_model_loss = []
-    #relabelled_lreg_acc = []
-
-    num_to_keep = int(len(train_features) * (1 - args.flip_fraction ))
-    keep_indices = rankings[0:num_to_keep]
-    relabel_indices = rankings[num_to_keep:]
+    
+    if not args.ranking_recursive:
+        relabel_indices = get_relabel_indices(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
+    else:
+        relabel_indices = get_recursive_relabel_indices(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
+    
     selected_indices_all.append(relabel_indices)
     
     num_correct_indices = len(set(indices_to_flip.numpy()).intersection(set(relabel_indices.numpy())))
