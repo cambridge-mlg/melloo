@@ -71,6 +71,10 @@ num_epochs = 5
 batch_size = 40
 learning_rate = 0.001
 
+
+if not os.path.exists(args.root):
+    os.makedirs(args.root)
+
 logfile = open(os.path.join(args.root, "log.txt"), 'a+')
 
 horse_index = 7
@@ -243,7 +247,6 @@ def load_embeddings(path):
     return features, labels
 
 def save_out_images(data_root, train, descrip, index_list):
-    import pdb; pdb.set_trace()
     if train:
         key = "train"
     else:
@@ -273,8 +276,8 @@ def initialize_embeddings(root, train, toy=False, task_size=-1):
         if way != num_classes:
             print("Error, embeddings don't match the requested number of classes ({} vs {})".format(way, num_classes))
             return -1
-        else:
-            print("Loaded classes with labels {}".format(np.unique(labels)))
+        #else:
+        #    print("Loaded classes with labels {}".format(np.unique(labels)))
     else:
         os.makedirs(output_dir)
         data_loader = make_data_loader(batch_size, train=train, shuffle=False)
@@ -348,7 +351,7 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
         import pdb; pdb.set_trace()
     if args.scale_logits:
         # If we're scaling, we have to recalculate means + stds with every loo
-        for i in tqdm(range(0, len(support_features))):
+        for i in range(0, len(support_features)):
             if i == 0:
                 loo_features = support_features[1:]
                 loo_labels = support_labels[1:]
@@ -357,10 +360,13 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
                 loo_labels = torch.cat((support_labels[0:i], support_labels[i + 1:]), 0)
             logits_loo = model.loo(loo_features, loo_labels, query_features, way)
             if i < 100:
-                loss, biggest_offending_targets = cross_entropy(logits_loo, query_labels, fig_prefix="Loo {}".format(i), return_worst=10)
+                loss, biggest_offending_targets = cross_entropy(logits_loo, query_labels, return_worst=10)
             else:
                 loss, biggest_offending_targets = cross_entropy(logits_loo, query_labels, return_worst=10)
             worst_targets.extend(biggest_offending_targets)
+            #predictions = logits_loo.argmax(axis=1)
+            #acc = (predictions==query_labels).sum().item()/float(len(predictions))
+            #weights[i] = 1.0 - acc
             weights[i] = loss
     else:
         # If not, we can use the "efficient drop" and only specify the one we want to drop:
@@ -381,10 +387,10 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
     return rankings
 
 # Model: {flip_fraction*100}% Noisy
-def print_accuracy(logits, test_labels, descrip, hush=False):
+def print_accuracy(logits, test_labels, descrip, hush=True):
     predictions = logits.argmax(axis=1)
     acc = (predictions==test_labels).sum().item()/float(len(predictions))
-    loss, worst_indices = cross_entropy(logits, test_labels, fig_prefix=descrip, return_worst=10)
+    loss, worst_indices = cross_entropy(logits, test_labels, return_worst=10)
 
     if not hush:
         print(f'{descrip} accuracy {(acc)*100}%')
@@ -395,7 +401,7 @@ def print_accuracy(logits, test_labels, descrip, hush=False):
     #logfile.write(f'{descrip} loss {(loss)}\n')
     #logfile.write(f'{descrip} worst indices {worst_indices}')
     
-    return acc, loss, worst_indices
+    return acc, loss.item(), worst_indices
 
 def print_prototype_info(prototype_dist, prototype_stds, descrip):
     #print(f'{descrip} Euclidean distace b/w prototypes {prototype_dist}')
@@ -418,8 +424,8 @@ def train_logistic_regression_head(train_features, train_labels, test_features, 
     
 def print_and_log_values(value_list, descrip):
     vals = np.array(value_list)
-    print("{} - {} +/- {} in range {} to {}".format(descrip, vals.mean(), vals.std(), vals.min(), vals.max()))
-    logfile.write("{} - {} +/- {} in range {} to {}".format(descrip, vals.mean(), vals.std(), vals.min(), vals.max()))
+    print("{} = {:.4} +/- {:.4} in range {:.4} to {:.4}".format(descrip, vals.mean(), vals.std(), float(vals.min()), float(vals.max())))
+    logfile.write("{} = {:.6} +/- {:.6} in range {:.6} to {:.6}\n".format(descrip, vals.mean(), vals.std(), float(vals.min()), float(vals.max())))
     plt.hist(vals)
     plt.title('{}'.format(descrip))
     plt.grid(True)
@@ -558,7 +564,8 @@ def do_task():
     relabeled_train_labels[relabel_indices] = train_labels[relabel_indices]
 
     logits = model(train_features, relabeled_train_labels, test_features)
-    relabelled_model_acc, relabelled_model_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% relabeled', hush=False)
+    relabelled_model_acc, relabelled_model_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% relabeled', hush=True)
+    relabeled_accs.append(relabelled_model_acc); relabeled_losses.append(relabelled_model_loss)
 
     #test_acc = train_logistic_regression_head(train_features, relabeled_train_labels, test_features, test_labels)
     #relabelled_lreg_acc.append(test_acc)
@@ -568,16 +575,25 @@ def do_task():
     #logfile.write("Relabelled {} acc: {}\n".format(args.classifier_type, relabelled_model_acc))
     #logfile.write("Relabelled {} loss: {}\n".format(args.classifier_type, relabelled_model_loss))
     
-import pdb; pdb.set_trace()
-for n in range(args.num_tasks):
+for n in tqdm(range(args.num_tasks)):
     do_task()
     
-print_and_log_values(initial_accs, "Initial accuracies")
+print_and_log_values(np.array(initial_accs)*100, "Initial accuracies")
 print_and_log_values(initial_losses, "Initial losses")
-print_and_log_values(flipped_accs, "Flipped accuracies")
+print_and_log_values(np.array(flipped_accs)*100, "Flipped accuracies")
 print_and_log_values(flipped_losses, "Flipped losses")
-print_and_log_values(relabeled_accs, "Relabeled accuracies")
+print_and_log_values(np.array(relabeled_accs)*100, "Relabeled accuracies")
 print_and_log_values(relabeled_losses, "Relabeled losses")
-print_and_log_values(correct_indices_all, "Correctly selected indices")
-print("Number of flipped indices: {}".format(int(len(args.context_size)*args.flip_fraction)))
-logfile.write("Number of flipped indices: {}".format(int(len(args.context_size)*args.flip_fraction)))
+print_and_log_values(correct_indices_all, "Num correctly selected indices")
+print("Number of flipped indices: {}".format(int(args.context_size*args.flip_fraction)))
+logfile.write("Number of flipped indices: {}".format(int(args.context_size*args.flip_fraction)))
+
+index_file = open(os.path.join(args.root, "indices.txt"), 'a+')
+index_file.write("Worst (initial) indices:")
+index_file.write("{}".format(worst_initial_indices_all))
+index_file.write("Flipped indices:")
+index_file.write("{}".format(flipped_indices_all))
+index_file.write("Selected indices:")
+index_file.write("{}".format(selected_indices_all))
+index_file.close()
+

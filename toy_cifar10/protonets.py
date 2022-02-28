@@ -26,7 +26,7 @@ class ProtoNets(nn.Module):
         way = self.way
         prototypes, stds = self._compute_prototypes(context_features, context_labels, way)
 
-        print("Prototype distances: {}".format(euclidean_metric(prototypes, prototypes)[0][1].item()))
+        #print("Prototype distances: {}".format(euclidean_metric(prototypes, prototypes)[0][1].item()))
         return self.predict(target_features)
         
     # Will always used saved protoypes and stds
