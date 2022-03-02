@@ -601,7 +601,7 @@ def do_task(task_num):
     drop_mask[relabel_indices] = False
 
     logits = model(train_features[drop_mask], flipped_train_labels[drop_mask], test_features)
-    flipped_loss_per_target = cross_entropy(logits, test_labels, reduction="none")
+    flipped_loss_per_target =  torch.nn.functional.cross_entropy(logits, test_labels, reduction="none")
     drop_acc, drop_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% dropped', hush=True)
     dropped_accs.append(drop_acc); dropped_losses.append(drop_loss)
 
@@ -617,13 +617,13 @@ def do_task(task_num):
     relabeled_train_labels[relabel_indices] = train_labels[relabel_indices]
 
     logits = model(train_features, relabeled_train_labels, test_features)
-    relabeled_loss_per_target = cross_entropy(logits, test_labels, reduction="none")
+    relabeled_loss_per_target =  torch.nn.functional.cross_entropy(logits, test_labels, reduction="none")
     relabelled_model_acc, relabelled_model_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% relabeled', hush=True)
     relabeled_accs.append(relabelled_model_acc); relabeled_losses.append(relabelled_model_loss)
 
-    plt.scatter(flipped_logg_per_target, relabeled_loss_per_target)
+    plt.scatter(flipped_loss_per_target.cpu().numpy(), relabeled_loss_per_target.cpu().numpy())
     plt.xlabel('Loss when context points flipped')
-    plt.xlabel('Loss when context points relabeled')
+    plt.ylabel('Loss when context points relabeled')
     plt.title('Scatter plot of target point losses')
     plt.grid(True)
     plt.savefig(os.path.join(args.root, "target_scatter_{}.png".format(task_num)))
