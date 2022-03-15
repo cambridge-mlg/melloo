@@ -12,6 +12,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy.random as rand
+from sklearn.manifold import TSNE
 
 from mahalanobis import MahalanobisPredictor
 from helper_classes import LogisticRegression, EmbeddedDataset
@@ -23,8 +24,8 @@ from argparse import ArgumentParser
 from PIL import Image
 
 #torch.use_deterministic_algorithms(True)
-#torch.manual_seed(2) #0
-#rand.seed(20160704) #20160702
+torch.manual_seed(2) #0
+rand.seed(20160704) #20160702
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"]="1"
@@ -117,7 +118,7 @@ def cross_entropy(logits, labels, fig_prefix=None, return_worst=-1):
         plt.grid(True)
         plt.savefig(os.path.join(args.root, fig_prefix.replace(":", "-") + "_worst_loss_hist.png"))
         plt.close()
-        
+
     if return_worst > 0:
         worst_indices =  torch.topk(unreduced_loss, return_worst).indices.tolist()
         return unreduced_loss.mean(), worst_indices
@@ -398,32 +399,32 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
 
 def get_relabel_indices(model, support_features, support_labels, query_features, query_labels, way):
     num_to_keep = int(len(support_features) * (1 - args.flip_fraction ))
-    
+
     if args.ranking_method == 'loo':
         rankings = calculate_rankings(model, support_features, support_labels, query_features, query_labels, way)
     elif args.ranking_method == 'random':
         rankings = calculate_random_rankings(support_labels)
-        
+
     relabel_indices = rankings[num_to_keep:]
-    
+
     return relabel_indices
 
 
 def get_recursive_relabel_indices(model, support_features, support_labels, query_features, query_labels, way):
     num_to_keep = int(len(support_features) * (1 - args.flip_fraction ))
     num_to_check = len(support_features) - num_to_keep
-    
+
     if args.ranking_method == 'loo':
         rankings_calculator = calculate_rankings
     elif args.ranking_method == 'random':
         rankings_calculator = calculate_random_rankings
-    
+
     relabel_indices = []
     keep_mask = torch.ones(support_labels.shape, dtype=torch.bool)
     for k in range(num_to_check):
-        
+
         rankings = rankings_calculator(model, support_features[keep_mask], support_labels[keep_mask], query_features, query_labels, way, plot_worst=False)
-        
+
         # Drop the last one, which brings about smallest loss when dropped
         relabel_index = rankings[-1]
         if k != 0 and relabel_index.item() != 0:
@@ -437,9 +438,9 @@ def get_recursive_relabel_indices(model, support_features, support_labels, query
         relabel_indices.append(relabel_index)
         logits = model.loo(support_features[keep_mask], support_labels[keep_mask], query_features, way)
         #print(cross_entropy(logits, query_labels))
-        
+
     return torch.tensor(relabel_indices, dtype=torch.long)
-        
+
 
 # Model: {flip_fraction*100}% Noisy
 def print_accuracy(logits, test_labels, descrip, hush=True):
@@ -455,7 +456,7 @@ def print_accuracy(logits, test_labels, descrip, hush=True):
     #logfile.write(f'{descrip} accuracy {(acc)*100}%\n')
     #logfile.write(f'{descrip} loss {(loss)}\n')
     #logfile.write(f'{descrip} worst indices {worst_indices}')
-    
+
     return acc, loss.item(), worst_indices
 
 def print_prototype_info(prototype_dist, prototype_stds, descrip):
@@ -476,7 +477,7 @@ def train_logistic_regression_head(train_features, train_labels, test_features, 
     clean_lreg = LogisticRegression(train_features.shape[1], num_classes)
     clean_lreg = train_model(clean_lreg, clean_dataloader_train)
     return test_model(clean_lreg, clean_dataloader_test)
-    
+
 def print_and_log_values(value_list, descrip):
     vals = np.array(value_list)
     print("{} = {:.4} +/- {:.4} in range {:.4} to {:.4}".format(descrip, vals.mean(), vals.std(), float(vals.min()), float(vals.max())))
@@ -486,7 +487,7 @@ def print_and_log_values(value_list, descrip):
     plt.grid(True)
     plt.savefig(os.path.join(args.root, descrip.replace(":", "-") + "_summary_hist.png"))
     plt.close()
-    
+
 
 '''
 save_out_indices_protonets = [745, 58, 849, 1553, 106, 1429, 1886, 413, 1249, 1656]
@@ -498,6 +499,41 @@ save_out_images(args.data_root, False, "sample", save_out_other_indices)
 
 exit()
 '''
+
+def convert_to_numpy(x):
+    if torch.is_tensor(x):
+        if x.is_cuda:
+            return x.cpu().numpy()
+        else:
+            return x.numpy()
+    else:
+        return x
+
+def plot_tsne(model, points, labels, descrip):
+    class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
+    points = convert_to_numpy(points)
+    labels = convert_to_numpy(labels)
+    prototypes = model.prototypes.cpu().numpy()
+    prototype_labels = torch.Tensor(model.prototype_labels).numpy()
+    points = np.concatenate([points, prototypes], axis=0)
+    labels = np.concatenate([labels, prototype_labels], axis=0)
+    perplexities = [30] #[2, 5, 10, 20, 30, 50, 75, 100]
+    learning_rates = [50] #[10.0, 25, 50, 100, 200, 500]
+    for r in learning_rates:
+        for p in perplexities:
+            p_embedded = TSNE(n_components=2, init='random', n_iter=1000, learning_rate=r).fit_transform(points)
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+            for class_label in range(num_classes):
+                class_mask = labels == class_label
+                # Plot regular points
+                ax.scatter(p_embedded[class_mask][:-1, 0],p_embedded[class_mask][:-1, 1], label='Class {}'.format(class_label), c=class_colors[class_label])
+                # Plot prototypes
+                ax.scatter(p_embedded[class_mask][-1:, 0],p_embedded[class_mask][-1:, 1], c=class_colors[class_label], marker='s')
+
+            plt.legend()
+            plt.savefig(os.path.join(args.root, "tsne_" + descrip.replace(":", "-") + "_perp_{}_lr_{}.png".format(p, r)))
+            plt.close()
 
 worst_initial_indices_all, flipped_indices_all, selected_indices_all = [], [], []
 initial_accs, flipped_accs, relabeled_accs = [], [], []
@@ -541,6 +577,8 @@ def do_task(task_num):
         model = MahalanobisPredictor()
 
     logits = model(train_features, train_labels, test_features)
+    plot_tsne(model, train_features, train_labels, 'initial_{}'.format(task_num))
+    initial_loss_per_target = torch.nn.functional.cross_entropy(logits, test_labels, reduction="none")
     initial_acc, initial_loss, initial_worst_indices = print_accuracy(logits, test_labels, f'{args.classifier_type}: initial')
     initial_accs.append(initial_acc); initial_losses.append(initial_loss); worst_initial_indices_all.append(initial_worst_indices)
 
@@ -583,9 +621,10 @@ def do_task(task_num):
     #test_indices_to_flip = torch.randperm(len(test_labels))[0:int(len(test_labels)*args.flip_fraction)]
     #flipped_test_labels[test_indices_to_flip] = 1 - flipped_test_labels[test_indices_to_flip]
     logits = model(train_features, flipped_train_labels, test_features)
+    plot_tsne(model, train_features, flipped_train_labels, 'flipped_{}'.format(task_num))
     flipped_acc, flipped_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% Noisy')
     flipped_accs.append(flipped_acc); flipped_losses.append(flipped_loss)
-    
+
 
 
     if args.is_toy:
@@ -601,13 +640,30 @@ def do_task(task_num):
     drop_mask[relabel_indices] = False
 
     logits = model(train_features[drop_mask], flipped_train_labels[drop_mask], test_features)
+    plot_tsne(model, train_features[drop_mask], flipped_train_labels[drop_mask], 'drop_selected_{}'.format(task_num))
+    plot_tsne(model, train_features[drop_mask], train_labels[drop_mask], 'drop_selected_true_{}'.format(task_num))
+
     flipped_loss_per_target =  torch.nn.functional.cross_entropy(logits, test_labels, reduction="none")
     drop_acc, drop_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% dropped', hush=True)
     dropped_accs.append(drop_acc); dropped_losses.append(drop_loss)
 
-
     selected_indices_all.append(relabel_indices)
-    
+    # Log class of selected indices. Of true classes? Yes, I think so.
+    plt.hist(train_labels[relabel_indices].cpu().numpy(), bins=num_classes)
+    plt.xlabel('True class label')
+    plt.ylabel('Num points selected for relabel')
+    plt.title('Classes selected for relabeling')
+    plt.grid(True)
+    plt.savefig(os.path.join(args.root, "selected_label_hist_true_{}.png".format(task_num)))
+    plt.close()
+    plt.hist(flipped_train_labels[relabel_indices].cpu().numpy(), bins=num_classes)
+    plt.xlabel('Presented class label')
+    plt.ylabel('Num points selected for relabel')
+    plt.title('Classes selected for relabeling')
+    plt.grid(True)
+    plt.savefig(os.path.join(args.root, "selected_label_hist_flipped_{}.png".format(task_num)))
+    plt.close()
+
     num_correct_indices = len(set(indices_to_flip.numpy()).intersection(set(relabel_indices.numpy())))
     num_correctly_identified = num_correct_indices
     #print(f'Correctly identified indices {(num_correct_indices)} out of {(args.flip_fraction*len(train_features))}')
@@ -620,27 +676,33 @@ def do_task(task_num):
     relabeled_loss_per_target =  torch.nn.functional.cross_entropy(logits, test_labels, reduction="none")
     relabelled_model_acc, relabelled_model_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% relabeled', hush=True)
     relabeled_accs.append(relabelled_model_acc); relabeled_losses.append(relabelled_model_loss)
+    class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
+    t_color = [class_colors[lbl] for lbl in test_labels]
+    import matplotlib.patches as mpatches
 
-    plt.scatter(flipped_loss_per_target.cpu().numpy(), relabeled_loss_per_target.cpu().numpy())
+    handles = [mpatches.Rectangle((0, 0), 1, 1, fc=ccol) for ccol in class_colors ]
+    plt.scatter(flipped_loss_per_target.cpu().numpy(), relabeled_loss_per_target.cpu().numpy(), c=t_color)
     plt.xlabel('Loss when context points flipped')
     plt.ylabel('Loss when context points relabeled')
     plt.title('Scatter plot of target point losses')
     plt.grid(True)
+
+    plt.legend(handles, ['Class {}'.format(lbl) for lbl in range(num_classes)])
     plt.savefig(os.path.join(args.root, "target_scatter_{}.png".format(task_num)))
     plt.close()
-   
+
 
     #test_acc = train_logistic_regression_head(train_features, relabeled_train_labels, test_features, test_labels)
     #relabelled_lreg_acc.append(test_acc)
 
     #logfile.write("Check fractions: {}\n".format(args.flip_fractions))
-    #logfile.write("Num correctly identified: {}\n".format(num_correctly_identified))
+    logfile.write("{} Num correctly identified: {}\n".format(task_num, num_correctly_identified))
     #logfile.write("Relabelled {} acc: {}\n".format(args.classifier_type, relabelled_model_acc))
     #logfile.write("Relabelled {} loss: {}\n".format(args.classifier_type, relabelled_model_loss))
-    
+
 for n in tqdm(range(args.num_tasks)):
     do_task(n)
-    
+
 print_and_log_values(np.array(initial_accs)*100, "Initial accuracies")
 print_and_log_values(initial_losses, "Initial losses")
 print_and_log_values(np.array(flipped_accs)*100, "Flipped accuracies")
@@ -664,4 +726,3 @@ index_file.write("{}".format(flipped_indices_all))
 index_file.write("Selected indices:")
 index_file.write("{}".format(selected_indices_all))
 index_file.close()
-
