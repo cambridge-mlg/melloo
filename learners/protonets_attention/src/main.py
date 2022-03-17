@@ -174,7 +174,6 @@ class Learner:
             train_set = [self.args.dataset]
             validation_set = [self.args.dataset]
             test_set = [self.args.dataset]
-
         return train_set, validation_set, test_set
 
     """
@@ -214,8 +213,8 @@ class Learner:
         parser.add_argument("--val_freq", type=int, default=5000, help="Number of iterations between validations.")
         parser.add_argument("--max_way_train", type=int, default=50, help="Maximum way of meta-train task.")
         parser.add_argument("--max_way_test", type=int, default=50, help="Maximum way of meta-test task.")
-        parser.add_argument("--max_support_train", type=int, default=500, help="Maximum support set size of meta-train task.")
-        parser.add_argument("--max_support_test", type=int, default=500, help="Maximum support set size of meta-test task.")
+        parser.add_argument("--max_support_train", type=int, default=50000, help="Maximum support set size of meta-train task.")
+        parser.add_argument("--max_support_test", type=int, default=50000, help="Maximum support set size of meta-test task.")
         parser.add_argument("--resume_from_checkpoint", "-r", dest="resume_from_checkpoint", default=False, action="store_true",
                             help="Restart from ltest checkpoint.")
         parser.add_argument("--way", type=int, default=5, help="Way of meta-train task.")
@@ -1321,7 +1320,6 @@ class Learner:
                 for mode in ranking_modes:
                     torch.cuda.empty_cache()
                     print(mode)
-
                     if mode == 'loo':
                         weights_per_qp['loo'] = self.calculate_loo(context_images, context_labels, target_images, target_labels)
                     elif mode == 'attention':
