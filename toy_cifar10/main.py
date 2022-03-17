@@ -488,6 +488,19 @@ def print_and_log_values(value_list, descrip):
     plt.savefig(os.path.join(args.root, descrip.replace(":", "-") + "_summary_hist.png"))
     plt.close()
 
+def plot_hist(x, bins, filename, task_num=None, title='', x_label='', y_label='', density=False):
+    x = convert_to_numpy(x)
+    plt.hist(x, bins=bins, density=density)
+    plt.xlabel(x_label)
+    plt.ylabel(y_label)
+    plt.title(title)
+    plt.grid(True)
+    if task_num != None:
+        filename = "{}_".format(task_num) + filename
+    filename += ".png"
+    plt.savefig(os.path.join(args.root, filename))
+    plt.close()
+
 
 '''
 save_out_indices_protonets = [745, 58, 849, 1553, 106, 1429, 1886, 413, 1249, 1656]
@@ -549,6 +562,8 @@ def do_task(task_num):
     assert len(train_labels) == args.context_size
     assert len(test_labels) == args.target_size
 
+    class_bins = list(range(0, num_classes+1))
+
     #num_train = 10
     #train_features = train_features[0:num_train]
     #train_labels = train_labels[0:num_train]
@@ -577,6 +592,10 @@ def do_task(task_num):
         model = MahalanobisPredictor()
 
     logits = model(train_features, train_labels, test_features)
+
+    predicted_classes_initial = logits.argmax(axis=1).cpu().numpy()
+    plot_hist(predicted_classes_initial, class_bins, "class_distribution_initial", task_num, 'Predicted classes (initial)', 'Predicted class label', density=True)
+
     plot_tsne(model, train_features, train_labels, 'initial_{}'.format(task_num))
     initial_loss_per_target = torch.nn.functional.cross_entropy(logits, test_labels, reduction="none")
     initial_acc, initial_loss, initial_worst_indices = print_accuracy(logits, test_labels, f'{args.classifier_type}: initial')
@@ -615,17 +634,17 @@ def do_task(task_num):
     flipped_indices_all.append(indices_to_flip)
     flip_offset = torch.from_numpy(rand.randint(low=1, high=num_classes, size=(len(indices_to_flip)))).type(torch.LongTensor).to(device)
     flipped_train_labels[indices_to_flip] = (flipped_train_labels[indices_to_flip] + flip_offset) % num_classes
-    #print("Flipped sum: {}".format(flipped_train_labels.sum()))
 
-    #flipped_test_labels = test_labels.clone()
-    #test_indices_to_flip = torch.randperm(len(test_labels))[0:int(len(test_labels)*args.flip_fraction)]
-    #flipped_test_labels[test_indices_to_flip] = 1 - flipped_test_labels[test_indices_to_flip]
-    logits = model(train_features, flipped_train_labels, test_features)
-    plot_tsne(model, train_features, flipped_train_labels, 'flipped_{}'.format(task_num))
+    logits = model(train_features, flipped_train_labels, test_features)    
+    predicted_classes_flipped = logits.argmax(axis=1).cpu().numpy()
+
+    plot_hist(predicted_classes_flipped, class_bins, "class_distribution_flipped", task_num, 'Predicted classes (flipped)', 'Predicted class label', density=True)
+
+    flipped_loss_per_target =  torch.nn.functional.cross_entropy(logits, test_labels, reduction="none").cpu().numpy()
     flipped_acc, flipped_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% Noisy')
     flipped_accs.append(flipped_acc); flipped_losses.append(flipped_loss)
 
-
+    plot_tsne(model, train_features, flipped_train_labels, 'flipped_{}'.format(task_num))
 
     if args.is_toy:
         plot_decision_regions(model.prototypes, test_features_subset, test_labels_subset, os.path.join(args.root, "noisy_{}.pdf").format(args.flip_fraction*100), plot_config, model, device)
@@ -640,29 +659,20 @@ def do_task(task_num):
     drop_mask[relabel_indices] = False
 
     logits = model(train_features[drop_mask], flipped_train_labels[drop_mask], test_features)
+    predicted_classes_after_drop = logits.argmax(axis=1).cpu().numpy()
+    dropped_loss_per_target = torch.nn.functional.cross_entropy(logits, test_labels, reduction="none").cpu().numpy()
+
+    plot_hist(predicted_classes_after_drop, class_bins, "class_distribution_after_drop", task_num, 'Predicted classes after dropping selected', 'Predicted class label', density=True)
     plot_tsne(model, train_features[drop_mask], flipped_train_labels[drop_mask], 'drop_selected_{}'.format(task_num))
     plot_tsne(model, train_features[drop_mask], train_labels[drop_mask], 'drop_selected_true_{}'.format(task_num))
-
-    flipped_loss_per_target =  torch.nn.functional.cross_entropy(logits, test_labels, reduction="none")
+    
     drop_acc, drop_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% dropped', hush=True)
     dropped_accs.append(drop_acc); dropped_losses.append(drop_loss)
 
     selected_indices_all.append(relabel_indices)
     # Log class of selected indices. Of true classes? Yes, I think so.
-    plt.hist(train_labels[relabel_indices].cpu().numpy(), bins=num_classes)
-    plt.xlabel('True class label')
-    plt.ylabel('Num points selected for relabel')
-    plt.title('Classes selected for relabeling')
-    plt.grid(True)
-    plt.savefig(os.path.join(args.root, "selected_label_hist_true_{}.png".format(task_num)))
-    plt.close()
-    plt.hist(flipped_train_labels[relabel_indices].cpu().numpy(), bins=num_classes)
-    plt.xlabel('Presented class label')
-    plt.ylabel('Num points selected for relabel')
-    plt.title('Classes selected for relabeling')
-    plt.grid(True)
-    plt.savefig(os.path.join(args.root, "selected_label_hist_flipped_{}.png".format(task_num)))
-    plt.close()
+    plot_hist(train_labels[relabel_indices], class_bins, "selected_label_hist_true", task_num, 'Classes selected for relabeling', 'True class label', 'Num points selected for relabel')
+    plot_hist(flipped_train_labels[relabel_indices], class_bins, "selected_label_hist_flipped", task_num, 'Classes selected for relabeling', 'Presented class label', 'Num points selected for relabel')
 
     num_correct_indices = len(set(indices_to_flip.numpy()).intersection(set(relabel_indices.numpy())))
     num_correctly_identified = num_correct_indices
@@ -673,23 +683,54 @@ def do_task(task_num):
     relabeled_train_labels[relabel_indices] = train_labels[relabel_indices]
 
     logits = model(train_features, relabeled_train_labels, test_features)
-    relabeled_loss_per_target =  torch.nn.functional.cross_entropy(logits, test_labels, reduction="none")
+    predicted_classes_after_relabel = logits.argmax(axis=1).cpu().numpy()
+
+    plot_hist(predicted_classes_after_relabel, class_bins, "class_distribution_after_relabel", task_num, 'Predicted class distribution after relabel', 'Predicted class label', density=True)
+
+    relabeled_loss_per_target =  torch.nn.functional.cross_entropy(logits, test_labels, reduction="none").cpu().numpy()
     relabelled_model_acc, relabelled_model_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% relabeled', hush=True)
     relabeled_accs.append(relabelled_model_acc); relabeled_losses.append(relabelled_model_loss)
     class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
+
+    x_min, x_max = flipped_loss_per_target.min(), flipped_loss_per_target.max()
+    y_min, y_max = relabeled_loss_per_target.min(), relabeled_loss_per_target.max()
+    for tc in range(0, num_classes):
+        class_mask = (test_labels == tc).cpu().numpy()
+        plt.scatter(flipped_loss_per_target[class_mask], relabeled_loss_per_target[class_mask], c=class_colors[tc])
+        plt.xlim(x_min, x_max)
+        plt.ylim(y_min, y_max)
+        plt.xlabel('Loss when context points flipped')
+        plt.ylabel('Loss when context points relabeled')
+        plt.title('Scatter plot of target point losses (class {})'.format(tc))
+        plt.grid(True)
+        plt.savefig(os.path.join(args.root, "{}_target_scatter_class_{}.png".format(task_num, tc)))
+        plt.close()
+
     t_color = [class_colors[lbl] for lbl in test_labels]
     import matplotlib.patches as mpatches
 
     handles = [mpatches.Rectangle((0, 0), 1, 1, fc=ccol) for ccol in class_colors ]
-    plt.scatter(flipped_loss_per_target.cpu().numpy(), relabeled_loss_per_target.cpu().numpy(), c=t_color)
+    plt.scatter(flipped_loss_per_target, relabeled_loss_per_target, c=t_color)
     plt.xlabel('Loss when context points flipped')
     plt.ylabel('Loss when context points relabeled')
     plt.title('Scatter plot of target point losses')
     plt.grid(True)
 
     plt.legend(handles, ['Class {}'.format(lbl) for lbl in range(num_classes)])
-    plt.savefig(os.path.join(args.root, "target_scatter_{}.png".format(task_num)))
+    plt.savefig(os.path.join(args.root, "{}_target_scatter_relabeled.png".format(task_num)))
     plt.close()
+
+
+    plt.scatter(flipped_loss_per_target, dropped_loss_per_target, c=t_color)
+    plt.xlabel('Loss when context points flipped')
+    plt.ylabel('Loss when selected context points are dropped')
+    plt.title('Scatter plot of target point losses')
+    plt.grid(True)
+
+    plt.legend(handles, ['Class {}'.format(lbl) for lbl in range(num_classes)])
+    plt.savefig(os.path.join(args.root, "{}_target_scatter_droped.png".format(task_num)))
+    plt.close()
+
 
 
     #test_acc = train_logistic_regression_head(train_features, relabeled_train_labels, test_features, test_labels)
@@ -699,6 +740,8 @@ def do_task(task_num):
     logfile.write("{} Num correctly identified: {}\n".format(task_num, num_correctly_identified))
     #logfile.write("Relabelled {} acc: {}\n".format(args.classifier_type, relabelled_model_acc))
     #logfile.write("Relabelled {} loss: {}\n".format(args.classifier_type, relabelled_model_loss))
+
+
 
 for n in tqdm(range(args.num_tasks)):
     do_task(n)
