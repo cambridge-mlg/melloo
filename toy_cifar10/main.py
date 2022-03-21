@@ -363,6 +363,10 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
             else:
                 loo_features = torch.cat((support_features[0:i], support_features[i + 1:]), 0)
                 loo_labels = torch.cat((support_labels[0:i], support_labels[i + 1:]), 0)
+
+            # Do plain LOO or do RLO
+
+
             # If we're trying to drop the last instance of a class
             if len(loo_labels.unique()) < way:
                 # Don't actually do the loo, just give it a high loss
@@ -399,7 +403,7 @@ def calculate_rankings(model, support_features, support_labels, query_features, 
     return rankings
 
 
-def get_relabel_indices(model, support_features, support_labels, query_features, query_labels, way):
+def get_drop_indices(model, support_features, support_labels, query_features, query_labels, way):
     num_to_keep = int(len(support_features) * (1 - args.flip_fraction ))
 
     if args.ranking_method == 'loo':
@@ -407,12 +411,11 @@ def get_relabel_indices(model, support_features, support_labels, query_features,
     elif args.ranking_method == 'random':
         rankings = calculate_random_rankings(support_labels)
 
-    relabel_indices = rankings[num_to_keep:]
+    drop_indices = rankings[num_to_keep:]
 
-    return relabel_indices
+    return drop_indices
 
-
-def get_recursive_relabel_indices(model, support_features, support_labels, query_features, query_labels, way):
+def get_recursive_drop_indices(model, support_features, support_labels, query_features, query_labels, way):
     num_to_keep = int(len(support_features) * (1 - args.flip_fraction ))
     num_to_check = len(support_features) - num_to_keep
 
@@ -421,27 +424,27 @@ def get_recursive_relabel_indices(model, support_features, support_labels, query
     elif args.ranking_method == 'random':
         rankings_calculator = calculate_random_rankings
 
-    relabel_indices = []
+    drop_indices = []
     keep_mask = torch.ones(support_labels.shape, dtype=torch.bool)
     for k in range(num_to_check):
 
         rankings = rankings_calculator(model, support_features[keep_mask], support_labels[keep_mask], query_features, query_labels, way, plot_worst=False)
 
         # Drop the last one, which brings about smallest loss when dropped
-        relabel_index = rankings[-1]
-        if k != 0 and relabel_index.item() != 0:
-            # This relabel_index can be off by up to k (because the mask will remove those elements before passing the data to the rankings calculator)
+        drop_index = rankings[-1]
+        if k != 0 and drop_index.item() != 0:
+            # This drop can be off by up to k (because the mask will remove those elements before passing the data to the rankings calculator)
             # Count how many elements are masked out before this element
-            mask_offset = len(keep_mask[0:relabel_index + k]) - (keep_mask[0:relabel_index + k]).sum()
-            relabel_index = relabel_index + mask_offset
+            mask_offset = len(keep_mask[0:drop_index + k]) - (keep_mask[0:drop_index + k]).sum()
+            drop_index = drop_index + mask_offset
 
-        keep_mask[relabel_index] = False
+        keep_mask[drop_index] = False
 
-        relabel_indices.append(relabel_index)
+        drop_indices.append(drop_index)
         logits = model.loo(support_features[keep_mask], support_labels[keep_mask], query_features, way)
         #print(cross_entropy(logits, query_labels))
 
-    return torch.tensor(relabel_indices, dtype=torch.long)
+    return torch.tensor(drop_indices, dtype=torch.long)
 
 
 # Model: {flip_fraction*100}% Noisy
@@ -654,9 +657,9 @@ def do_task(task_num):
     #train_logistic_regression_head(train_features, flipped_train_labels, test_features, test_labels)
 
     if not args.ranking_recursive:
-        relabel_indices = get_relabel_indices(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
+        relabel_indices = get_drop_indices(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
     else:
-        relabel_indices = get_recursive_relabel_indices(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
+        relabel_indices = get_recursive_drop_indices(model, train_features, flipped_train_labels, test_features, test_labels, num_classes)
     drop_mask = torch.ones(train_labels.shape, dtype=torch.bool)
     drop_mask[relabel_indices] = False
 
