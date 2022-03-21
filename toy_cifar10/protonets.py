@@ -3,8 +3,7 @@ import torch.nn as nn
 import numpy as np
 from helper_classes import euclidean_metric
 
-cluster_distance = 800
-    
+
 class ProtoNets(nn.Module):
     """
     Main model class.
@@ -26,13 +25,12 @@ class ProtoNets(nn.Module):
         way = self.way
         prototypes, stds = self._compute_prototypes(context_features, context_labels, way)
 
-        #print("Prototype distances: {}".format(euclidean_metric(prototypes, prototypes)[0][1].item()))
         return self.predict(target_features)
-        
+
     # Will always used saved protoypes and stds
     def predict(self, target_features):
         return self._predict(target_features, self.prototypes, self.stds)
-        
+
     # Will use specified prototypes and stds
     def _predict(self, target_features, class_prototypes, class_stds):
         logits = euclidean_metric(target_features, class_prototypes)
@@ -46,22 +44,12 @@ class ProtoNets(nn.Module):
         prototype_labels = []
         prototype_counts = []
         cluster_stds = []
-        #unpertured_prototype_distance = np.sqrt(cluster_distance)/2.0
-        #unperturbed_symmetric_coords = unpertured_prototype_distance/np.sqrt(2)
-        #prototype_0 = np.array([unperturbed_symmetric_coords, unperturbed_symmetric_coords])
-        #prototype_1 = np.array([-unperturbed_symmetric_coords, -unperturbed_symmetric_coords])
         for c in torch.unique(context_labels):
             class_features = torch.index_select(context_features, 0, self._extract_class_indices(context_labels, c))
             class_mean = torch.mean(class_features, dim=0, keepdim=True)
-            '''
-            if c == 0:
-                class_mean = torch.Tensor(prototype_0).unsqueeze(0).to(context_features.device)
-            else:
-                class_mean = torch.Tensor(prototype_1).unsqueeze(0).to(context_features.device)
-            '''
 
             class_std = torch.std(class_features)
-            #class_std = torch.Tensor([1]).to(context_features.device) #torch.std(class_features)
+
             prototypes.append(class_mean)
             cluster_stds.append(class_std)
             prototype_labels.append(c)
@@ -74,16 +62,16 @@ class ProtoNets(nn.Module):
             self.prototype_labels = prototype_labels
             self.prototype_counts = prototype_counts
             self.stds = cluster_stds
-        
+
         return prototypes, cluster_stds
-        
-        
+
+
     def loo(self, loo_features, loo_labels, target_features, way):
         if self.scale_by_std:
             return self._loo_std_scale(loo_features, loo_labels, target_features, way)
         else:
             return self._loo_efficient(loo_features, loo_labels, target_features, way)
-        
+
     # Subtract the given points from the means. i.e. given points should be left out
     # Doesn't account for potential change in stds
     def _loo_efficient(self, loo_features, loo_labels, target_features, way):
@@ -107,12 +95,12 @@ class ProtoNets(nn.Module):
                     other_prototype = prototypes[index].squeeze()
                     other_prototype_count = self.prototype_counts[index]
                     other_prototype_index = index
-                
-                    
+
+
             if prototype is None:
                 print("Failed to find prototype for label %".format(c))
                 return
-                
+
             class_features = torch.index_select(loo_features, 0, self._extract_class_indices(loo_labels, c))
             prototype = ((prototype * prototype_count) - torch.sum(class_features, dim=0)) / (prototype_count - len(loo_features))
             prototypes[prototype_index] = prototype
@@ -121,8 +109,8 @@ class ProtoNets(nn.Module):
 
         logits = self._predict(target_features, prototypes, self.stds)
         return logits
-        
-        
+
+
     # Recalculate all values with the given points. i.e. points are ones remaining after the ones to be left out have been removed
     def _loo_std_scale(self, loo_features, loo_labels, target_features, way):
         new_prototypes, new_stds = self._compute_prototypes(loo_features, loo_labels, way, save_prototypes=False)

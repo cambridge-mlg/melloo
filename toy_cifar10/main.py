@@ -103,6 +103,8 @@ def cross_entropy(logits, labels, fig_prefix=None, return_worst=-1):
     unreduced_loss = torch.nn.functional.cross_entropy(logits, labels, reduction="none")
 
     if fig_prefix is not None:
+        worst_50 =  torch.topk(unreduced_loss, max_num).indices.tolist()
+        '''
         plt.hist(unreduced_loss.cpu().numpy(), 100, density=True)
         plt.xlabel('Loss')
         plt.title('Histogram of test losses (max {:.3f})'.format(unreduced_loss.max()))
@@ -111,13 +113,13 @@ def cross_entropy(logits, labels, fig_prefix=None, return_worst=-1):
         #print("Top 10 loss indices: {}", worst_indices)
         plt.close()
         max_num = min(len(labels), 50)
-        worst_50 =  torch.topk(unreduced_loss, max_num).indices.tolist()
         plt.hist(unreduced_loss[worst_50].cpu().numpy(), 10, density=True)
         plt.xlabel('Loss')
         plt.title('Histogram of worst {} test losses (max {:.3f})'.format(max_num, unreduced_loss[worst_50].max()))
         plt.grid(True)
         plt.savefig(os.path.join(args.root, fig_prefix.replace(":", "-") + "_worst_loss_hist.png"))
         plt.close()
+        '''
 
     if return_worst > 0:
         worst_indices =  torch.topk(unreduced_loss, return_worst).indices.tolist()
@@ -635,7 +637,7 @@ def do_task(task_num):
     flip_offset = torch.from_numpy(rand.randint(low=1, high=num_classes, size=(len(indices_to_flip)))).type(torch.LongTensor).to(device)
     flipped_train_labels[indices_to_flip] = (flipped_train_labels[indices_to_flip] + flip_offset) % num_classes
 
-    logits = model(train_features, flipped_train_labels, test_features)    
+    logits = model(train_features, flipped_train_labels, test_features)
     predicted_classes_flipped = logits.argmax(axis=1).cpu().numpy()
 
     plot_hist(predicted_classes_flipped, class_bins, "class_distribution_flipped", task_num, 'Predicted classes (flipped)', 'Predicted class label', density=True)
@@ -665,7 +667,7 @@ def do_task(task_num):
     plot_hist(predicted_classes_after_drop, class_bins, "class_distribution_after_drop", task_num, 'Predicted classes after dropping selected', 'Predicted class label', density=True)
     plot_tsne(model, train_features[drop_mask], flipped_train_labels[drop_mask], 'drop_selected_{}'.format(task_num))
     plot_tsne(model, train_features[drop_mask], train_labels[drop_mask], 'drop_selected_true_{}'.format(task_num))
-    
+
     drop_acc, drop_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% dropped', hush=True)
     dropped_accs.append(drop_acc); dropped_losses.append(drop_loss)
 
