@@ -152,8 +152,8 @@ def attentive_linear_classifier(x, param_dict):
     return torch.baddbmm(beta=1.0, alpha=1.0, input=bias, batch1=features, batch2=weights)
 
 
-def cross_entropy_loss(logits, labels):
-    return F.cross_entropy(logits, labels)
+def cross_entropy_loss(logits, labels, reduce=True):
+    return F.cross_entropy(logits, labels, reduce=reduce)
 
 
 def coalesce_labels(labels, mode="by_example"):

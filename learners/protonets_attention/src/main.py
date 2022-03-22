@@ -18,6 +18,7 @@ import math
 import matplotlib
 import matplotlib.pyplot as plt
 import gc
+import matplotlib.patches as mpatches
 
 from scipy.stats import kendalltau
 from sklearn.metrics.pairwise import rbf_kernel
@@ -30,6 +31,16 @@ def convert_to_array(my_list):
     if type(my_list) == np.int32:
         return np.array([my_list])
     return my_list
+
+def convert_to_numpy(x):
+    if torch.is_tensor(x):
+        if x.is_cuda:
+            return x.cpu().numpy()
+        else:
+            return x.numpy()
+    else:
+        return x
+
 
 def move_set_to_cuda(images, labels, device):
         if not images.is_cuda:
@@ -518,6 +529,34 @@ class Learner:
             print("Unsupported kernel aggregation method specified")
             return None
         return representers_agg
+
+    def alternative_loo(self, context_images, context_labels, target_images, target_labels):
+
+        target_classes = target_labels.unique()
+        weights = torch.zeros(len(context_labels))
+
+        full_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+        full_loss = self.loss(full_logits, target_labels)
+
+        with torch.no_grad():
+            for i in range(context_images.shape[0]):
+                if i == 0:
+                    context_images_loo = context_images[i + 1:]
+                    context_labels_loo = context_labels[i + 1:]
+                else:
+                    context_images_loo = torch.cat((context_images[0:i], context_images[i + 1:]), 0)
+                    context_labels_loo = torch.cat((context_labels[0:i], context_labels[i + 1:]), 0)
+
+                if len(context_labels_loo.unique()) < self.args.way:
+                    weights[i] = 10*loss
+                    continue
+
+                logits = self.model(context_images_loo, context_labels_loo, target_images, target_labels, MetaLearningState.META_TEST)
+                loss = self.loss(logits, target_labels)
+                weights[i] = loss
+                
+        return weights
+
 
     def calculate_loo(self,  context_images, context_labels, target_images, target_labels):
         target_classes = target_labels.unique()
@@ -1246,6 +1285,54 @@ class Learner:
         task_dict["noisy_context_indices"] = mislabeled_indices
         return task_dict
         
+
+    
+
+    def plot_hist(self, x, bins, filename, task_num=None, title='', x_label='', y_label='', density=False):
+        x = convert_to_numpy(x)
+        plt.hist(x, bins=bins, density=density)
+        plt.xlabel(x_label)
+        plt.ylabel(y_label)
+        plt.title(title)
+        plt.grid(True)
+        if task_num != None:
+            filename = "{}_".format(task_num) + filename
+        filename += ".png"
+        plt.savefig(os.path.join(self.args.checkpoint_dir, filename))
+        plt.close()
+
+
+
+    def plot_scatter(self, x, y, x_label, y_label, plot_title, output_name, class_labels=None, color=None, split_by_class_label=False, x_min=None, x_max=None, y_min=None, y_max=None):
+        class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
+        x = convert_to_numpy(x)
+        y = convert_to_numpy(y)
+        if class_labels != None:
+            t_color = [class_colors[lbl] for lbl in class_labels]
+            num_classes_local = len(class_labels.unique())
+        else:
+            assert not split_by_class_label
+            assert color != None
+            t_color = color
+            num_classes_local = self.args.way
+
+        if split_by_class_label:
+            x_min, x_max = x.min(), x.max()
+            y_min, y_max = y.min(), y.max()
+            for tc in range(0, num_classes_local):
+                class_mask = (class_labels == tc).cpu().numpy()
+                self.plot_scatter(x[class_mask], y[class_mask], x_label, y_label, plot_title + "_{}".format(tc), output_name + "_{}".format(tc), color = class_colors[tc], 
+                    x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max, split_by_class_label=False)
+
+        handles = [mpatches.Rectangle((0, 0), 1, 1, fc=ccol) for ccol in class_colors ]
+        plt.scatter(x, y, c=t_color)
+        plt.xlabel(x_label)
+        plt.ylabel(y_label)
+        plt.title(plot_title)
+        plt.grid(True)
+        plt.legend(handles, ['Class {}'.format(lbl) for lbl in range(num_classes_local)])
+        plt.savefig(os.path.join(self.args.checkpoint_dir, output_name + ".png"))
+        plt.close()
         
     def detect_noisy_shots(self, path):
         self.logger.print_and_log("")  # add a blank line
@@ -1253,6 +1340,7 @@ class Learner:
         self.model = self.init_model()
         if path != 'None':
             self.model.load_state_dict(torch.load(path))
+
 
         for item in self.test_set:
             accuracies = {}
@@ -1270,12 +1358,16 @@ class Learner:
                 overlaps[mode] = []
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
+                class_bins = list(range(0, self.args.way+1))
+
                 # If mislabelling, then we calculate clean accuracy before doing any mislabeling
                 if self.args.noise_type == "mislabel":
                     context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
                     # Calculate clean accuracy 
                     with torch.no_grad():
                         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                        initial_predictions = target_logits.argmax(axis=1)
+                        self.plot_hist(initial_predictions, bins=class_bins, filename="class_distrib_initial", task_num=ti, title='Predicted classes (initial)', x_label='Predicted class label', density=True)
                         task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                         accuracies_clean.append(task_accuracy)
                         del target_logits
@@ -1295,6 +1387,10 @@ class Learner:
 
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    noisy_predictions = target_logits.argmax(axis=1)
+                    noisy_losses = self.loss(target_logits, target_labels, reduce=False)
+                    self.plot_hist(noisy_predictions, bins=class_bins, filename="class_distrib_noisy", task_num=ti, title='Predicted classes (noisy)', x_label='Predicted class label', density=True)
+
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                     accuracies_noisy.append(task_accuracy)
                     del target_logits
@@ -1322,6 +1418,8 @@ class Learner:
                     print(mode)
                     if mode == 'loo':
                         weights_per_qp['loo'] = self.calculate_loo(context_images, context_labels, target_images, target_labels)
+                        weights_alternative = self.alternative_loo(context_images, context_labels, target_images, target_labels)
+
                     elif mode == 'attention':
                         # Make a copy of the attention weights otherwise we get a reference to what the model is storing
                         with torch.no_grad():
@@ -1347,9 +1445,12 @@ class Learner:
                     elif self.args.selection_mode == "drop":
                         candidate_indices, removed_indices = self.select_by_dropping(weights[key])
                         removed_indices_set = set(removed_indices.tolist())
+                        alt_candidate_indices, alt_removed_indices = self.select_by_dropping(weights_alternative)
+                        alt_removed_indices_set = set(alt_removed_indices.tolist())
+                        assert alt_removed_indices_set == removed_indices_set
                     if removed_indices_set is None:
                         removed_indices_set = set(range(len(context_labels))).difference(set(candidate_indices.tolist()))
-                        
+
                     # Determine overlap between removed candidates and noisy shots
                     overlaps[key].append(float(len(removed_indices_set.intersection(set(task_dict["noisy_context_indices"]))))/float(len(task_dict["noisy_context_indices"])))
                     candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
@@ -1360,6 +1461,13 @@ class Learner:
                     # Calculate accuracy on task using only selected candidates as context points
                     with torch.no_grad():
                         target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
+                        red_predictions = target_logits.argmax(axis=1)
+                        self.plot_hist(red_predictions, bins=class_bins, filename="class_distrib_reduced", task_num=ti, 
+                                title='Predicted classes (reduced, -{})'.format(self.args.way-len(reduced_candidate_labels.unique())), x_label='Predicted class label', density=True)
+                        red_losses = self.loss(target_logits, target_labels, reduce=False)
+
+                        self.plot_scatter(noisy_losses, red_losses, x_label="Loss when context points flipped", y_label="Loss when selected context points are dropped", plot_title="Target Point Losses",
+                            output_name="{}_target_scatter_dropped.png".format(ti), class_labels=reduced_target_labels, split_by_class_label=True)
                         task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels).item()
                         # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
                         task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels)) # TODO: We should add random accuracy back in, not zero.
@@ -1370,6 +1478,10 @@ class Learner:
                     if ti < 10  and self.args.way * self.args.shot <= 100:
                         self.save_image_set(ti, context_images[removed_indices], "removed_by_{}".format(key), labels=context_labels[removed_indices])
                      
+
+                    self.plot_hist(task_dict["true_context_labels"][removed_indices], class_bins, "selected_label_hist_true", ti, 'Classes selected for dropping', 'True class label', 'Num points selected for drop')
+                    self.plot_hist(context_labels[removed_indices], class_bins, "selected_label_hist_flipped", ti, 'Classes selected for dropping', 'Presented class label', 'Num points selected for drop')
+
             if len(accuracies_clean) > 0:
                 self.print_and_log_metric(accuracies_clean, item, 'Clean Accuracy')
             self.print_and_log_metric(accuracies_noisy, item, 'Noisy Accuracy')
