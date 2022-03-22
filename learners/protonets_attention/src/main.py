@@ -1302,6 +1302,32 @@ class Learner:
         plt.close()
 
 
+    def plot_tsne(self, points, labels, prototypes, descrip):
+        class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
+        points = convert_to_numpy(points)
+        labels = convert_to_numpy(labels)
+        prototypes = convert_to_numpy(prototypes)
+        prototype_labels = torch.unique(labels)
+        points = np.concatenate([points, prototypes], axis=0)
+        labels = np.concatenate([labels, prototype_labels], axis=0)
+        perplexities = [30] #[2, 5, 10, 20, 30, 50, 75, 100]
+        learning_rates = [50] #[10.0, 25, 50, 100, 200, 500]
+        for r in learning_rates:
+            for p in perplexities:
+                p_embedded = TSNE(n_components=2, init='random', n_iter=1000, learning_rate=r).fit_transform(points)
+                fig = plt.figure()
+                ax = fig.add_subplot(111)
+                for class_label in range(self.args.way):
+                    class_mask = labels == class_label
+                    # Plot regular points
+                    ax.scatter(p_embedded[class_mask][:-1, 0],p_embedded[class_mask][:-1, 1], label='Class {}'.format(class_label), c=class_colors[class_label])
+                    # Plot prototypes
+                    ax.scatter(p_embedded[class_mask][-1:, 0],p_embedded[class_mask][-1:, 1], c=class_colors[class_label], marker='s')
+
+                plt.legend()
+                plt.savefig(os.path.join(self.args.checkpoint_dir, "tsne_" + descrip.replace(":", "-") + "_perp_{}_lr_{}.png".format(p, r)))
+                plt.close()
+
 
     def plot_scatter(self, x, y, x_label, y_label, plot_title, output_name, class_labels=None, color=None, split_by_class_label=False, x_min=None, x_max=None, y_min=None, y_max=None):
         class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
@@ -1374,6 +1400,8 @@ class Learner:
                     del context_images
                     del target_images
 
+                self.plot_tsne(model.context_features, context_labels, model.prototypes, "{}_tsne_initial".format(ti))
+
                 # Noisiness
                 task_dict = self.make_noisy(task_dict)
                 context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
@@ -1411,7 +1439,8 @@ class Learner:
                     self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     # Make a copy of the target features, otherwise we get a reference to what the model is storing
                     # (and we're about to send another task through it, so that's not what we want)
-                    context_features, target_features = self.model.context_features.cpu(), self.model.target_features.cpu()
+                    context_features, target_features = self.model.context_features.cpu(), self.model.target_features.cpu()                
+                    self.plot_tsne(context_features, context_labels, model.prototypes, "{}_tsne_noisy".format(ti))
                 
                 for mode in ranking_modes:
                     torch.cuda.empty_cache()
@@ -1464,7 +1493,8 @@ class Learner:
                         red_predictions = target_logits.argmax(axis=1)
                         self.plot_hist(red_predictions, bins=class_bins, filename="class_distrib_reduced", task_num=ti, 
                                 title='Predicted classes (reduced, -{})'.format(self.args.way-len(reduced_candidate_labels.unique())), x_label='Predicted class label', density=True)
-                        red_losses = self.loss(target_logits, target_labels, reduce=False)
+                        red_losses = self.loss(target_logits, target_labels, reduce=False)            
+                        self.plot_tsne(model.context_features, candidate_labels, model.prototypes, "{}_tsne_reduced".format(ti))
 
                         self.plot_scatter(noisy_losses, red_losses, x_label="Loss when context points flipped", y_label="Loss when selected context points are dropped", plot_title="Target Point Losses",
                             output_name="{}_target_scatter_dropped.png".format(ti), class_labels=reduced_target_labels, split_by_class_label=True)
