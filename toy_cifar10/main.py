@@ -22,6 +22,7 @@ from helper_classes import euclidean_metric
 from tqdm import tqdm
 from argparse import ArgumentParser
 from PIL import Image
+import matplotlib.patches as mpatches
 
 #torch.use_deterministic_algorithms(True)
 torch.manual_seed(2) #0
@@ -488,6 +489,17 @@ def print_and_log_values(value_list, descrip):
     plt.savefig(os.path.join(args.root, descrip.replace(":", "-") + "_summary_hist.png"))
     plt.close()
 
+
+
+def convert_to_numpy(x):
+    if torch.is_tensor(x):
+        if x.is_cuda:
+            return x.cpu().numpy()
+        else:
+            return x.numpy()
+    else:
+        return x
+
 def plot_hist(x, bins, filename, task_num=None, title='', x_label='', y_label='', density=False):
     x = convert_to_numpy(x)
     plt.hist(x, bins=bins, density=density)
@@ -502,25 +514,35 @@ def plot_hist(x, bins, filename, task_num=None, title='', x_label='', y_label=''
     plt.close()
 
 
-'''
-save_out_indices_protonets = [745, 58, 849, 1553, 106, 1429, 1886, 413, 1249, 1656]
-save_out_indices_mahal = [106, 1149, 58, 1021, 568, 1553, 1989, 745, 939, 1114]
-save_out_other_indices = [0, 1, 2, 3, 4, 1001, 1002, 1003, 1004]
-save_out_images(args.data_root, False, "protonets", save_out_indices_protonets)
-save_out_images(args.data_root, False, "mahal", save_out_indices_mahal)
-save_out_images(args.data_root, False, "sample", save_out_other_indices)
 
-exit()
-'''
-
-def convert_to_numpy(x):
-    if torch.is_tensor(x):
-        if x.is_cuda:
-            return x.cpu().numpy()
-        else:
-            return x.numpy()
+def plot_scatter(x, y, x_label, y_label, plot_title, output_name, class_labels=None, color=None, split_by_class_label=False, x_min=None, x_max=None, y_min=None, y_max=None):
+    class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
+    if class_labels != None:
+        t_color = [class_colors[lbl] for lbl in class_labels]
+        num_classes_local = len(class_labels.unique())
     else:
-        return x
+        assert not split_by_class_label
+        assert color != None
+        t_color = color
+        num_classes_local = num_classes # global
+
+    if split_by_class_label:
+        x_min, x_max = x.min(), x.max()
+        y_min, y_max = y.min(), y.max()
+        for tc in range(0, num_classes_local):
+            class_mask = (class_labels == tc).cpu().numpy()
+            plot_scatter(x[class_mask], y[class_mask], x_label, y_label, plot_title + "_{}".format(tc), output_name + "_{}".format(tc), color = class_colors[tc], 
+                x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max, split_by_class_label=False)
+                
+    handles = [mpatches.Rectangle((0, 0), 1, 1, fc=ccol) for ccol in class_colors ]
+    plt.scatter(x, y, c=t_color)
+    plt.xlabel(x_label')
+    plt.ylabel(y_label)
+    plt.title(plot_title)
+    plt.grid(True)
+    plt.legend(handles, ['Class {}'.format(lbl) for lbl in range(num_classes_local)])
+    plt.savefig(os.path.join(args.root, output_name + ".png"))
+    plt.close()
 
 def plot_tsne(model, points, labels, descrip):
     class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
@@ -690,47 +712,12 @@ def do_task(task_num):
     relabeled_loss_per_target =  torch.nn.functional.cross_entropy(logits, test_labels, reduction="none").cpu().numpy()
     relabelled_model_acc, relabelled_model_loss, _ = print_accuracy(logits, test_labels, f'{args.classifier_type}: {args.flip_fraction*100}% relabeled', hush=True)
     relabeled_accs.append(relabelled_model_acc); relabeled_losses.append(relabelled_model_loss)
-    class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
 
-    x_min, x_max = flipped_loss_per_target.min(), flipped_loss_per_target.max()
-    y_min, y_max = relabeled_loss_per_target.min(), relabeled_loss_per_target.max()
-    for tc in range(0, num_classes):
-        class_mask = (test_labels == tc).cpu().numpy()
-        plt.scatter(flipped_loss_per_target[class_mask], relabeled_loss_per_target[class_mask], c=class_colors[tc])
-        plt.xlim(x_min, x_max)
-        plt.ylim(y_min, y_max)
-        plt.xlabel('Loss when context points flipped')
-        plt.ylabel('Loss when context points relabeled')
-        plt.title('Scatter plot of target point losses (class {})'.format(tc))
-        plt.grid(True)
-        plt.savefig(os.path.join(args.root, "{}_target_scatter_class_{}.png".format(task_num, tc)))
-        plt.close()
+    plot_scatter(flipped_loss_per_target, relabeled_loss_per_target, x_label='Loss when context points flipped', y_label='Loss when selected context points relabeled',
+        plot_title='Scatter plot of target point losses', "{}_target_scatter_relabeled.png".format(task_num), class_labels=test_labels, split_by_class_label=True)
 
-    t_color = [class_colors[lbl] for lbl in test_labels]
-    import matplotlib.patches as mpatches
-
-    handles = [mpatches.Rectangle((0, 0), 1, 1, fc=ccol) for ccol in class_colors ]
-    plt.scatter(flipped_loss_per_target, relabeled_loss_per_target, c=t_color)
-    plt.xlabel('Loss when context points flipped')
-    plt.ylabel('Loss when context points relabeled')
-    plt.title('Scatter plot of target point losses')
-    plt.grid(True)
-
-    plt.legend(handles, ['Class {}'.format(lbl) for lbl in range(num_classes)])
-    plt.savefig(os.path.join(args.root, "{}_target_scatter_relabeled.png".format(task_num)))
-    plt.close()
-
-
-    plt.scatter(flipped_loss_per_target, dropped_loss_per_target, c=t_color)
-    plt.xlabel('Loss when context points flipped')
-    plt.ylabel('Loss when selected context points are dropped')
-    plt.title('Scatter plot of target point losses')
-    plt.grid(True)
-
-    plt.legend(handles, ['Class {}'.format(lbl) for lbl in range(num_classes)])
-    plt.savefig(os.path.join(args.root, "{}_target_scatter_droped.png".format(task_num)))
-    plt.close()
-
+    plot_scatter(flipped_loss_per_target, dropped_loss_per_target, x_label='Loss when context points flipped', y_label='Loss when selected context points are dropped',
+        plot_title='Scatter plot of target point losses', "{}_target_scatter_dropped.png".format(task_num), class_labels=test_labels, split_by_class_label=True)
 
 
     #test_acc = train_logistic_regression_head(train_features, relabeled_train_labels, test_features, test_labels)
@@ -740,8 +727,6 @@ def do_task(task_num):
     logfile.write("{} Num correctly identified: {}\n".format(task_num, num_correctly_identified))
     #logfile.write("Relabelled {} acc: {}\n".format(args.classifier_type, relabelled_model_acc))
     #logfile.write("Relabelled {} loss: {}\n".format(args.classifier_type, relabelled_model_loss))
-
-
 
 for n in tqdm(range(args.num_tasks)):
     do_task(n)
