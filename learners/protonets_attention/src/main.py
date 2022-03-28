@@ -19,6 +19,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import gc
 import matplotlib.patches as mpatches
+from sklearn.manifold import TSNE
 
 from scipy.stats import kendalltau
 from sklearn.metrics.pairwise import rbf_kernel
@@ -1304,10 +1305,10 @@ class Learner:
 
     def plot_tsne(self, points, labels, prototypes, descrip):
         class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
+        prototypes = convert_to_numpy(prototypes)
+        prototype_labels = convert_to_numpy(torch.unique(labels)) # Need the ordering of torch.unique
         points = convert_to_numpy(points)
         labels = convert_to_numpy(labels)
-        prototypes = convert_to_numpy(prototypes)
-        prototype_labels = torch.unique(labels)
         points = np.concatenate([points, prototypes], axis=0)
         labels = np.concatenate([labels, prototype_labels], axis=0)
         perplexities = [30] #[2, 5, 10, 20, 30, 50, 75, 100]
@@ -1392,15 +1393,16 @@ class Learner:
                     # Calculate clean accuracy 
                     with torch.no_grad():
                         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
-                        initial_predictions = target_logits.argmax(axis=1)
-                        self.plot_hist(initial_predictions, bins=class_bins, filename="class_distrib_initial", task_num=ti, title='Predicted classes (initial)', x_label='Predicted class label', density=True)
+                        if ti<10:
+                            initial_predictions = target_logits.argmax(axis=1)
+                            self.plot_hist(initial_predictions, bins=class_bins, filename="class_distrib_initial", task_num=ti, title='Predicted classes (initial)', x_label='Predicted class label', density=True)
                         task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                         accuracies_clean.append(task_accuracy)
                         del target_logits
                     del context_images
                     del target_images
-
-                self.plot_tsne(model.context_features, context_labels, model.prototypes, "{}_tsne_initial".format(ti))
+                if ti<10:
+                    self.plot_tsne(self.model.context_features, context_labels, self.model.prototypes, "{}_tsne_initial".format(ti))
 
                 # Noisiness
                 task_dict = self.make_noisy(task_dict)
@@ -1415,9 +1417,10 @@ class Learner:
 
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
-                    noisy_predictions = target_logits.argmax(axis=1)
-                    noisy_losses = self.loss(target_logits, target_labels, reduce=False)
-                    self.plot_hist(noisy_predictions, bins=class_bins, filename="class_distrib_noisy", task_num=ti, title='Predicted classes (noisy)', x_label='Predicted class label', density=True)
+                    if ti<10:
+                        noisy_predictions = target_logits.argmax(axis=1)
+                        noisy_losses = self.loss(target_logits, target_labels, reduce=False)
+                        self.plot_hist(noisy_predictions, bins=class_bins, filename="class_distrib_noisy", task_num=ti, title='Predicted classes (noisy)', x_label='Predicted class label', density=True)
 
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                     accuracies_noisy.append(task_accuracy)
@@ -1440,7 +1443,8 @@ class Learner:
                     # Make a copy of the target features, otherwise we get a reference to what the model is storing
                     # (and we're about to send another task through it, so that's not what we want)
                     context_features, target_features = self.model.context_features.cpu(), self.model.target_features.cpu()                
-                    self.plot_tsne(context_features, context_labels, model.prototypes, "{}_tsne_noisy".format(ti))
+                    if ti<10:
+                        self.plot_tsne(context_features, context_labels, self.model.prototypes, "{}_tsne_noisy".format(ti))
                 
                 for mode in ranking_modes:
                     torch.cuda.empty_cache()
@@ -1490,14 +1494,15 @@ class Learner:
                     # Calculate accuracy on task using only selected candidates as context points
                     with torch.no_grad():
                         target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
-                        red_predictions = target_logits.argmax(axis=1)
-                        self.plot_hist(red_predictions, bins=class_bins, filename="class_distrib_reduced", task_num=ti, 
-                                title='Predicted classes (reduced, -{})'.format(self.args.way-len(reduced_candidate_labels.unique())), x_label='Predicted class label', density=True)
-                        red_losses = self.loss(target_logits, target_labels, reduce=False)            
-                        self.plot_tsne(model.context_features, candidate_labels, model.prototypes, "{}_tsne_reduced".format(ti))
+                        if ti<10:
+                            red_predictions = target_logits.argmax(axis=1)
+                            self.plot_hist(red_predictions, bins=class_bins, filename="class_distrib_reduced", task_num=ti, 
+                                    title='Predicted classes (reduced, -{})'.format(self.args.way-len(reduced_candidate_labels.unique())), x_label='Predicted class label', density=True)
+                            red_losses = self.loss(target_logits, target_labels, reduce=False)            
+                            self.plot_tsne(self.model.context_features, candidate_labels, self.model.prototypes, "{}_tsne_reduced".format(ti))
 
-                        self.plot_scatter(noisy_losses, red_losses, x_label="Loss when context points flipped", y_label="Loss when selected context points are dropped", plot_title="Target Point Losses",
-                            output_name="{}_target_scatter_dropped.png".format(ti), class_labels=reduced_target_labels, split_by_class_label=True)
+                            self.plot_scatter(noisy_losses, red_losses, x_label="Loss when context points flipped", y_label="Loss when selected context points are dropped", plot_title="Target Point Losses",
+                                output_name="{}_target_scatter_dropped.png".format(ti), class_labels=reduced_target_labels, split_by_class_label=True)
                         task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels).item()
                         # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
                         task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels)) # TODO: We should add random accuracy back in, not zero.
@@ -1507,10 +1512,8 @@ class Learner:
                         # Save out the selected candidates (?)
                     if ti < 10  and self.args.way * self.args.shot <= 100:
                         self.save_image_set(ti, context_images[removed_indices], "removed_by_{}".format(key), labels=context_labels[removed_indices])
-                     
-
-                    self.plot_hist(task_dict["true_context_labels"][removed_indices], class_bins, "selected_label_hist_true", ti, 'Classes selected for dropping', 'True class label', 'Num points selected for drop')
-                    self.plot_hist(context_labels[removed_indices], class_bins, "selected_label_hist_flipped", ti, 'Classes selected for dropping', 'Presented class label', 'Num points selected for drop')
+                        self.plot_hist(task_dict["true_context_labels"][removed_indices], class_bins, "selected_label_hist_true", ti, 'Classes selected for dropping', 'True class label', 'Num points selected for drop')
+                        self.plot_hist(context_labels[removed_indices], class_bins, "selected_label_hist_flipped", ti, 'Classes selected for dropping', 'Presented class label', 'Num points selected for drop')
 
             if len(accuracies_clean) > 0:
                 self.print_and_log_metric(accuracies_clean, item, 'Clean Accuracy')
