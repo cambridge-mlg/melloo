@@ -100,7 +100,7 @@ def add_image_rankings(image_ranking_dict, image_key, image, ranking_key, rankin
     
 def weights_from_multirankings(image_ranking_dict, ranking_key):
     agg_ranking = torch.zeros(len(image_ranking_dict.keys()))
-    image_ids = np.zeros(len(agg_ranking), dtype=np.int)
+    image_ids = np.zeros(len(agg_ranking), dtype=int)
     # For each image
     for i, img_id in enumerate(image_ranking_dict.keys()):
         agg_ranking[i] = image_ranking_dict[img_id][ranking_key].sum().item()
@@ -149,6 +149,8 @@ class Learner:
                 assert self.args.top_k <= self.args.shot
             else :
                 assert self.args.top_k <= self.args.shot * self.args.way
+            assert self.args.selection_mode != "drop"
+        elif self.args.task_type == "generate_coreset":
             assert self.args.selection_mode != "drop"
         else:
             assert self.args.spread_constraint == "none"
@@ -668,7 +670,6 @@ class Learner:
         self.model = self.init_model()
         if path != 'None':
             self.model.load_state_dict(torch.load(path))
-
         ranking_mode = self.args.importance_mode  
         save_out_interval = 500
         if self.args.tasks <= 1000:
@@ -796,6 +797,7 @@ class Learner:
         self.logger.print_and_log("")  # add a blank line
         self.logger.print_and_log('Generating coreset (full scoring) using model {0:}: '.format(path))
         self.model = self.init_model()
+
         if path != 'None':
             self.model.load_state_dict(torch.load(path))
 
@@ -803,7 +805,7 @@ class Learner:
             accuracies_full = []
             accuracies = {}
             if self.args.importance_mode == 'all':
-                ranking_modes = ['loo', 'attention', 'representer', 'random']
+                ranking_modes = ['loo', 'random'] #'attention', 'representer', 'random']
             else:
                 ranking_modes = [self.args.importance_mode]
                 
@@ -813,30 +815,26 @@ class Learner:
             for mode in ranking_modes:
                 accuracies[mode] = []
                 
-            if self.args.test_case == "bimodal":
-                num_unique_labels = {}
-                for mode in ranking_modes:
-                    num_unique_labels[mode] = 0
-
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
+                #import pdb; pdb.set_trace()
+
                 task_dict = self.dataset.get_test_task(item)
                 context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
-                if self.args.test_case == "bimodal":
-                    context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
-                    context_labels = context_labels.floor_divide(2)
-                    target_labels = target_labels.floor_divide(2)
 
-                rankings_per_qp = {}
+                #rankings_per_qp = {}
                 weights_per_qp = {}
-                rankings = {}
+                #rankings = {}
                 weights = {}
                 
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                     accuracies_full.append(task_accuracy)
+                    if ti < 50 and self.args.way <= 10:
+                        self.plot_tsne(self.model.context_features, context_labels, self.model.prototypes, "{}_tsne_initial_coreset_{:.3}".format(ti, task_accuracy))
+
                     del target_logits
-                
+
                 # Save the target/context features
                 # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
                 with torch.no_grad():
@@ -860,49 +858,48 @@ class Learner:
                         weights_per_qp['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
                     elif mode == 'random':
                         weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
-                    rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
+                    #rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
                     # May want to normalize here:
                     weights[mode] = weights_per_qp[mode].sum(dim=0)
-                    rankings[mode] = torch.argsort(weights[mode], descending=True)
-                    normalized_rankings = rankings[mode]/(rankings[mode].max() - rankings[mode].min())
+                    #rankings[mode] = torch.argsort(weights[mode], descending=True)
+                    min_weight, max_weight = weights[mode].min(), weights[mode].max()
+                    normalized_weights = (weights[mode] - min_weight)/(max_weight - min_weight)
                     for i in range(len(context_images)):
-                        image_rankings = add_image_rankings(image_rankings, task_dict["context_ids"][i], context_images[i], mode, normalized_rankings[i])
+                        image_rankings = add_image_rankings(image_rankings, task_dict["context_ids"][i], context_images[i], mode, normalized_weights[i])
 
-            self.print_and_log_metric(accuracies_full, item, 'Accuracy')
-            if self.args.test_case == "bimodal":
-                for key in num_unique_labels.keys():
-                    self.logger.print_and_log("Average number of unique labels ({}): {}".format(key, float(num_unique_labels[key])/float(self.args.tasks)))
+            #import pdb; pdb.set_trace()
+            self.print_and_log_metric(accuracies_full, item, 'Full Accuracy')
 
             # Righty-oh, now that we have our image_rankings, we need to do something with them.
             # Let's get some basic stats about them;
             # Aggregate to get indices.
 
             pickle.dump(image_rankings, open(os.path.join(self.args.checkpoint_dir, "rankings.pickle"), "wb"))
-
-            for key in rankings.keys():
-                weights, image_ids = weights_from_multirankings(image_rankings, key)
-                candidate_indices = self.select_top_k(weights)
+            
+            for mode in ranking_modes:
+                weights, image_ids = weights_from_multirankings(image_rankings, mode)
+                image_labels = self.dataset.get_labels_from_ids(image_ids)
+                candidate_indices = self.select_top_k(weights, image_labels)
                 candidate_ids = image_ids[candidate_indices]
+                candidate_labels = image_labels[candidate_indices]
+                self.logger.log("{} candidate labels: {}".format(mode, candidate_labels))
                 # Evaluate those indices:
                 eval_accuracies = []
-                for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
+                for ti in tqdm(range(50), dynamic_ncols=True):
                     task_dict = self.dataset.get_task_from_ids(candidate_ids)
                     context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
-                    if self.args.test_case == "bimodal":
-                        context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
-                        context_labels = context_labels.floor_divide(2)
-                        target_labels = target_labels.floor_divide(2)
-                    
-                    if ti == 0:
-                        self.save_image_set(ti, context_images, "selected_{}".format(key))
-                    
+
                     with torch.no_grad():
                         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                         task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                         eval_accuracies.append(task_accuracy)
+                        if ti == 0:
+                            self.plot_tsne(self.model.context_features, context_labels, self.model.prototypes, "{}_tsne_candidate_coreset_{:.3}".format(mode, task_accuracy))
+                            self.save_image_set(ti, context_images, "selected_{}".format(mode))
+
                         del target_logits
                     
-                self.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy ({})'.format(key))
+                self.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy ({})'.format(mode))
 
     def _funky_bimodal_inner_loop(self, context_images, context_labels, context_labels_orig, target_images, target_labels, ranking_modes, accuracies, num_unique_labels, ti, descrip):
         full_accuracy = -1
@@ -1214,7 +1211,10 @@ class Learner:
         num_classes = len(np.unique(task_dict["target_labels"]))
         num_context_images = len(task_dict["context_labels"])
         
-        new_context_labels = task_dict["context_labels"].copy()
+        if torch.is_tensor(task_dict["context_labels"]):
+            new_context_labels = task_dict["context_labels"].clone()
+        else:
+            new_context_labels = task_dict["context_labels"].copy()
         if self.args.noise_type == "mislabel":
             num_noisy = max(1, int(self.args.error_rate * num_context_images))
             assert num_noisy < num_context_images
@@ -1304,7 +1304,7 @@ class Learner:
 
 
     def plot_tsne(self, points, labels, prototypes, descrip):
-        class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
+        class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c", "#323ca8", "#ff0303", "#03ffc4", "#afff03", "#a566e3"]
         prototypes = convert_to_numpy(prototypes)
         prototype_labels = convert_to_numpy(torch.unique(labels)) # Need the ordering of torch.unique
         points = convert_to_numpy(points)
@@ -1393,16 +1393,17 @@ class Learner:
                     # Calculate clean accuracy 
                     with torch.no_grad():
                         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
-                        if ti<10:
-                            initial_predictions = target_logits.argmax(axis=1)
-                            self.plot_hist(initial_predictions, bins=class_bins, filename="class_distrib_initial", task_num=ti, title='Predicted classes (initial)', x_label='Predicted class label', density=True)
                         task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                         accuracies_clean.append(task_accuracy)
+
+                        if ti<50:
+                            initial_predictions = target_logits.argmax(axis=1)
+                            self.plot_hist(initial_predictions, bins=class_bins, filename="class_distrib_initial", task_num=ti, title='Predicted classes (initial)', x_label='Predicted class label', density=True)
+                            self.plot_tsne(self.model.context_features, context_labels, self.model.prototypes, "{}_tsne_initial_{:.3}_acc".format(ti, task_accuracy))
+
                         del target_logits
                     del context_images
                     del target_images
-                if ti<10:
-                    self.plot_tsne(self.model.context_features, context_labels, self.model.prototypes, "{}_tsne_initial".format(ti))
 
                 # Noisiness
                 task_dict = self.make_noisy(task_dict)
@@ -1417,13 +1418,15 @@ class Learner:
 
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
-                    if ti<10:
+                    task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
+                    accuracies_noisy.append(task_accuracy)
+
+                    if ti<50:
                         noisy_predictions = target_logits.argmax(axis=1)
                         noisy_losses = self.loss(target_logits, target_labels, reduce=False)
                         self.plot_hist(noisy_predictions, bins=class_bins, filename="class_distrib_noisy", task_num=ti, title='Predicted classes (noisy)', x_label='Predicted class label', density=True)
+                        self.plot_tsne(self.model.context_features, context_labels, self.model.prototypes, "{}_tsne_noisy_{:.3}_acc".format(ti, task_accuracy))
 
-                    task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
-                    accuracies_noisy.append(task_accuracy)
                     del target_logits
                     gc.collect()
 
@@ -1443,15 +1446,12 @@ class Learner:
                     # Make a copy of the target features, otherwise we get a reference to what the model is storing
                     # (and we're about to send another task through it, so that's not what we want)
                     context_features, target_features = self.model.context_features.cpu(), self.model.target_features.cpu()                
-                    if ti<10:
-                        self.plot_tsne(context_features, context_labels, self.model.prototypes, "{}_tsne_noisy".format(ti))
                 
                 for mode in ranking_modes:
                     torch.cuda.empty_cache()
                     print(mode)
                     if mode == 'loo':
                         weights_per_qp['loo'] = self.calculate_loo(context_images, context_labels, target_images, target_labels)
-                        weights_alternative = self.alternative_loo(context_images, context_labels, target_images, target_labels)
 
                     elif mode == 'attention':
                         # Make a copy of the attention weights otherwise we get a reference to what the model is storing
@@ -1478,9 +1478,6 @@ class Learner:
                     elif self.args.selection_mode == "drop":
                         candidate_indices, removed_indices = self.select_by_dropping(weights[key])
                         removed_indices_set = set(removed_indices.tolist())
-                        alt_candidate_indices, alt_removed_indices = self.select_by_dropping(weights_alternative)
-                        alt_removed_indices_set = set(alt_removed_indices.tolist())
-                        assert alt_removed_indices_set == removed_indices_set
                     if removed_indices_set is None:
                         removed_indices_set = set(range(len(context_labels))).difference(set(candidate_indices.tolist()))
 
@@ -1494,23 +1491,24 @@ class Learner:
                     # Calculate accuracy on task using only selected candidates as context points
                     with torch.no_grad():
                         target_logits = self.model(candidate_images, reduced_candidate_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
-                        if ti<10:
-                            red_predictions = target_logits.argmax(axis=1)
-                            self.plot_hist(red_predictions, bins=class_bins, filename="class_distrib_reduced", task_num=ti, 
-                                    title='Predicted classes (reduced, -{})'.format(self.args.way-len(reduced_candidate_labels.unique())), x_label='Predicted class label', density=True)
-                            red_losses = self.loss(target_logits, target_labels, reduce=False)            
-                            self.plot_tsne(self.model.context_features, candidate_labels, self.model.prototypes, "{}_tsne_reduced".format(ti))
-
-                            self.plot_scatter(noisy_losses, red_losses, x_label="Loss when context points flipped", y_label="Loss when selected context points are dropped", plot_title="Target Point Losses",
-                                output_name="{}_target_scatter_dropped.png".format(ti), class_labels=reduced_target_labels, split_by_class_label=True)
                         task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels).item()
                         # Add the things that were incorrectly classified by default, because they weren't represented in the candidate context set
                         task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels)) # TODO: We should add random accuracy back in, not zero.
                         accuracies[key].append(task_accuracy)
+
+                        if ti<50:
+                            red_predictions = target_logits.argmax(axis=1)
+                            self.plot_hist(red_predictions, bins=class_bins, filename="class_distrib_reduced", task_num=ti, 
+                                    title='Predicted classes (reduced, -{})'.format(self.args.way-len(reduced_candidate_labels.unique())), x_label='Predicted class label', density=True)
+                            red_losses = self.loss(target_logits, target_labels, reduce=False)            
+                            self.plot_tsne(self.model.context_features, candidate_labels, self.model.prototypes, "{}_tsne_reduced_{:.3}_acc".format(ti, task_accuracy))
+
+                            self.plot_scatter(noisy_losses, red_losses, x_label="Loss when context points flipped", y_label="Loss when selected context points are dropped", plot_title="Target Point Losses",
+                                output_name="{}_target_scatter_dropped.png".format(ti), class_labels=reduced_target_labels, split_by_class_label=True)
                         del target_logits
                             
                         # Save out the selected candidates (?)
-                    if ti < 10  and self.args.way * self.args.shot <= 100:
+                    if ti < 50  and self.args.way * self.args.shot <= 100:
                         self.save_image_set(ti, context_images[removed_indices], "removed_by_{}".format(key), labels=context_labels[removed_indices])
                         self.plot_hist(task_dict["true_context_labels"][removed_indices], class_bins, "selected_label_hist_true", ti, 'Classes selected for dropping', 'True class label', 'Num points selected for drop')
                         self.plot_hist(context_labels[removed_indices], class_bins, "selected_label_hist_flipped", ti, 'Classes selected for dropping', 'Presented class label', 'Num points selected for drop')
