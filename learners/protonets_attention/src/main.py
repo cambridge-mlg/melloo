@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 import gc
 import matplotlib.patches as mpatches
 from sklearn.manifold import TSNE
+import sklearn.metrics
 
 from scipy.stats import kendalltau
 from sklearn.metrics.pairwise import rbf_kernel
@@ -664,7 +665,22 @@ class Learner:
 
             self.save_image_set(0, context_images, "selected_{}".format(key))
 
+    def plot_confusion_matrix(self, true_labels, filename, logits=None, pred_labels=None):
+        labels = true_labels.cpu()
+        if logits is not None:
+            preds = logits.argmax(axis=1).cpu()
+        else:
+            preds = pred_labels.cpu()
+        cm = sklearn.metrics.confusion_matrix(labels, preds)
+        cm = cm.transpose()
+        plt.matshow(cm.transpose())
+        for (x, y), value in np.ndenumerate(cm):
+            plt.text(x, y, f"{value:d}", va="center", ha="center")
+        plt.savefig(os.path.join(self.args.checkpoint_dir, filename))
+        plt.close()
+
     def generate_coreset_discard(self, path):
+        #import pdb; pdb.set_trace()
         self.logger.print_and_log("")  # add a blank line
         self.logger.print_and_log('Generating coreset (by discard) using model {0:}: '.format(path))
         self.model = self.init_model()
@@ -687,18 +703,19 @@ class Learner:
             if self.args.importance_mode == 'all':
                 self.print_and_log_metric("Error - coreset construction by discard does not support doing all importance modes simultaneously")
                 return  
-            
             # Start with the original, random context set
             task_dict = self.dataset.get_test_task(item)
             context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
             image_ids = task_dict["context_ids"]
-            
+            no_drop_count = 0
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                     accuracies.append(task_accuracy)
+                    if ti % save_out_interval == 0 or ti == self.args.tasks-1:
+                        self.plot_confusion_matrix(target_labels, "confusion_{}.png".format(ti), logits=target_logits)
                     del target_logits
 
                 one_hot = torch.nn.functional.one_hot(context_labels).to("cpu")
@@ -730,7 +747,6 @@ class Learner:
                 # May want to normalize here:
                 weights = weight_per_qp.sum(dim=0)
                 rankings = torch.argsort(weights, descending=True)
-                normalized_rankings = rankings/(rankings.max() - rankings.min())
                 
                 # Discard least valuable point/s
                 candidate_indices, dropped_indices = self.select_by_dropping(weights, use_top_k=True)
@@ -738,12 +754,11 @@ class Learner:
                 dropped_ids = image_ids[dropped_indices]
                 self.dataset.mark_discarded(dropped_ids)
                 
-                if ti % save_out_interval == 0:
-                    self.save_image_set(ti, context_images[candidate_indices], "keep_{}".format(ti), labels=context_labels[candidate_indices])
-                    self.save_image_set(ti, context_images[dropped_indices], "discard_{}".format(ti), labels=context_labels[dropped_indices])
-                    self.save_image_set(ti, target_images, "target_{}".format(ti), labels=target_labels)
+                old_images = context_images[dropped_indices].clone()
+                old_labels = context_labels[dropped_indices].clone()
                     
-                if ti < self.args.tasks -1:
+                ti_start = ti
+                while ti < self.args.tasks - 1:
                     # Request new points to replace those
                     new_images, new_labels, new_ids = self.dataset.sample_new_context_points(self.args.top_k)
                     # Re-prepare data
@@ -753,26 +768,57 @@ class Learner:
                         context_images[dropped_indices[i]] = new_images[i]
                         context_labels[dropped_indices[i]] = new_labels[i]
                         image_ids[dropped_indices[i]] = id
+
+                    # Try the new points; if it's worse, swap the old ones back in
+                    new_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    new_accuracy = self.accuracy_fn(new_logits, target_labels).item()
+                    if new_accuracy >= accuracies[-1]:
+                        # New task improves or is equal to old accuracy; continue with loo 
+                        break
+                        #for i in range(len(old_images)):
+                        #  context_images[dropped_indices[i]] = old_images[i]
+                        #  context_labels[dropped_indices[i]] = old_labels[i]
+                        #dropped_indices = None
+                    else:
+                        no_drop_count += 1
+                        ti += 1
+
+
+                if ti % save_out_interval == 0 or (ti - ti_start > save_out_interval):
+                    self.save_image_set(ti, context_images[candidate_indices], "keep_{}".format(ti), labels=context_labels[candidate_indices])
+                    self.save_image_set(ti, old_images, "discard_{}".format(ti), labels=old_labels)
+                    self.save_image_set(ti, context_images[dropped_indices], "new_{}".format(ti), labels=context_labels[dropped_indices])
+                    self.save_image_set(ti, target_images, "target_{}".format(ti), labels=target_labels)
+
+
                     # Remove the old points, replace with new points
 
                     # Get new query set as well
-                    if ti == int(self.args.tasks/2):
-                        target_images, target_labels, _ = self.dataset.get_query_set()
-                        target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
+                    #if ti == int(self.args.tasks/2):
+                    #    target_images, target_labels, _ = self.dataset.get_query_set()
+                    #    target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
 
             eval_accuracies = []
             num_eval_tasks = 100
+            eval_predictions = []
+            eval_labels = []
             for te in range(num_eval_tasks):
                 with torch.no_grad():
                     target_images, target_labels, _ = self.dataset.get_query_set()
+                    eval_labels.append(target_labels.cpu())
                     target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    eval_predictions.append(target_logits.argmax(axis=1).cpu())
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                     eval_accuracies.append(task_accuracy)
                     del target_logits
-
+            all_eval_labels = torch.cat(eval_labels)
+            all_eval_predictions = torch.cat(eval_predictions)
+            self.plot_confusion_matrix(all_eval_labels, pred_labels=all_eval_predictions, filename="confusion_eval.png")
+            
             self.print_and_log_metric(accuracies, item, 'Accuracy')
             self.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy')
+            self.logger.print_and_log("Number of no_drop iterations: {}".format(no_drop_count))
             self.save_image_set(ti, context_images, "context_final".format(ti), labels=context_labels)
             self.plot_and_log(accuracies, "Accuracies over tasks", "accuracies.png")
             self.plot_and_log(entropies, "Entropy of context labels", "entropy.png")
@@ -816,8 +862,6 @@ class Learner:
                 accuracies[mode] = []
                 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
-                #import pdb; pdb.set_trace()
-
                 task_dict = self.dataset.get_test_task(item)
                 context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
 

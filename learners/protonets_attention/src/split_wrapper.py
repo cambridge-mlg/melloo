@@ -140,8 +140,9 @@ class IdentifiableDatasetWrapper:
         # Not implemented
         return None
 
-    def get_test_task(self, *args):
-        self.current_context_mapping = reset_empty_class_mapings(self.context_data, self.current_context_mapping, self.shot)
+    def get_test_task(self, *args, mutate_context_mapping=True):
+        if mutate_context_mapping:
+            self.current_context_mapping = reset_empty_class_mapings(self.context_data, self.current_context_mapping, self.shot)
 
         c_avail = available_classes(self.current_context_mapping)
 
@@ -152,10 +153,10 @@ class IdentifiableDatasetWrapper:
 
 
         task_dict = {}
-        task_dict["context_images"], unnormalized_context_labels, task_dict["context_ids"] = self._construct_context_set(c_avail)
+        task_dict["context_images"], unnormalized_context_labels, task_dict["context_ids"] = self._construct_context_set(c_avail, mutate_context_mapping=mutate_context_mapping)
         # Use our custom, order-preserving unique function
         chosen_classes = unique(unnormalized_context_labels)
-        task_dict["target_images"], unnormalized_target_labels, task_dict["target_ids"] = self._construct_query_set(chosen_classes)
+        task_dict["target_images"], unnormalized_target_labels, task_dict["target_ids"] = self._construct_query_set(chosen_classes, remove_from_available=True)
 
         # If all classes are represented, don't renormalize
         if len(chosen_classes) == len(self.context_data.classes):
@@ -188,7 +189,7 @@ class IdentifiableDatasetWrapper:
         task_dict["target_images"], task_dict["target_labels"], _ = self._construct_query_set(full_test_classes)
         return task_dict
 
-    def _construct_query_set(self, task_classes):
+    def _construct_query_set(self, task_classes, remove_from_available=False):
         task_way = len(task_classes)
         task_images = torch.zeros(self._query_task_shape(task_way*self.query_shot), dtype=torch.float32)
         task_labels = torch.zeros(self.query_shot*task_way, dtype=torch.long)
@@ -205,9 +206,11 @@ class IdentifiableDatasetWrapper:
                 task_labels[t] = label
                 task_ids[t] = c_indices[i]
                 t += 1
+            if remove_from_available:
+                self.query_mapping[c] = np.delete(self.query_mapping[c], pattern_indices)
         return task_images, task_labels, task_ids
 
-    def _construct_context_set(self, possible_classes):
+    def _construct_context_set(self, possible_classes, mutate_context_mapping=True):
         # Choose the classes for the task
         try:
             task_classes = rng.choice(possible_classes, size=self.way, replace=False)
@@ -235,27 +238,44 @@ class IdentifiableDatasetWrapper:
                 task_ids[t] = c_indices[i]
                 t += 1
             # Remove selected patterns from list of available patterns to choose from
-            self.current_context_mapping[c] = np.delete(self.current_context_mapping[c], pattern_indices)
+            if mutate_context_mapping:
+                self.current_context_mapping[c] = np.delete(self.current_context_mapping[c], pattern_indices)
         return task_images, task_labels, task_ids
 
 
 class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
     def __init__(self, dataset_path, dataset_name, way, shot, query_shot):
         IdentifiableDatasetWrapper.__init__(self, dataset_path, dataset_name, way, shot, query_shot)
-        num_context_images = len(self.context_data.targets)
+
+        # Construct list of drawable ids from current_context_mapping
         self.current_context_ids = []
-        self.drawable_context_ids = list(range(num_context_images))
-        self.rounds_not_discarded = np.zeros(num_context_images)
+        self.drawable_context_ids = self._reset_drawable_ids()
+        self.rounds_not_discarded = {}
         self.returned_label_counts = {}
+
+    def _reset_drawable_ids(self):
+        #import pdb; pdb.set_trace()
+        drawable_ids = []
+        for cl in range(len(self.context_data.classes)):
+            drawable_ids = drawable_ids + self.current_context_mapping[cl]
+        
+        # If some points are currently issued, remove them from the drawable list
+        if len(self.current_context_ids) > 0:
+            for context_id in self.current_context_ids:
+                drawable_ids.remove(context_id)
+
+        return drawable_ids
+
 
     # For the ValueTracking dataset wrapper, the requested way should match actual classes
     def get_test_task(self, *args):
         assert self.way == len(self.context_data.classes)
-        task_dict = IdentifiableDatasetWrapper.get_test_task(self, *args)
+        task_dict = IdentifiableDatasetWrapper.get_test_task(self, *args, mutate_context_mapping=False)
         # Track what images are currently in rotation
         self.current_context_ids = task_dict["context_ids"].tolist()
         # Mark the selected context images so that we don't swap them in multiple times
         for i, context_id in enumerate(self.current_context_ids):
+            assert context_id in self.drawable_context_ids
             self.drawable_context_ids.remove(context_id)
             if task_dict["context_labels"][i].item() in self.returned_label_counts:
                 self.returned_label_counts[task_dict["context_labels"][i].item()] += 1
@@ -269,36 +289,56 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
         # Increase count for images not discarded this round
         current_context_set = set(self.current_context_ids)
         not_discarded_ids = list(current_context_set.difference(set(image_ids)))
-        self.rounds_not_discarded[not_discarded_ids] += 1
+        for nd_id in not_discarded_ids:
+            if nd_id in self.rounds_not_discarded.keys():
+                self.rounds_not_discarded[nd_id] += 1
+            else:
+                self.rounds_not_discarded[nd_id] = 1
         try:
             # Remove discarded from context set
             for image_id in image_ids:
                 self.current_context_ids.remove(image_id)
         except ValueError:
             import pdb; pdb.set_trace()
+    
+    def _calculate_available_class_distrib(self):
+        class_counts = {}
+        for id in self.drawable_context_ids:
+            _, label = self.context_data[id]
+            #label = label.item()
+            if label in class_counts.keys():
+                class_counts[label] += 1
+            else:
+                class_counts[label] = 1
+
+        return class_counts
+            
 
     def sample_new_context_points(self, num_points_requested):
         # Check whether there are new points to propose
         # If not, reset the list of drawables, excluding current selection
         if len(self.drawable_context_ids) < num_points_requested:
-            self.drawable_context_ids = list(range(len(self.context_data)))
-            for context_id in self.current_context_ids:
-                self.drawable_context_ids.remove(context_id)
+            self.drawable_context_ids = self._reset_drawable_ids()
 
-        indices = rng.choice(self.drawable_context_ids, size=num_points_requested, replace=False)
-        for index in indices:
-            self.drawable_context_ids.remove(index)
-        self.current_context_ids = self.current_context_ids + indices.tolist()
+        #import pdb; pdb.set_trace()
+        #class_distribs = self._calculate_available_class_distrib()
+        #print(class_distribs)
+
+        new_ids = rng.choice(self.drawable_context_ids, size=num_points_requested, replace=False)
+        for id in new_ids:
+            self.drawable_context_ids.remove(id)
+        self.current_context_ids = self.current_context_ids + new_ids.tolist()
 
         context_images = torch.zeros(self._context_task_shape(num_points_requested))
         context_labels = torch.zeros(num_points_requested, dtype=torch.long)
-        for i, id in enumerate(indices):
+        for i, id in enumerate(new_ids):
             context_images[i], context_labels[i] = self.context_data[id]
             if context_labels[i].item() in self.returned_label_counts:
                 self.returned_label_counts[context_labels[i].item()] += 1
             else:
                 self.returned_label_counts[context_labels[i].item()] = 1
-        return context_images, context_labels, indices
+        #print(context_labels)
+        return context_images, context_labels, new_ids
 
     def get_query_set(self):
         return self._construct_query_set(range(len(self.query_data.classes)))
