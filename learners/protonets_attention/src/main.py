@@ -699,7 +699,9 @@ class Learner:
 
         for item in self.test_set:
             accuracies = []
+            losses = []
             entropies = []
+            #restart_checkpoints = []
             if self.args.importance_mode == 'all':
                 self.print_and_log_metric("Error - coreset construction by discard does not support doing all importance modes simultaneously")
                 return  
@@ -713,7 +715,9 @@ class Learner:
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
+                    task_loss = self.loss(target_logits, target_labels, reduce=True).item()
                     accuracies.append(task_accuracy)
+                    losses.append(losses)
                     if ti % save_out_interval == 0 or ti == self.args.tasks-1:
                         self.plot_confusion_matrix(target_labels, "confusion_{}.png".format(ti), logits=target_logits)
                     del target_logits
@@ -764,25 +768,41 @@ class Learner:
                     # Re-prepare data
                     new_images, new_labels = move_set_to_cuda(new_images, new_labels, self.device)
 
-                    for i, id in enumerate(new_ids):
+                    for i, idd in enumerate(new_ids):
                         context_images[dropped_indices[i]] = new_images[i]
                         context_labels[dropped_indices[i]] = new_labels[i]
-                        image_ids[dropped_indices[i]] = id
+                        image_ids[dropped_indices[i]] = idd
 
                     # Try the new points; if it's worse, swap the old ones back in
                     new_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    new_loss = self.loss(new_logits, target_labels, reduce=True).item()
                     new_accuracy = self.accuracy_fn(new_logits, target_labels).item()
-                    if new_accuracy >= accuracies[-1]:
+                    #TODO: Do we want to compare accuracies or losses? I wouldn't thought losses...
+                    if new_loss <= losses[-1]:
                         # New task improves or is equal to old accuracy; continue with loo 
                         break
-                        #for i in range(len(old_images)):
-                        #  context_images[dropped_indices[i]] = old_images[i]
-                        #  context_labels[dropped_indices[i]] = old_labels[i]
-                        #dropped_indices = None
                     else:
                         no_drop_count += 1
                         ti += 1
-
+                        '''
+                        # If we've gone 5 or more iterations without dropping anything, do a random restart
+                        if no_drop_count >= 10:
+                            # Swap the old ones back in
+                            for i in range(dropped_ids):
+                              image_ids[dropped_indices[i]] = dropped_ids[i]
+                            # Save current context set
+                            # Save this context set's loss
+                            current_info = {"context_ids": np.copy(image_ids), "accuracy": accuracies[-1], "loss": losses[-1]}
+                            # reset drop count
+                            no_drop_count = 0;
+                            # Request whole new context set
+                            context_images, context_labels, image_ids = self.dataset.sample_new_context_points(context_images.shape[0])
+                            # Re-prepare data
+                            context_images, context_labels = move_set_to_cuda(context_images, context_labels, self.device)
+                            # Discard current context set (in that order so that there's no chance of getting re-issued points from the current context set)
+                            self.dataset.mark_discarded(current_info["context_ids"])
+                            restart_checkpoints.append(current_info)
+                        '''
 
                 if ti % save_out_interval == 0 or (ti - ti_start > save_out_interval):
                     self.save_image_set(ti, context_images[candidate_indices], "keep_{}".format(ti), labels=context_labels[candidate_indices])
