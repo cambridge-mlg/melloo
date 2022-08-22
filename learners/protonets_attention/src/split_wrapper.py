@@ -140,7 +140,9 @@ class IdentifiableDatasetWrapper:
         # Not implemented
         return None
 
-    def get_test_task(self, *args, mutate_context_mapping=True):
+    # By default, remove issued points from the context set mapping.
+    # but leave points in the query set alone so they can be re-issued later. The query point behaviour is what we used in the older experiments, so we've kept the deault the same.
+    def get_test_task(self, *args, mutate_context_mapping=True, mutate_query_mapping=False):
         if mutate_context_mapping:
             self.current_context_mapping = reset_empty_class_mapings(self.context_data, self.current_context_mapping, self.shot)
 
@@ -156,7 +158,7 @@ class IdentifiableDatasetWrapper:
         task_dict["context_images"], unnormalized_context_labels, task_dict["context_ids"] = self._construct_context_set(c_avail, mutate_context_mapping=mutate_context_mapping)
         # Use our custom, order-preserving unique function
         chosen_classes = unique(unnormalized_context_labels)
-        task_dict["target_images"], unnormalized_target_labels, task_dict["target_ids"] = self._construct_query_set(chosen_classes, remove_from_available=True)
+        task_dict["target_images"], unnormalized_target_labels, task_dict["target_ids"] = self._construct_query_set(chosen_classes, mutate_query_mapping=mutate_query_mapping)
 
         # If all classes are represented, don't renormalize
         if len(chosen_classes) == len(self.context_data.classes):
@@ -189,7 +191,7 @@ class IdentifiableDatasetWrapper:
         task_dict["target_images"], task_dict["target_labels"], _ = self._construct_query_set(full_test_classes)
         return task_dict
 
-    def _construct_query_set(self, task_classes, remove_from_available=False):
+    def _construct_query_set(self, task_classes, mutate_query_mapping=False):
         task_way = len(task_classes)
         task_images = torch.zeros(self._query_task_shape(task_way*self.query_shot), dtype=torch.float32)
         task_labels = torch.zeros(self.query_shot*task_way, dtype=torch.long)
@@ -206,10 +208,11 @@ class IdentifiableDatasetWrapper:
                 task_labels[t] = label
                 task_ids[t] = c_indices[i]
                 t += 1
-            if remove_from_available:
+            if mutate_query_mapping:
                 self.query_mapping[c] = np.delete(self.query_mapping[c], pattern_indices)
         return task_images, task_labels, task_ids
 
+    # By default, we always mutate the context mapping. So by default, we won't return the same point until we've run out of all other points.
     def _construct_context_set(self, possible_classes, mutate_context_mapping=True):
         # Choose the classes for the task
         try:
@@ -243,6 +246,23 @@ class IdentifiableDatasetWrapper:
         return task_images, task_labels, task_ids
 
 
+### This class maintains a list of the context points currently issued so that they are not re-issued
+### It also tracks how many "rounds" a context point stays issued for, under the assumption that good context points
+### won't be discarded as often as bad ones.
+### It uses the IdentifiableDatasetWrapper for some functionality, like constructing query sets.
+### Use of this class:
+### Use the get_test_task function to obtain the starting task.
+###     These context points are no longer drawable. But they will remain in the underlying IdentifiableDatasetWrapper's mapping, 
+###     which we try to leacve unchanged throuhgout, reyling instead on the list of drawable and current context ids.'
+### You can request new context points using sample_new_context_points after calling mark_discarded to discard the relevant points.
+###     Marking a point discarded will take it out of the list of currently issued context points. 
+###     They will stay out of rotation until the next call to reset_drawable_ids, which will happen when more new context points are requested than are available in the list of drawable_context_ids.
+### 
+### You can request a new queryset, which will rely on the underlying IdentifiableDataset to retrieve a queryset from the set of available query points.
+###     These points will still be available to draw next time you ask for a query set.
+###     To prevent the initial seed query set from being re-issued, the call to get_test_task is done with mutate_query_mapping=True so that those points can never be re-issued when we're requesting
+###     evaluation points.
+
 class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
     def __init__(self, dataset_path, dataset_name, way, shot, query_shot):
         IdentifiableDatasetWrapper.__init__(self, dataset_path, dataset_name, way, shot, query_shot)
@@ -270,7 +290,8 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
     # For the ValueTracking dataset wrapper, the requested way should match actual classes
     def get_test_task(self, *args):
         assert self.way == len(self.context_data.classes)
-        task_dict = IdentifiableDatasetWrapper.get_test_task(self, *args, mutate_context_mapping=False)
+        # Here we choose not to mutate the context mapping, we rely on the drawable id list instead.
+        task_dict = IdentifiableDatasetWrapper.get_test_task(self, *args, mutate_context_mapping=False, mutate_query_mapping=True)
         # Track what images are currently in rotation
         self.current_context_ids = task_dict["context_ids"].tolist()
         # Mark the selected context images so that we don't swap them in multiple times

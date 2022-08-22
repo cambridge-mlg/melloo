@@ -129,5 +129,8 @@ dmypy.json
 .pyre/
 
 data/
+results
+resultsv2
+resultsv3
 
 .idea
