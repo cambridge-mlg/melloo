@@ -272,9 +272,10 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
         self.drawable_context_ids = self._reset_drawable_ids()
         self.rounds_not_discarded = {}
         self.returned_label_counts = {}
+        # TODO: Recomputing this every time is expensive, save a master version and make a copy on reset.
+        self.master_drawable_list = []
 
     def _reset_drawable_ids(self):
-        #import pdb; pdb.set_trace()
         drawable_ids = []
         for cl in range(len(self.context_data.classes)):
             drawable_ids = drawable_ids + self.current_context_mapping[cl]
@@ -306,15 +307,16 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
 
     def mark_discarded(self, image_ids):
         image_ids = convert_to_array(image_ids)
-
         # Increase count for images not discarded this round
         current_context_set = set(self.current_context_ids)
-        not_discarded_ids = list(current_context_set.difference(set(image_ids)))
-        for nd_id in not_discarded_ids:
-            if nd_id in self.rounds_not_discarded.keys():
-                self.rounds_not_discarded[nd_id] += 1
-            else:
-                self.rounds_not_discarded[nd_id] = 1
+        not_discarded_ids_set = current_context_set.difference(set(image_ids))
+        if len(not_discarded_ids_set) > 0:
+            not_discarded_ids = list(current_context_set.difference(set(image_ids)))
+            for nd_id in not_discarded_ids:
+                if nd_id in self.rounds_not_discarded.keys():
+                    self.rounds_not_discarded[nd_id] += 1
+                else:
+                    self.rounds_not_discarded[nd_id] = 1
         try:
             # Remove discarded from context set
             for image_id in image_ids:
@@ -335,15 +337,16 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
         return class_counts
             
 
-    def sample_new_context_points(self, num_points_requested):
+    def sample_new_context_points(self, num_points_requested, force_reset=False):
         # Check whether there are new points to propose
         # If not, reset the list of drawables, excluding current selection
-        if len(self.drawable_context_ids) < num_points_requested:
+        if len(self.drawable_context_ids) < num_points_requested or force_reset:
             self.drawable_context_ids = self._reset_drawable_ids()
+            class_distribs = self._calculate_available_class_distrib()
+            print(class_distribs)
+
 
         #import pdb; pdb.set_trace()
-        #class_distribs = self._calculate_available_class_distrib()
-        #print(class_distribs)
 
         new_ids = rng.choice(self.drawable_context_ids, size=num_points_requested, replace=False)
         for id in new_ids:
@@ -358,7 +361,7 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
                 self.returned_label_counts[context_labels[i].item()] += 1
             else:
                 self.returned_label_counts[context_labels[i].item()] = 1
-        #print(context_labels)
+        #print("ValueTracker has {} points issued".format(len(self.current_context_ids)))
         return context_images, context_labels, new_ids
 
     def get_query_set(self):
