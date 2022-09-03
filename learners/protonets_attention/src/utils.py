@@ -168,13 +168,6 @@ def categorical_accuracy(logits, labels):
     return torch.mean(torch.eq(predictions, labels).float())
 
 
-def save_image(image_array, save_path):
-    image_array = image_array.squeeze()
-    image_array = image_array.transpose([1, 2, 0])
-    im = Image.fromarray(np.clip((image_array + 1.0) * 127.5 + 0.5, 0, 255).astype(np.uint8), mode='RGB')
-    im.save(save_path)
-
-
 def extract_class_indices(labels, which_class):
     if isinstance(labels, torch.Tensor):
        class_mask = torch.eq(labels, which_class)  # binary mask of labels equal to which_class
@@ -215,3 +208,66 @@ def mode_accuracy(logits, labels):
     merged_accuracies = torch.stack(accuracies)
 
     return torch.mean(merged_accuracies)
+
+
+def save_image(image_array, save_path):
+    image_array = image_array.squeeze()
+    image_array = image_array.transpose([1, 2, 0])
+    im = Image.fromarray(np.clip((image_array + 1.0) * 127.5 + 0.5, 0, 255).astype(np.uint8), mode='RGB')
+    im.save(save_path)
+
+# Have updated with version in split_wrapper
+def convert_to_array(my_list):
+    if type(my_list) == np.int32 or type(my_list) == int:
+        return np.array([my_list])
+    return my_list
+
+def convert_to_numpy(x):
+    if torch.is_tensor(x):
+        if x.is_cuda:
+            return x.cpu().numpy()
+        else:
+            return x.numpy()
+    else:
+        return x
+
+
+def move_set_to_cuda(images, labels, device):
+        if not images.is_cuda:
+            images = images.to(device)
+        if not labels.is_cuda:
+            labels = labels.type(torch.LongTensor).to(device)
+        return images, labels
+        
+def np_set_to_torch(images_np, labels_np, shuffle=False):
+    if len(images_np.shape) == 3:
+        images_np = images_np.unsqueeze(0)
+    images_np = images_np.transpose([0, 3, 1, 2])
+    # Don't shuffle so that we are assured consistency in the noisy shot detection case
+    if shuffle:
+        images_np, labels_np = shuffle_set(images_np, labels_np)
+    images = torch.from_numpy(images_np)
+    labels = torch.from_numpy(labels_np)
+    return images, labels
+    
+
+def prepare_task(task_dict, device, shuffle=False):
+    # If context_images are already a tensor, just assign
+    context_images, context_labels = task_dict['context_images'], task_dict['context_labels']
+    target_images, target_labels = task_dict['target_images'], task_dict['target_labels']
+    # Else, assume numpy format and do conversion
+    if not torch.is_tensor(context_images):
+        context_images, context_labels = np_set_to_torch(context_images, context_labels, shuffle)
+        target_images, target_labels = np_set_to_torch(target_images, target_labels, shuffle)
+
+    context_images, context_labels = move_set_to_cuda(context_images, context_labels, device)
+    target_images, target_labels = move_set_to_cuda(target_images, target_labels, device)
+    return context_images, target_images, context_labels, target_labels
+
+    
+def shuffle_set(images, labels):
+    """
+    Return shuffled data.
+    """
+    permutation = np.random.permutation(images.shape[0])
+    return images[permutation], labels[permutation]

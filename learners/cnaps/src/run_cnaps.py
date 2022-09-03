@@ -58,35 +58,15 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Quiet TensorFlow warnings
 import tensorflow as tf
 
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)  # Quiet TensorFlow warnings
-# from art.attacks import ProjectedGradientDescent, FastGradientMethod
-# from art.classifiers import PyTorchClassifier
+
 from PIL import Image
 import sys
-# sys.path.append(os.path.abspath('attacks'))
 
 NUM_VALIDATION_TASKS = 200
 NUM_TEST_TASKS = 600
 PRINT_FREQUENCY = 1000
 NUM_INDEP_EVAL_TASKS = 50
 
-
-def save_image(image_array, save_path):
-    image_array = image_array.squeeze()
-    image_array = image_array.transpose([1, 2, 0])
-    im = Image.fromarray(np.clip((image_array + 1.0) * 127.5 + 0.5, 0, 255).astype(np.uint8), mode='RGB')
-    im.save(save_path)
-
-
-def extract_class_indices(labels, which_class):
-    """
-    Helper method to extract the indices of elements which have the specified label.
-    :param labels: (torch.tensor) Labels of the context set.
-    :param which_class: Label for which indices are extracted.
-    :return: (torch.tensor) Indices in the form of a mask that indicate the locations of the specified label.
-    """
-    class_mask = torch.eq(labels, which_class)  # binary mask of labels equal to which_class
-    class_mask_indices = torch.nonzero(class_mask)  # indices of labels equal to which class
-    return torch.reshape(class_mask_indices, (-1,))  # reshape to be a 1D vector
 
 
 def main():
@@ -98,13 +78,11 @@ class Learner:
     def __init__(self):
         self.args = self.parse_command_line()
 
-        if self.args.mode == "attack":
-            if not os.path.exists(self.args.checkpoint_dir):
-                os.makedirs(self.args.checkpoint_dir)
+        if not os.path.exists(self.args.checkpoint_dir):
+            os.makedirs(self.args.checkpoint_dir)
 
         self.checkpoint_dir, self.logfile, self.checkpoint_path_validation, self.checkpoint_path_final, self.debugfile \
-            = get_log_files(self.args.checkpoint_dir, self.args.resume_from_checkpoint, self.args.mode == "test" or
-                            self.args.mode == "attack")
+            = get_log_files(self.args.checkpoint_dir, self.args.resume_from_checkpoint, self.args.mode == "test")
 
         print_and_log(self.logfile, "Options: %s\n" % self.args)
         print_and_log(self.logfile, "Checkpoint Directory: %s\n" % self.checkpoint_dir)
@@ -185,8 +163,7 @@ class Learner:
                             default="versa", help="Which classifier method to use.")
         parser.add_argument("--pretrained_resnet_path", default="learners/cnaps/models/pretrained_resnet.pt.tar",
                             help="Path to pretrained feature extractor model.")
-        parser.add_argument("--attack_config_path", help="Path to attack config file in yaml format.")
-        parser.add_argument("--mode", choices=["train", "test", "train_test", "attack"], default="train_test",
+        parser.add_argument("--mode", choices=["train", "test", "train_test"], default="train_test",
                             help="Whether to run training only, testing only, or both training and testing.")
         parser.add_argument("--learning_rate", "-lr", type=float, default=5e-4, help="Learning rate.")
         parser.add_argument("--tasks_per_batch", type=int, default=16,
@@ -215,8 +192,8 @@ class Learner:
                             help="Shots per class for target  of single dataset task.")
         parser.add_argument("--query_test", type=int, default=10,
                             help="Shots per class for target  of single dataset task.")
-        parser.add_argument("--save_task", default=False,
-                            help="Save all the tasks and adversarial images to a pickle file. Currently only applicable to non-swap attacks.")
+        #parser.add_argument("--save_task", default=False,
+        #                    help="Save all the tasks images to a pickle file. ")
         parser.add_argument("--do_not_freeze_feature_extractor", dest="do_not_freeze_feature_extractor", default=False,
                             action="store_true", help="If True, don't freeze the feature extractor.")
         parser.add_argument("--construct_coreset", default=False)
@@ -440,8 +417,8 @@ class Learner:
                       '{0:} {1:}: {2:3.1f}+/-{3:2.1f}'.format(descriptor, item, accuracy, accuracy_confidence))
 
     def save_image_pair(self, adv_img, clean_img, task_no, index):
-        save_image(adv_img.cpu().detach().numpy(),os.path.join(self.checkpoint_dir, 'adv_task_{}_index_{}.png'.format(task_no, index)))
-        save_image(clean_img, os.path.join(self.checkpoint_dir, 'in_task_{}_index_{}.png'.format(task_no, index)))
+        utils.save_image(adv_img.cpu().detach().numpy(),os.path.join(self.checkpoint_dir, 'adv_task_{}_index_{}.png'.format(task_no, index)))
+        utils.save_image(clean_img, os.path.join(self.checkpoint_dir, 'in_task_{}_index_{}.png'.format(task_no, index)))
 
     def prepare_task(self, task_dict, shuffle=True):
         context_images_np, context_labels_np = task_dict['context_images'], task_dict['context_labels']

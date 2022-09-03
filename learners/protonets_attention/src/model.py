@@ -38,12 +38,17 @@ class FewShotClassifier(nn.Module):
         self.class_representations = OrderedDict()  # Dictionary mapping class label (integer) to encoded representation
         self.context_features = None
         self.target_features = None
+        self.classifier_params = None
 
         if self.args.classifier == "protonets_attention" :
             self.cross_attention = DotProdAttention(temperature=self.args.attention_temperature)
 
         if self.args.classifier == "protonets_cross_transformer":
             self.cross_attention = CrossTransformer(temperature=self.args.attention_temperature)
+            
+        if self.args.classifier == "protonets_mahalanobis":
+            self.class_precision_matrices = OrderedDict() # Dictionary mapping class label (integer) to regularized precision matrices estimated
+
 
 
     def forward(self, context_images, context_labels, target_images, target_labels, meta_learning_state):
@@ -69,18 +74,129 @@ class FewShotClassifier(nn.Module):
             self.attention_weights = attention_weights
 
         elif self.args.classifier == "protonets_cross_transformer":
-            self.prototypes, target_embeddings, h, w = self.cross_attention(self.context_features, self.target_features, context_labels)
-            logits = self._cross_transformer_euclidiean_distances(self.prototypes, target_embeddings, h, w)
+            prototypes, target_embeddings, h, w = self.cross_attention(self.context_features, self.target_features, context_labels)
+            self.set_class_prototypes(prototypes)
+            logits = self._cross_transformer_euclidiean_distances(prototypes, target_embeddings, h, w)
 
+        elif self.args.classifier == "protonets_mahalanobis":
+            logits = _protonets_mahalanobis_classifier(self.context_features, self.target_features, context_labels)
         else:
             print("Unsupported model type requested")
             return
 
         return logits
         
+    def _protonets_mahalanobis_classifier(self, context_features, target_features, context_labels):
+        """
+        SCM: we build both class representations and the regularized covariance estimates.
+        """
+        # clear all dictionaries from previous forward pass
+        self.class_representations.clear()
+        self.class_precision_matrices.clear()
+        
+        # get the class means and covariance estimates in tensor form
+        self._build_class_reps_and_covariance_estimates(context_features, context_labels)
+        class_means = torch.stack(list(self.class_representations.values())).squeeze(1)
+        class_precision_matrices = torch.stack(list(self.class_precision_matrices.values())) 
+        self.classifier_params = {
+            'class_means': class_means,
+            'class_precision_matrices': class_precision_matrices
+        }
+
+        """
+        SCM: calculating the Mahalanobis distance between query examples and the class means
+        including the class precision estimates in the calculations, reshaping the distances
+        and multiplying by -1 to produce the sample logits
+        """
+        # grabbing the number of classes and query examples for easier use later in the function
+        number_of_classes = class_means.size(0)
+        number_of_targets = target_features.size(0)
+        
+        repeated_target = target_features.repeat(1, number_of_classes).view(-1, class_means.size(1))
+        repeated_class_means = class_means.repeat(number_of_targets, 1)
+        repeated_difference = (repeated_class_means - repeated_target)
+        repeated_difference = repeated_difference.view(number_of_targets, number_of_classes,
+                                                       repeated_difference.size(1)).permute(1, 0, 2)
+        first_half = torch.matmul(repeated_difference, class_precision_matrices)
+        logits = torch.mul(first_half, repeated_difference).sum(dim=2).transpose(1, 0) * -1
+        return logits
+    
+    def set_class_prototypes(prototypes):
+        self.classifier_params = {"class_prototypes": prototypes}
+    
+    def _build_class_reps_and_covariance_estimates(self, context_features, context_labels):
+        """
+        Construct and return class level representations and class covariance estimattes for each class in task.
+        :param context_features: (torch.tensor) Adapted feature representation for each image in the context set.
+        :param context_labels: (torch.tensor) Label for each image in the context set.
+        :return: (void) Updates the internal class representation and class covariance estimates dictionary.
+        """
+
+        """
+        SCM: calculating a task level covariance estimate using the provided function.
+        """
+        task_covariance_estimate = self.estimate_cov(context_features)
+        for c in torch.unique(context_labels):
+            # filter out feature vectors which have class c
+            class_features = torch.index_select(context_features, 0, extract_class_indices(context_labels, c))
+            # mean pooling examples to form class means
+            class_rep = mean_pooling(class_features)
+            # updating the class representations dictionary with the mean pooled representation
+            self.class_representations[c.item()] = class_rep
+            """
+            Calculating the mixing ratio lambda_k_tau for regularizing the class level estimate with the task level estimate."
+            Then using this ratio, to mix the two estimate; further regularizing with the identity matrix to assure invertability, and then
+            inverting the resulting matrix, to obtain the regularized precision matrix. This tensor is then saved in the corresponding
+            dictionary for use later in infering of the query data points.
+            """
+            lambda_k_tau = (class_features.size(0) / (class_features.size(0) + 1))
+            self.class_precision_matrices[c.item()] = torch.inverse(
+                (lambda_k_tau * self.estimate_cov(class_features)) + ((1 - lambda_k_tau) * task_covariance_estimate) \
+                + torch.eye(class_features.size(1), class_features.size(1)).cuda(0))
+        
+    def estimate_cov(self, examples, rowvar=False, inplace=False):
+        """
+        SCM: unction based on the suggested implementation of Modar Tensai
+        and his answer as noted in: https://discuss.pytorch.org/t/covariance-and-gradient-support/16217/5
+
+        Estimate a covariance matrix given data.
+
+        Covariance indicates the level to which two variables vary together.
+        If we examine N-dimensional samples, `X = [x_1, x_2, ... x_N]^T`,
+        then the covariance matrix element `C_{ij}` is the covariance of
+        `x_i` and `x_j`. The element `C_{ii}` is the variance of `x_i`.
+
+        Args:
+            examples: A 1-D or 2-D array containing multiple variables and observations.
+                Each row of `m` represents a variable, and each column a single
+                observation of all those variables.
+            rowvar: If `rowvar` is True, then each row represents a
+                variable, with observations in the columns. Otherwise, the
+                relationship is transposed: each column represents a variable,
+                while the rows contain observations.
+
+        Returns:
+            The covariance matrix of the variables.
+        """
+        if examples.dim() > 2:
+            raise ValueError('m has more than 2 dimensions')
+        if examples.dim() < 2:
+            examples = examples.view(1, -1)
+        if not rowvar and examples.size(0) != 1:
+            examples = examples.t()
+        factor = 1.0 / (examples.size(1) - 1)
+        if inplace:
+            examples -= torch.mean(examples, dim=1, keepdim=True)
+        else:
+            examples = examples - torch.mean(examples, dim=1, keepdim=True)
+        examples_t = examples.t()
+        return factor * examples.matmul(examples_t).squeeze()
+
+        
     def _protonets_euclidean_classifier(self, context_features, target_features, context_labels):
-        self.prototypes = self._compute_class_prototypes(context_features, context_labels)
-        logits = self._euclidean_distances(target_features, self.prototypes)
+        prototypes = self._compute_class_prototypes(context_features, context_labels)
+        self.set_class_prototypes(prototypes)
+        logits = self._euclidean_distances(target_features, prototypes)
         return logits
 
     def _compute_class_prototypes(self, context_features, context_labels):
@@ -101,9 +217,10 @@ class FewShotClassifier(nn.Module):
         return -distances
 
     def _protonets_euclidean_attention_classifier(self, context_features, target_features, context_labels):
-        self.prototypes, attention_weights = self._compute_class_prototypes_with_attention(context_features, target_features,
+        prototypes, attention_weights = self._compute_class_prototypes_with_attention(context_features, target_features,
                                                                          context_labels)
-        logits = self._euclidean_distances_with_attention(target_features, self.prototypes)
+        self.set_class_prototypes(prototypes)
+        logits = self._euclidean_distances_with_attention(target_features, prototypes)
         return logits, attention_weights
 
     def _compute_class_prototypes_with_attention(self, context_features, target_features, context_labels):
@@ -143,7 +260,7 @@ class FewShotClassifier(nn.Module):
         return -euclidean_dist
 
     def classifer_regularization_term(self):
-        if self.prototypes is None:
+        if "class_prototypes" not in self.classifier_params or self.classifier_params["class_prototypes"] is None:
             print("Classifier has no prototypes saved. Either no forward pass has happened yet, or the regularization term is being calculated out of sync")
             return None
         
@@ -153,6 +270,8 @@ class FewShotClassifier(nn.Module):
         elif self.args.classifier != "protonets_attention" and self.args.classifier != "protonets_euclidean":
             print("Classifier regularization term not available for selected classifer: {}".format(self.args.classifier))
             return None
+        
+        prototypes = sel.classifier_params["class_prototypes"]
         
         # In all cases, the most recently calculated prototypes are saved on the model
         # The classifier head's parameters are wk and bk with wk = 2ck, bk = -ck^Tck
@@ -166,15 +285,15 @@ class FewShotClassifier(nn.Module):
         normalize_denom = 1.0
         if self.args.classifier == "protonets_attention":
             # permute the embedding so that we have the prototypes per target point
-            self.prototypes = self.prototypes.permute(1, 0, 2)
-            normalize_denom = self.prototypes.shape[0]
+            prototypes = prototypes.permute(1, 0, 2)
+            normalize_denom = prototypes.shape[0]
             
-        cs_per_target_pt = 2 * self.prototypes
-        bs = -(self.prototypes * self.prototypes).sum(dim=-1)
+        cs_per_target_pt = 2 * prototypes
+        bs = -(prototypes * prototypes).sum(dim=-1)
         params = torch.cat((cs_per_target_pt, bs.unsqueeze(-1)), dim=-1)
         
         # Clear the reference to our own prototypes for now, so that if we accidentally call this function out of sync, we will notice        
-        self.prototypes = None
+        self.classifier_params = None
         
         # Calculate the L2 norm of the params, which is either the entire param matrix for protonets_euclidean
         # or over the classifier heads for each target point, in the dot product attention case
@@ -222,10 +341,10 @@ class FewShotClassifier(nn.Module):
 
         return context_features, target_features
 
-    def _get_classifier_params(self):
-        # This is None for the protonets_attention and protonets_euclidean
-        classifier_params = self.classifier_adaptation_network(self.class_representations)
-        return classifier_params
+    #def _get_classifier_params(self):
+    #    # This is None for the protonets_attention and protonets_euclidean
+    #    classifier_params = self.classifier_adaptation_network(self.class_representations)
+    #    return classifier_params
 
     def distribute_model(self):
         self.feature_extractor.cuda(1)

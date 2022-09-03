@@ -5,15 +5,11 @@ import torch
 import torchvision.datasets as tv_datasets
 import torchvision.transforms as tv_transforms
 from PIL import Image
+import utils
 
 rng = default_rng()
 shorten_data = False
 shortened_class_size = 10
-
-def convert_to_array(my_list):
-    if type(my_list) == np.int32 or type(my_list) == int:
-        return np.array([my_list])
-    return my_list
 
 
 def map_to_classes(dataset):
@@ -306,7 +302,7 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
         return task_dict
 
     def mark_discarded(self, image_ids):
-        image_ids = convert_to_array(image_ids)
+        image_ids = utils.convert_to_array(image_ids)
         # Increase count for images not discarded this round
         current_context_set = set(self.current_context_ids)
         not_discarded_ids_set = current_context_set.difference(set(image_ids))

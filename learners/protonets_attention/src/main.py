@@ -6,8 +6,8 @@ from numpy.random import default_rng
 import argparse
 import os
 from tqdm import tqdm
-from utils import Logger, LogFiles, ValidationAccuracies, cross_entropy_loss, categorical_accuracy, MetaLearningState, \
-    coalesce_labels, merge_logits, mode_accuracy, extract_class_indices
+from utils import MetaLearningState
+import utils
 from model import FewShotClassifier
 from normalization_layers import TaskNormI
 from dataset import get_dataset_reader
@@ -21,6 +21,8 @@ import gc
 import matplotlib.patches as mpatches
 from sklearn.manifold import TSNE
 import sklearn.metrics
+import metaloo
+import metrics
 
 from scipy.stats import kendalltau
 from sklearn.metrics.pairwise import rbf_kernel
@@ -29,85 +31,6 @@ NUM_VALIDATION_TASKS = 200
 PRINT_FREQUENCY = 1000
 rng = default_rng()
 
-def convert_to_array(my_list):
-    if type(my_list) == np.int32:
-        return np.array([my_list])
-    return my_list
-
-def convert_to_numpy(x):
-    if torch.is_tensor(x):
-        if x.is_cuda:
-            return x.cpu().numpy()
-        else:
-            return x.numpy()
-    else:
-        return x
-
-
-def move_set_to_cuda(images, labels, device):
-        if not images.is_cuda:
-            images = images.to(device)
-        if not labels.is_cuda:
-            labels = labels.type(torch.LongTensor).to(device)
-        return images, labels
-        
-def np_set_to_torch(images_np, labels_np, shuffle=False):
-    if len(images_np.shape) == 3:
-        images_np = images_np.unsqueeze(0)
-    images_np = images_np.transpose([0, 3, 1, 2])
-    # Don't shuffle so that we are assured consistency in the noisy shot detection case
-    if shuffle:
-        images_np, labels_np = shuffle_set(images_np, labels_np)
-    images = torch.from_numpy(images_np)
-    labels = torch.from_numpy(labels_np)
-    return images, labels
-    
-    
-def shuffle_set(images, labels):
-    """
-    Return shuffled data.
-    """
-    permutation = np.random.permutation(images.shape[0])
-    return images[permutation], labels[permutation]
-
-def prepare_task(task_dict, device, shuffle=False):
-    # If context_images are already a tensor, just assign
-    context_images, context_labels = task_dict['context_images'], task_dict['context_labels']
-    target_images, target_labels = task_dict['target_images'], task_dict['target_labels']
-    # Else, assume numpy format and do conversion
-    if not torch.is_tensor(context_images):
-        context_images, context_labels = np_set_to_torch(context_images, context_labels, shuffle)
-        target_images, target_labels = np_set_to_torch(target_images, target_labels, shuffle)
-
-    context_images, context_labels = move_set_to_cuda(context_images, context_labels, device)
-    target_images, target_labels = move_set_to_cuda(target_images, target_labels, device)
-    return context_images, target_images, context_labels, target_labels
-
-def save_image(image_array, save_path):
-    image_array = image_array.squeeze()
-    image_array = image_array.transpose([1, 2, 0])
-    im = Image.fromarray(np.clip((image_array + 1.0) * 127.5 + 0.5, 0, 255).astype(np.uint8), mode='RGB')
-    im.save(save_path)
-    
-def add_image_rankings(image_ranking_dict, image_key, image, ranking_key, ranking):
-    if image_key not in image_ranking_dict.keys():
-       image_ranking_dict[image_key] = {}
-    
-    if ranking_key not in image_ranking_dict[image_key].keys():
-        image_ranking_dict[image_key][ranking_key] = np.array(ranking)
-    else:
-        image_ranking_dict[image_key][ranking_key] = np.append(image_ranking_dict[image_key][ranking_key], ranking)
-    return image_ranking_dict
-    
-def weights_from_multirankings(image_ranking_dict, ranking_key):
-    agg_ranking = torch.zeros(len(image_ranking_dict.keys()))
-    image_ids = np.zeros(len(agg_ranking), dtype=int)
-    # For each image
-    for i, img_id in enumerate(image_ranking_dict.keys()):
-        agg_ranking[i] = image_ranking_dict[img_id][ranking_key].sum().item()
-        image_ids[i] = img_id
-    # Return parallel arrays of the ranking and the image id
-    return agg_ranking, image_ids
 
 def main():
     learner = Learner()
@@ -117,11 +40,18 @@ def main():
 class Learner:
     def __init__(self):
         self.args = self.parse_command_line()
-        self.log_files = LogFiles(self.args.checkpoint_dir, self.args.resume_from_checkpoint, self.args.mode == "test")
-        self.logger = Logger(self.args.checkpoint_dir, "log.txt")
+        self.log_files = utils.LogFiles(self.args.checkpoint_dir, self.args.resume_from_checkpoint, self.args.mode == "test")
+        self.logger = utils.Logger(self.args.checkpoint_dir, "log.txt")
 
         self.logger.print_and_log("Options: %s\n" % self.args)
         self.logger.print_and_log("Checkpoint Directory: %s\n" % self.log_files.checkpoint_dir)
+        
+        self.metrics = new metrics.Metrics(self.args.checkpoint_dir, self.args.way, self.args.top_k, self.logger)
+        self.representer_args = {
+                "l2_regularize_classifier": self.args.l2_regularize_classifier,
+                "l2_lambda": self.args.l2_lambda,
+                "kernel_agg": self.args.kernel_agg,
+            }
 
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.model = self.init_model()
@@ -136,10 +66,10 @@ class Learner:
             device=self.device,
             value_tracking=value_tracking)
 
-        self.loss = cross_entropy_loss
-        self.accuracy_fn = categorical_accuracy
+        self.loss = utils.cross_entropy_loss
+        self.accuracy_fn = utils.categorical_accuracy
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-        self.validation_accuracies = ValidationAccuracies(self.validation_set)
+        self.validation_accuracies = utils.ValidationAccuracies(self.validation_set)
         self.start_iteration = 0
         if self.args.resume_from_checkpoint:
             self.load_checkpoint()
@@ -205,7 +135,8 @@ class Learner:
                             help="Dataset reader to use.")
         parser.add_argument("--classifier", choices=["protonets_euclidean",
                                                      "protonets_attention",
-                                                     "protonets_cross_transformer"],
+                                                     "protonets_cross_transformer",
+                                                     "protonets_mahalanobis"],
                             default="versa", help="Which classifier method to use.")
         parser.add_argument('--test_datasets', nargs='+', help='Datasets to use for testing',
                             default=["ilsvrc_2012", "omniglot", "aircraft", "cu_birds", "dtd", "quickdraw", "fungi",
@@ -273,7 +204,6 @@ class Learner:
         parser.add_argument("--error_rate", type=float, default=0.1,
                             help="Rate at which noise is introduced. For mislabelling, this is the percentage of the context set to mislabel. For ood, this how many ood patterns are shuffled into the other classes (calculated as num context patterns * error rate)")
         
-
         args = parser.parse_args()
         return args
 
@@ -351,7 +281,7 @@ class Learner:
             return value
 
     def train_task(self, task_dict):
-        context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
+        context_images, target_images, context_labels, target_labels = utils.prepare_task(task_dict, self.device)
 
         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TRAIN)
         task_loss = self.loss(target_logits, target_labels)
@@ -376,7 +306,7 @@ class Learner:
                 accuracies = []
                 for _ in range(NUM_VALIDATION_TASKS):
                     task_dict = self.dataset.get_validation_task(item)
-                    context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
+                    context_images, target_images, context_labels, target_labels = utils.prepare_task(task_dict, self.device)
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     accuracy = self.accuracy_fn(target_logits, target_labels)
                     accuracies.append(accuracy.item())
@@ -401,7 +331,7 @@ class Learner:
             protonets_accuracies = []
             for _ in range(self.args.tasks):
                 task_dict = self.dataset.get_test_task(item)
-                context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
+                context_images, target_images, context_labels, target_labels = utils.prepare_task(task_dict, self.device)
                 # Do the forward pass with the target set so that we can get the feature embeddings
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels,
@@ -444,7 +374,7 @@ class Learner:
                 
                 representer_tmp = []
                 for c in torch.unique(context_labels):
-                    c_indices = extract_class_indices(context_labels, c)
+                    c_indices = utils.extract_class_indices(context_labels, c)
                     for i in c_indices:    
                         representer_tmp.append(representers[c][i])
                 representer_per_query_point = torch.stack(representer_tmp).transpose(1,0)
@@ -472,12 +402,12 @@ class Learner:
                 plt.savefig(os.path.join(self.args.checkpoint_dir, "attention_vs_representer_summed.png"))
                 plt.close()
 
-                ave_corr, ave_num_intersected = self.compare_rankings(weights_per_query_point, representer_per_query_point, "Attention vs Representer", weights=True)
-                #ave_corr_mag, ave_num_intersected_mag = self.compare_rankings(weights_per_query_point, representer_per_query_point, "Attention vs Representer", weights=True)
-                ave_corr_s, ave_num_intersected_s = self.compare_rankings(weights_per_query_point, representer_summed, "Attention vs Representer Summed", weights=True)
-                #ave_corr_mag_s, ave_num_intersected_mag_s = self.compare_rankings(weights_per_query_point, representer_summed, "Attention vs Representer Summed", weights=True)
-                ave_corr_abs_s, ave_num_intersected_abs_s = self.compare_rankings(weights_per_query_point, representer_abs_sum, "Attention vs Representer Sum Abs", weights=True)
-                #ave_corr_mag_abs_s, ave_num_intersected_mag_abs_s = self.compare_rankings(weights_per_query_point, representer_abs_sum, "Attention vs Representer Sum Abs", weights=True)
+                ave_corr, ave_num_intersected = self.metrics.compare_rankings(weights_per_query_point, representer_per_query_point, "Attention vs Representer", weights=True)
+                #ave_corr_mag, ave_num_intersected_mag = self.metrics.compare_rankings(weights_per_query_point, representer_per_query_point, "Attention vs Representer", weights=True)
+                ave_corr_s, ave_num_intersected_s = self.metrics.compare_rankings(weights_per_query_point, representer_summed, "Attention vs Representer Summed", weights=True)
+                #ave_corr_mag_s, ave_num_intersected_mag_s = self.metrics.compare_rankings(weights_per_query_point, representer_summed, "Attention vs Representer Summed", weights=True)
+                ave_corr_abs_s, ave_num_intersected_abs_s = self.metrics.compare_rankings(weights_per_query_point, representer_abs_sum, "Attention vs Representer Sum Abs", weights=True)
+                #ave_corr_mag_abs_s, ave_num_intersected_mag_abs_s = self.metrics.compare_rankings(weights_per_query_point, representer_abs_sum, "Attention vs Representer Sum Abs", weights=True)
                 
             del target_logits
 
@@ -485,167 +415,11 @@ class Learner:
             accuracy_confidence = (196.0 * np.array(accuracies).std()) / np.sqrt(len(accuracies))
 
             self.logger.print_and_log('{0:}: {1:3.1f}+/-{2:2.1f}'.format(item, accuracy, accuracy_confidence))
-
-    def calculate_representer_values(self, context_images, context_labels, context_features, target_labels, target_features):
-        # Do the forward pass with the context set for the representer points:
-        context_logits = self.model(context_images, context_labels, context_images, context_labels, MetaLearningState.META_TEST)
-        task_loss = self.loss(context_logits, context_labels)
-        regularization_term = (self.model.feature_adaptation_network.regularization_term())
-        regularizer_scaling = 0.001
-        task_loss += regularizer_scaling * regularization_term
-
-        if self.args.l2_regularize_classifier:
-            classifier_regularization_term = self.model.classifer_regularization_term()
-            task_loss += self.args.l2_lambda * classifier_regularization_term
             
-        # Representer values calculation    
-        dl_dphi = torch.autograd.grad(task_loss, context_logits, retain_graph=True)[0]
-        del context_logits
-        gc.collect()
-        alphas = dl_dphi/(-2.0 * self.args.l2_lambda * float(len(context_labels)))
-        alphas_t = alphas.transpose(1,0)
-        feature_prod = torch.matmul(context_features, target_features.transpose(1,0)).to(self.device)
-        
-        kernels_agg = []
-        for k in range(alphas.shape[1]):
-            alphas_k = alphas_t[k]
-            tmp_mat = alphas_k.unsqueeze(1).expand(len(context_labels), len(target_labels))
-            kernels_k = tmp_mat * feature_prod
-            kernels_agg.append(kernels_k.unsqueeze(0))
-        representers = torch.cat(kernels_agg, dim=0)
-        
-
-        if self.args.kernel_agg == 'sum':
-            representers_agg = representers.sum(dim=0).transpose(1,0).cpu()
-        
-        elif self.args.kernel_agg == 'sum_abs':
-            representers_agg = representers.abs().sum(dim=0).transpose(1,0).cpu()
-        
-        elif self.args.kernel_agg == 'class':
-            representer_tmp = []
-            for c in torch.unique(context_labels):
-                c_indices = extract_class_indices(context_labels, c)
-                for i in c_indices:    
-                    representer_tmp.append(representers[c][i])
-            representers_agg = torch.stack(representer_tmp).transpose(1,0).cpu()
-            
-        else:
-            print("Unsupported kernel aggregation method specified")
-            return None
-        return representers_agg
-
-    def alternative_loo(self, context_images, context_labels, target_images, target_labels):
-
-        target_classes = target_labels.unique()
-        weights = torch.zeros(len(context_labels))
-
-        full_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
-        full_loss = self.loss(full_logits, target_labels)
-
-        with torch.no_grad():
-            for i in range(context_images.shape[0]):
-                if i == 0:
-                    context_images_loo = context_images[i + 1:]
-                    context_labels_loo = context_labels[i + 1:]
-                else:
-                    context_images_loo = torch.cat((context_images[0:i], context_images[i + 1:]), 0)
-                    context_labels_loo = torch.cat((context_labels[0:i], context_labels[i + 1:]), 0)
-
-                if len(context_labels_loo.unique()) < self.args.way:
-                    weights[i] = 10*loss
-                    continue
-
-                logits = self.model(context_images_loo, context_labels_loo, target_images, target_labels, MetaLearningState.META_TEST)
-                loss = self.loss(logits, target_labels)
-                weights[i] = loss
-                
-        return weights
-
-
-    def calculate_loo(self,  context_images, context_labels, target_images, target_labels):
-        target_classes = target_labels.unique()
-        loss_per_qp = torch.zeros((len(target_labels), len(context_labels)))
-        with torch.no_grad():
-            for i in range(context_images.shape[0]):
-                if i == 0:
-                    context_images_loo = context_images[i + 1:]
-                    context_labels_loo = context_labels[i + 1:]
-                else:
-                    context_images_loo = torch.cat((context_images[0:i], context_images[i + 1:]), 0)
-                    context_labels_loo = torch.cat((context_labels[0:i], context_labels[i + 1:]), 0)
-                    
-                # Handle the case where we're dropping the only instance of a class
-                # These labels are all re-normalized
-                reduced_context_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(context_labels_loo, target_images, target_labels)
-                represented_classes = []
-                for cc in target_classes:
-                    if cc in context_labels_loo:
-                        represented_classes.append(cc.item())
-
-                # Calculate accuracy on task using only selected candidates as context points
-                reduced_target_logits = self.model(context_images_loo, reduced_context_labels, reduced_target_images, reduced_target_labels, MetaLearningState.META_TEST)
-
-                #logits = self.model(context_images_loo, context_labels_loo, target_images, target_labels, MetaLearningState.META_TEST)
-                rt = 0
-                for t in range(len(target_labels)):
-                    # If this target label wasn't removed 
-                    if target_labels[t].item() in represented_classes:
-                        loo_loss =  self.loss(reduced_target_logits[rt].unsqueeze(0), reduced_target_labels[rt].unsqueeze(0))
-                        loss_per_qp[t][i] = loo_loss
-                        rt += 1
-                    else:
-                        # Add the things that were incorrectly classified by default, because they weren't represented in the loo context set
-                        equal_chance_logits = torch.tensor([1.0/float(len(target_classes))]).repeat(len(target_classes)).to(self.device)
-                        loo_loss = self.loss(equal_chance_logits.unsqueeze(0), target_labels[t].unsqueeze(0))
-                        loss_per_qp[t][i] = loo_loss
-                        
-                
-        #Somehow turn the loss into a weight:
-        #weight_per_qp = loss_per_qp/loss_per_qp.max() - 1
-        return loss_per_qp 
-
 
     def random_weights(self, context_images, context_labels, target_images, target_labels):
         return torch.tensor(np.random.rand(len(target_labels), len(context_labels)))
 
-    def save_image_set(self, task_num, images, descrip, labels=None):
-        if task_num != -1:
-            path = os.path.join(self.args.checkpoint_dir, str(task_num))
-        else:
-            path = self.args.checkpoint_dir
-        if not os.path.exists(path):
-            os.makedirs(path)
-        tmp_images = images.cpu().detach().numpy()
-        if not labels is None:
-            assert len(labels) == len(images)
-
-        for i in range(len(tmp_images)):
-            if labels is None:
-                image_path = os.path.join(path, '{}_index_{}.png'.format(descrip, i))
-            else:
-                image_path = os.path.join(path, '{}_index_{}_label_{}.png'.format(descrip, i, labels[i]))
-            save_image(tmp_images[i], image_path)
-    
-    def remove_unrepresented_points(self, candidate_labels, target_images, target_labels):
-        classes = torch.unique(target_labels).cpu().numpy()
-        unrepresented = (set(classes)).difference(set(candidate_labels.cpu().numpy()))
-        num_represented_classes = len(classes) - len(unrepresented)
-        reduced_indices = []
-        for c in classes:
-            if c in unrepresented:
-                continue
-            else:
-                reduced_indices.append(extract_class_indices(target_labels, c))
-        reduced_indices = torch.stack(reduced_indices).flatten()
-        reduced_target_images = target_images[reduced_indices]
-        reduced_labels = (target_labels[reduced_indices]).clone()
-        reduced_candidate_labels = candidate_labels.clone()
-        unrepresented_classes = list(unrepresented)
-        unrepresented_classes.sort(reverse=True)
-        for unc in unrepresented_classes:
-            reduced_labels[reduced_labels > unc] = reduced_labels[reduced_labels > unc] - 1
-            reduced_candidate_labels[reduced_candidate_labels > unc] = reduced_candidate_labels[reduced_candidate_labels > unc] - 1
-        return reduced_candidate_labels, reduced_target_images, reduced_labels  
     
 
     def save_coreset_from_ranking(self, path):
@@ -656,28 +430,14 @@ class Learner:
         image_rankings = pickle.load(open(os.path.join(self.args.checkpoint_dir, "rankings.pickle"), "rb"))
 
         for key in image_rankings[0].keys():
-            weights, image_ids = weights_from_multirankings(image_rankings, key)
-            candidate_indices = self.select_top_k(weights)
+            weights, image_ids = metaloo.weights_from_multirankings(image_rankings, key)
+            candidate_indices = self.select_top_k(self.args.top_k, weights, self.args.spread_constraint)
             candidate_ids = image_ids[candidate_indices]
 
             task_dict = self.dataset.get_task_from_ids(candidate_ids)
-            context_images, _, _, _ = prepare_task(task_dict, self.device)
+            context_images, _, _, _ = utils.prepare_task(task_dict, self.device)
 
-            self.save_image_set(0, context_images, "selected_{}".format(key))
-
-    def plot_confusion_matrix(self, true_labels, filename, logits=None, pred_labels=None):
-        labels = true_labels.cpu()
-        if logits is not None:
-            preds = logits.argmax(axis=1).cpu()
-        else:
-            preds = pred_labels.cpu()
-        cm = sklearn.metrics.confusion_matrix(labels, preds)
-        cm = cm.transpose()
-        plt.matshow(cm.transpose())
-        for (x, y), value in np.ndenumerate(cm):
-            plt.text(x, y, f"{value:d}", va="center", ha="center")
-        plt.savefig(os.path.join(self.args.checkpoint_dir, filename))
-        plt.close()
+            self.metrics.save_image_set(0, context_images, "selected_{}".format(key))
 
     def generate_coreset_discard(self, path):
         #import pdb; pdb.set_trace()
@@ -703,11 +463,11 @@ class Learner:
             entropies = []
             restart_checkpoints = []
             if self.args.importance_mode == 'all':
-                self.print_and_log_metric("Error - coreset construction by discard does not support doing all importance modes simultaneously")
+                self.metrics.plot_scatter("Error - coreset construction by discard does not support doing all importance modes simultaneously")
                 return  
             # Start with the original, random context set
             task_dict = self.dataset.get_test_task(item)
-            context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
+            context_images, target_images, context_labels, target_labels = utils.prepare_task(task_dict, self.device)
             image_ids = task_dict["context_ids"]
             no_drop_count = 0
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
@@ -719,7 +479,7 @@ class Learner:
                     accuracies.append(task_accuracy)
                     losses.append(task_loss)
                     if ti % save_out_interval == 0 or ti == self.args.tasks-1:
-                        self.plot_confusion_matrix(target_labels, "confusion_{}.png".format(ti), logits=target_logits)
+                        self.metrics.plot_confusion_matrix(target_labels, "confusion_{}.png".format(ti), logits=target_logits)
                     del target_logits
 
                 one_hot = torch.nn.functional.one_hot(context_labels).to("cpu")
@@ -736,7 +496,7 @@ class Learner:
                         context_features, target_features = self.model.context_features.clone(), self.model.target_features.clone()
 
                 if ranking_mode == 'loo':
-                    weight_per_qp = self.calculate_loo(context_images, context_labels, target_images, target_labels)
+                    weight_per_qp = metaloo.calculate_loo(self.model, self.loss, context_images, context_labels, target_images, target_labels)
                 elif ranking_mode == 'attention':
                     # Make a copy of the attention weights otherwise we get a reference to what the model is storing
                     with torch.no_grad():
@@ -744,7 +504,7 @@ class Learner:
                     attention_weights = self.model.attention_weights.copy()
                     weight_per_qp = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
                 elif ranking_mode == 'representer':
-                    weight_per_qp = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
+                    weight_per_qp = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, target_labels, target_features, self.representer_args, self.representer_args)
                 elif ranking_mode == 'random':
                     weight_per_qp = self.random_weights(context_images, context_labels, target_images, target_labels)
                     
@@ -753,7 +513,7 @@ class Learner:
                 rankings = torch.argsort(weights, descending=True)
                 
                 # Discard least valuable point/s
-                candidate_indices, dropped_indices = self.select_by_dropping(weights, use_top_k=True)
+                candidate_indices, dropped_indices = metaloo.select_by_dropping(weights, number=self.args.top_k)
                 candidate_ids = image_ids[candidate_indices]
                 dropped_ids = image_ids[dropped_indices]
                 if len(dropped_indices) == 1:
@@ -769,7 +529,7 @@ class Learner:
                     # Request new points to replace those
                     new_images, new_labels, new_ids = self.dataset.sample_new_context_points(self.args.top_k)
                     # Re-prepare data
-                    new_images, new_labels = move_set_to_cuda(new_images, new_labels, self.device)
+                    new_images, new_labels = utils.move_set_to_cuda(new_images, new_labels, self.device)
 
                     for i, idd in enumerate(new_ids):
                         context_images[dropped_indices[i]] = new_images[i]
@@ -818,17 +578,17 @@ class Learner:
                                 context_images, context_labels, image_ids = self.dataset.sample_new_context_points(context_images.shape[0], force_reset=True)
     
                             # Re-prepare data
-                            context_images, context_labels = move_set_to_cuda(context_images, context_labels, self.device)
+                            context_images, context_labels = utils.move_set_to_cuda(context_images, context_labels, self.device)
 
                             restart_checkpoints.append(current_info)
                             break
                         
 
                 if ti % save_out_interval == 0 or (ti - ti_start > save_out_interval):
-                    self.save_image_set(ti, context_images[candidate_indices], "keep_{}".format(ti), labels=context_labels[candidate_indices])
-                    self.save_image_set(ti, old_images, "discard_{}".format(ti), labels=old_labels)
-                    self.save_image_set(ti, context_images[dropped_indices], "new_{}".format(ti), labels=context_labels[dropped_indices])
-                    self.save_image_set(ti, target_images, "target_{}".format(ti), labels=target_labels)
+                    self.metrics.save_image_set(ti, context_images[candidate_indices], "keep_{}".format(ti), labels=context_labels[candidate_indices])
+                    self.metrics.save_image_set(ti, old_images, "discard_{}".format(ti), labels=old_labels)
+                    self.metrics.save_image_set(ti, context_images[dropped_indices], "new_{}".format(ti), labels=context_labels[dropped_indices])
+                    self.metrics.save_image_set(ti, target_images, "target_{}".format(ti), labels=target_labels)
 
 
                     # Remove the old points, replace with new points
@@ -836,7 +596,7 @@ class Learner:
                     # Get new query set as well
                     #if ti == int(self.args.tasks/2):
                     #    target_images, target_labels, _ = self.dataset.get_query_set()
-                    #    target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
+                    #    target_images, target_labels = utils.move_set_to_cuda(target_images ,target_labels, self.device)
 
             eval_accuracies = []
             num_eval_tasks = 100
@@ -847,7 +607,7 @@ class Learner:
                 with torch.no_grad():
                     target_images, target_labels, _ = self.dataset.get_query_set()
                     eval_labels.append(target_labels.cpu())
-                    target_images, target_labels = move_set_to_cuda(target_images ,target_labels, self.device)
+                    target_images, target_labels = utils.move_set_to_cuda(target_images ,target_labels, self.device)
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     eval_predictions.append(target_logits.argmax(axis=1).cpu())
                     eval_losses.append(self.loss(target_logits, target_labels, reduce=True).item())
@@ -856,35 +616,20 @@ class Learner:
                     del target_logits
             all_eval_labels = torch.cat(eval_labels)
             all_eval_predictions = torch.cat(eval_predictions)
-            self.plot_confusion_matrix(all_eval_labels, pred_labels=all_eval_predictions, filename="confusion_eval.png")
+            self.metrics.plot_confusion_matrix(all_eval_labels, pred_labels=all_eval_predictions, filename="confusion_eval.png")
             
-            self.print_and_log_metric(accuracies, item, 'Accuracy')
-            self.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy')
-            self.print_and_log_metric(eval_losses, item, 'Eval Loss')
+            self.metrics.plot_scatter(accuracies, item, 'Accuracy')
+            self.metrics.plot_scatter(eval_accuracies, item, 'Eval Accuracy')
+            self.metrics.plot_scatter(eval_losses, item, 'Eval Loss')
             self.logger.print_and_log("Number of no_drop iterations: {}".format(no_drop_count))
-            self.save_image_set(ti, context_images, "context_final".format(ti), labels=context_labels)
-            self.plot_and_log(accuracies, "Accuracies over tasks", "accuracies.png")
-            self.plot_and_log(losses, "Losses over tasks", "losses.png")
-            self.plot_and_log(entropies, "Entropy of context labels", "entropy.png")
-            self.bar_plot_and_log(list(self.dataset.returned_label_counts.keys()), self.dataset.returned_label_counts.values(), "Returned label counts: ", "returned_label_counts.png")
-            self.plot_hist(context_labels.cpu(), np.arange(10), "final_context_distrib", title='Final Context Distribution', x_label='class', y_label='count', density=False)
+            self.metrics.save_image_set(ti, context_images, "context_final".format(ti), labels=context_labels)
+            self.metrics.plot_and_log(accuracies, "Accuracies over tasks", "accuracies.png")
+            self.metrics.plot_and_log(losses, "Losses over tasks", "losses.png")
+            self.metrics.plot_and_log(entropies, "Entropy of context labels", "entropy.png")
+            self.metrics.bar_plot_and_log(list(self.dataset.returned_label_counts.keys()), self.dataset.returned_label_counts.values(), "Returned label counts: ", "returned_label_counts.png")
+            self.metrics.plot_hist(context_labels.cpu(), np.arange(10), "final_context_distrib", title='Final Context Distribution', x_label='class', y_label='count', density=False)
             import pdb; pdb.set_trace()
             self.logger.log("{}".format(restart_checkpoints))
-            
-    def plot_and_log(self, vals, descrip, filename, bar=False):
-        self.logger.log(descrip)
-        self.logger.log("{}".format(vals))
-        plt.plot(vals)
-        plt.savefig(os.path.join(self.args.checkpoint_dir, filename))
-        plt.close()
-        
-    def bar_plot_and_log(self, keys, vals, descrip, filename, bar=False):
-        self.logger.log(descrip)
-        for key, val in zip(keys, vals):
-            self.logger.log("{} : {}".format(key, val))
-        plt.bar(keys, vals)
-        plt.savefig(os.path.join(self.args.checkpoint_dir, filename))
-        plt.close()
 
     def generate_coreset(self, path):
         self.logger.print_and_log("")  # add a blank line
@@ -910,7 +655,7 @@ class Learner:
                 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
-                context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
+                context_images, target_images, context_labels, target_labels = utils.prepare_task(task_dict, self.device)
 
                 #rankings_per_qp = {}
                 weights_per_qp = {}
@@ -922,7 +667,7 @@ class Learner:
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                     accuracies_full.append(task_accuracy)
                     if ti < 50 and self.args.way <= 10:
-                        self.plot_tsne(self.model.context_features, context_labels, self.model.prototypes, "{}_tsne_initial_coreset_{:.3}".format(ti, task_accuracy))
+                        self.metrics.plot_tsne(self.model.context_features, context_labels, self.model.classifier_params["class_prototypes"], "{}_tsne_initial_coreset_{:.3}".format(ti, task_accuracy))
 
                     del target_logits
 
@@ -937,7 +682,7 @@ class Learner:
                 for mode in ranking_modes:
 
                     if mode == 'loo':
-                        weights_per_qp['loo'] = self.calculate_loo(context_images, context_labels, target_images, target_labels)
+                        weights_per_qp['loo'] = metaloo.calculate_loo(self.model, self.loss, context_images, context_labels, target_images, target_labels)
                     elif mode == 'attention':
                         # Make a copy of the attention weights otherwise we get a reference to what the model is storing
                         with torch.no_grad():
@@ -946,7 +691,7 @@ class Learner:
                         weights_per_qp['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
                         
                     elif mode == 'representer':
-                        weights_per_qp['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
+                        weights_per_qp['representer'] = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, target_labels, target_features, self.representer_args)
                     elif mode == 'random':
                         weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
                     #rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
@@ -956,10 +701,10 @@ class Learner:
                     min_weight, max_weight = weights[mode].min(), weights[mode].max()
                     normalized_weights = (weights[mode] - min_weight)/(max_weight - min_weight)
                     for i in range(len(context_images)):
-                        image_rankings = add_image_rankings(image_rankings, task_dict["context_ids"][i], context_images[i], mode, normalized_weights[i])
+                        image_rankings = metaloo.add_image_rankings(image_rankings, task_dict["context_ids"][i], context_images[i], mode, normalized_weights[i])
 
             #import pdb; pdb.set_trace()
-            self.print_and_log_metric(accuracies_full, item, 'Full Accuracy')
+            self.metrics.plot_scatter(accuracies_full, item, 'Full Accuracy')
 
             # Righty-oh, now that we have our image_rankings, we need to do something with them.
             # Let's get some basic stats about them;
@@ -968,9 +713,9 @@ class Learner:
             pickle.dump(image_rankings, open(os.path.join(self.args.checkpoint_dir, "rankings.pickle"), "wb"))
             
             for mode in ranking_modes:
-                weights, image_ids = weights_from_multirankings(image_rankings, mode)
+                weights, image_ids = metaloo.weights_from_multirankings(image_rankings, mode)
                 image_labels = self.dataset.get_labels_from_ids(image_ids)
-                candidate_indices = self.select_top_k(weights, image_labels)
+                candidate_indices = self.select_top_k(self.args.top_k, weights, self.args.spread_constraint, image_labels)
                 candidate_ids = image_ids[candidate_indices]
                 candidate_labels = image_labels[candidate_indices]
                 self.logger.log("{} candidate labels: {}".format(mode, candidate_labels))
@@ -978,19 +723,19 @@ class Learner:
                 eval_accuracies = []
                 for ti in tqdm(range(50), dynamic_ncols=True):
                     task_dict = self.dataset.get_task_from_ids(candidate_ids)
-                    context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
+                    context_images, target_images, context_labels, target_labels = utils.prepare_task(task_dict, self.device)
 
                     with torch.no_grad():
                         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                         task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                         eval_accuracies.append(task_accuracy)
                         if ti == 0:
-                            self.plot_tsne(self.model.context_features, context_labels, self.model.prototypes, "{}_tsne_candidate_coreset_{:.3}".format(mode, task_accuracy))
-                            self.save_image_set(ti, context_images, "selected_{}".format(mode))
+                            self.metrics.plot_tsne(self.model.context_features, context_labels, self.model.classifier_params["class_prototypes"], "{}_tsne_candidate_coreset_{:.3}".format(mode, task_accuracy))
+                            self.metrics.save_image_set(ti, context_images, "selected_{}".format(mode))
 
                         del target_logits
                     
-                self.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy ({})'.format(mode))
+                self.metrics.plot_scatter(eval_accuracies, item, 'Eval Accuracy ({})'.format(mode))
 
     def _funky_bimodal_inner_loop(self, context_images, context_labels, context_labels_orig, target_images, target_labels, ranking_modes, accuracies, num_unique_labels, ti, descrip):
         full_accuracy = -1
@@ -1015,7 +760,7 @@ class Learner:
         for mode in ranking_modes:
 
             if mode == 'loo':
-                weights_per_qp['loo'] = self.calculate_loo(context_images, context_labels, target_images, target_labels)
+                weights_per_qp['loo'] = metaloo.calculate_loo(self.model, self.loss, context_images, context_labels, target_images, target_labels)
             elif mode == 'attention':
                 # Make a copy of the attention weights otherwise we get a reference to what the model is storing
                 with torch.no_grad():
@@ -1024,7 +769,7 @@ class Learner:
                 weights_per_qp['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
                 
             elif mode == 'representer':
-                weights_per_qp['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
+                weights_per_qp['representer'] = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, target_labels, target_features, self.representer_args)
             elif mode == 'random':
                 weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
             rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
@@ -1033,15 +778,15 @@ class Learner:
 
         for key in weights.keys():
             if self.args.selection_mode == "top_k":
-                candidate_indices = self.select_top_k(weights[key], context_labels)
+                candidate_indices = self.select_top_k(self.args.top_k, weights[key], context_labels, self.args.spread_constraint, )
             elif self.args.selection_mode == "multinomial":
-                candidate_indices = self.select_multinomial(weights[key], context_labels)
+                candidate_indices = metaloo.select_multinomial(self.args.top_k, weights[key], context_labels, self.args.spread_constraint)
             elif self.args.selection_mode == "divine":
-                candidate_indices = self.select_divine(weights[key], context_features, context_labels, key)
+                candidate_indices = metaloo.select_divine(self.args.top_k, weights[key], context_features, context_labels, self.args.spread_constraint, key)
             candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
 
             # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
-            reduced_candidate_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(candidate_labels, target_images, target_labels)
+            reduced_candidate_labels, reduced_target_images, reduced_target_labels = metaloo.remove_unrepresented_points(candidate_labels, target_images, target_labels)
 
             num_unique_labels[key].append(len(context_labels_orig[candidate_indices].unique()))
             
@@ -1056,7 +801,7 @@ class Learner:
                 # Save out the selected candidates (?)
 
                 if ti < 10:
-                    self.save_image_set(ti, candidate_images, "candidate_{}_{}".format(descrip, key), labels=candidate_labels)
+                    self.metrics.save_image_set(ti, candidate_images, "candidate_{}_{}".format(descrip, key), labels=candidate_labels)
                     
         return full_accuracy, accuracies, num_unique_labels
 
@@ -1090,15 +835,15 @@ class Learner:
 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
-                context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
+                context_images, target_images, context_labels, target_labels = utils.prepare_task(task_dict, self.device)
                 
                 context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
                 context_labels = context_labels.floor_divide(2)
                 target_labels = target_labels.floor_divide(2)
                 
                 if ti < 10:
-                    self.save_image_set(ti, context_images, "context")
-                    self.save_image_set(ti, target_images, "target")
+                    self.metrics.save_image_set(ti, context_images, "context")
+                    self.metrics.save_image_set(ti, target_images, "target")
 
                 full_acc_bimodal, accuracies_bimodal, num_unique_labels_bimodal = self._funky_bimodal_inner_loop(context_images, context_labels, context_labels_orig, 
                                 target_images, target_labels, ranking_modes, accuracies_bimodal, num_unique_labels_bimodal, ti, "bimodal")
@@ -1109,13 +854,13 @@ class Learner:
                 classes_to_keep = list(range(0, len(orig_classes), 2))
                 keep_indices = []
                 for c in classes_to_keep:
-                    c_indices = extract_class_indices(target_labels_orig, c)
+                    c_indices = utils.extract_class_indices(target_labels_orig, c)
                     keep_indices = keep_indices + c_indices.squeeze().tolist()
                 keep_indices = np.array(keep_indices)
                 new_target_images, new_target_labels = target_images[keep_indices], target_labels[keep_indices]
 
                 if ti < 10:
-                    self.save_image_set(ti, target_images[keep_indices], "unimodal_target", labels=target_labels_orig[keep_indices])
+                    self.metrics.save_image_set(ti, target_images[keep_indices], "unimodal_target", labels=target_labels_orig[keep_indices])
                 
                 full_acc_unimodal, accuracies_unimodal, num_unique_labels_unimodal = self._funky_bimodal_inner_loop(context_images, context_labels, context_labels_orig,
                                 new_target_images, new_target_labels, ranking_modes, accuracies_unimodal, num_unique_labels_unimodal, ti, "unimodal")
@@ -1124,16 +869,16 @@ class Learner:
             for key in num_unique_labels_bimodal.keys():
                 unique_np = np.array(num_unique_labels_bimodal[key])
                 self.logger.print_and_log("Average number of unique labels (bimodal) ({}): {}+/-{}".format(key, unique_np.mean(), unique_np.std()))
-            self.print_and_log_metric(accuracies_full_bimodal, item, 'Accuracy (bimodal)')
+            self.metrics.plot_scatter(accuracies_full_bimodal, item, 'Accuracy (bimodal)')
             for key in accuracies_bimodal.keys():
-                self.print_and_log_metric(accuracies_bimodal[key], item, 'Accuracy (bimodal) {}'.format(key))
+                self.metrics.plot_scatter(accuracies_bimodal[key], item, 'Accuracy (bimodal) {}'.format(key))
                 
             for key in num_unique_labels_unimodal.keys():
                 unique_np = np.array(num_unique_labels_unimodal[key])
                 self.logger.print_and_log("Average number of unique labels (unimodal) ({}): {}+/-{}".format(key, unique_np.mean(), unique_np.std()))
-            self.print_and_log_metric(accuracies_full_unimodal, item, 'Accuracy (unimodal)')
+            self.metrics.plot_scatter(accuracies_full_unimodal, item, 'Accuracy (unimodal)')
             for key in accuracies_unimodal.keys():
-                self.print_and_log_metric(accuracies_unimodal[key], item, 'Accuracy (unimodal) {}'.format(key))
+                self.metrics.plot_scatter(accuracies_unimodal[key], item, 'Accuracy (unimodal) {}'.format(key))
            
     def select_shots(self, path):
         self.logger.print_and_log("")  # add a blank line
@@ -1168,7 +913,7 @@ class Learner:
 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
-                context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
+                context_images, target_images, context_labels, target_labels = utils.prepare_task(task_dict, self.device)
                 if self.args.test_case == "bimodal":
                     context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
                     context_labels = context_labels.floor_divide(2)
@@ -1180,8 +925,8 @@ class Learner:
                 weights = {}
                 
                 if ti < 10 and self.args.way * self.args.shot <= 100:
-                    self.save_image_set(ti, context_images, "context")
-                    self.save_image_set(ti, target_images, "target")
+                    self.metrics.save_image_set(ti, context_images, "context")
+                    self.metrics.save_image_set(ti, target_images, "target")
                 
                 with torch.no_grad():
                     target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
@@ -1205,7 +950,7 @@ class Learner:
                 for mode in ranking_modes:
 
                     if mode == 'loo':
-                        weights_per_qp['loo'] = self.calculate_loo(context_images, context_labels, target_images, target_labels)
+                        weights_per_qp['loo'] = metaloo.calculate_loo(self.model, self.loss, context_images, context_labels, target_images, target_labels)
                     elif mode == 'attention':
                         # Make a copy of the attention weights otherwise we get a reference to what the model is storing
                         with torch.no_grad():
@@ -1214,7 +959,7 @@ class Learner:
                         weights_per_qp['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
                         
                     elif mode == 'representer':
-                        weights_per_qp['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
+                        weights_per_qp['representer'] = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, target_labels, target_features, self.representer_args)
                     elif mode == 'random':
                         weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
                     rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
@@ -1223,41 +968,41 @@ class Learner:
                     
                 # Great, now we have the importance weights. Now what to do with them
                 if self.args.importance_mode == 'all':
-                    corr, inters = self.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['representer'], "Attention vs Representer")
+                    corr, inters = self.metrics.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['representer'], "Attention vs Representer")
                     correlations['attention_representer'].append(corr)
                     intersections['attention_representer'].append(inters)
-                    corr, inters = self.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['loo'], "Attention vs Meta-LOO")
+                    corr, inters = self.metrics.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['loo'], "Attention vs Meta-LOO")
                     correlations['attention_loo'].append(corr)
                     intersections['attention_loo'].append(inters)
-                    corr, inters = self.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['loo'], "Representer vs Meta-LOO")
+                    corr, inters = self.metrics.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['loo'], "Representer vs Meta-LOO")
                     correlations['representer_loo'].append(corr) 
                     intersections['representer_loo'].append(inters)
-                    corr, inters = self.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['random'], "Attention vs Random")
+                    corr, inters = self.metrics.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['random'], "Attention vs Random")
                     correlations['attention_random'].append(corr)
                     intersections['attention_random'].append(inters)
-                    corr, inters = self.compare_rankings(rankings_per_qp['loo'], rankings_per_qp['random'], "Meta-LOO vs Random")
+                    corr, inters = self.metrics.compare_rankings(rankings_per_qp['loo'], rankings_per_qp['random'], "Meta-LOO vs Random")
                     correlations['loo_random'].append(corr)
                     intersections['loo_random'].append(inters)
-                    corr, inters = self.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['random'], "Representer vs Random")
+                    corr, inters = self.metrics.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['random'], "Representer vs Random")
                     correlations['representer_random'].append(corr) 
                     intersections['representer_random'].append(inters)
 
                 for key in weights.keys():
                     if self.args.selection_mode == "top_k":
-                        candidate_indices = self.select_top_k(weights[key], context_labels)
+                        candidate_indices = self.select_top_k(self.args.top_k, weights[key], context_labels, self.args.spread_constraint)
                     elif self.args.selection_mode == "multinomial":
-                        candidate_indices = self.select_multinomial(weights[key], context_labels)
+                        candidate_indices = metaloo.select_multinomial(self.args.top_k, weights[key], context_labels, self.args.spread_constraint)
                     elif self.args.selection_mode == "divine":
-                        candidate_indices = self.select_divine(weights[key], context_features, context_labels, key)
+                        candidate_indices = metaloo.select_divine(self.args.top_k, weights[key], context_features, context_labels, self.args.spread_constraint, key)
                     candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
 
                     # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
-                    reduced_candidate_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(candidate_labels, target_images, target_labels)
+                    reduced_candidate_labels, reduced_target_images, reduced_target_labels = metaloo.remove_unrepresented_points(candidate_labels, target_images, target_labels)
 
                     if self.args.test_case == "bimodal":
                         num_unique_labels[key].append(len(context_labels_orig[candidate_indices].unique()))
                         candidate_labels_orig = context_labels_orig[candidate_indices]
-                        reduced_candidate_labels_orig, reduced_target_images_orig, reduced_target_labels_orig = self.remove_unrepresented_points(candidate_labels_orig, target_images, target_labels_orig)
+                        reduced_candidate_labels_orig, reduced_target_images_orig, reduced_target_labels_orig = metaloo.remove_unrepresented_points(candidate_labels_orig, target_images, target_labels_orig)
                     
                     # Calculate accuracy on task using only selected candidates as context points
                     with torch.no_grad():
@@ -1270,7 +1015,7 @@ class Learner:
                         # Save out the selected candidates (?)
 
                         if ti < 10 and self.args.way * self.args.shot <= 100:
-                            self.save_image_set(ti, candidate_images, "candidate_{}_{}".format(ti, key), labels=candidate_labels)
+                            self.metrics.save_image_set(ti, candidate_images, "candidate_{}_{}".format(ti, key), labels=candidate_labels)
 
                         if self.args.test_case == "bimodal":
                             target_logits = self.model(candidate_images, reduced_candidate_labels_orig, reduced_target_images_orig, reduced_target_labels_orig, MetaLearningState.META_TEST)
@@ -1284,19 +1029,19 @@ class Learner:
                     unique_np = np.array(num_unique_labels[key])
                     self.logger.print_and_log("Average number of unique labels ({}): {}+/-{}".format(key, unique_np.mean(), unique_np.std()))
 
-                self.print_and_log_metric(accuracies_orig_full, item, '*Accuracy (Not bimodal)')
+                self.metrics.plot_scatter(accuracies_orig_full, item, '*Accuracy (Not bimodal)')
                 for key in accuracies_orig_by_mode.keys():
-                    self.print_and_log_metric(accuracies_orig_by_mode[key], item, '*Accuracy (Not bimodal) {}'.format(key))
+                    self.metrics.plot_scatter(accuracies_orig_by_mode[key], item, '*Accuracy (Not bimodal) {}'.format(key))
                 
-            self.print_and_log_metric(accuracies_full, item, 'Accuracy')
+            self.metrics.plot_scatter(accuracies_full, item, 'Accuracy')
 
             for key in weights.keys():
-                self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
+                self.metrics.plot_scatter(accuracies[key], item, 'Accuracy {}'.format(key))
             if self.args.importance_mode == 'all':
                 for key in correlations:
-                    self.print_and_log_metric(correlations[key], item, 'Correlation {}'.format(key))
+                    self.metrics.plot_scatter(correlations[key], item, 'Correlation {}'.format(key))
                 for key in intersections:
-                    self.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
+                    self.metrics.plot_scatter(intersections[key], item, 'Intersections {}'.format(key))
         
     def make_noisy(self, task_dict):
         num_classes = len(np.unique(task_dict["target_labels"]))
@@ -1329,7 +1074,7 @@ class Learner:
             wild_card_indices = np.empty(0, dtype=np.int8)
             for class_to_drop in classes_to_drop:
                 # Build a list of all indices that we want to corrupt/drop
-                wild_card_indices = np.append(wild_card_indices, extract_class_indices(task_dict["context_labels"], class_to_drop))
+                wild_card_indices = np.append(wild_card_indices, utils.extract_class_indices(task_dict["context_labels"], class_to_drop))
             wild_card_indices = wild_card_indices.reshape(-1)
             np.random.shuffle(wild_card_indices)
 
@@ -1340,7 +1085,7 @@ class Learner:
             clean_count = 0
             for c in range(num_classes):
                 if c not in classes_to_drop:
-                    c_indices = extract_class_indices(task_dict["context_labels"], c)
+                    c_indices = utils.extract_class_indices(task_dict["context_labels"], c)
                     new_context_labels[c_indices] = clean_count
                     clean_count += 1
 
@@ -1354,13 +1099,13 @@ class Learner:
                 # Recalculate indices of mislabeled images by using the unnormalized context labels
                 wild_card_indices = np.empty(0, dtype=np.int8)
                 for class_to_drop in classes_to_drop:
-                    wild_card_indices = np.append(wild_card_indices, extract_class_indices(task_dict["context_labels"], class_to_drop))
+                    wild_card_indices = np.append(wild_card_indices, utils.extract_class_indices(task_dict["context_labels"], class_to_drop))
 
             mislabeled_indices = wild_card_indices
 
             # Remove the dropped classes from the target set
             for class_to_drop in classes_to_drop:
-                target_class_indices = extract_class_indices(task_dict["target_labels"], class_to_drop)
+                target_class_indices = utils.extract_class_indices(task_dict["target_labels"], class_to_drop)
                 task_dict["target_images"] = np.delete(task_dict["target_images"], target_class_indices, axis=0)
                 task_dict["target_labels"] = np.delete(task_dict["target_labels"], target_class_indices)
 
@@ -1368,7 +1113,7 @@ class Learner:
             clean_count = 0
             for c in range(num_classes):
                 if c not in classes_to_drop:
-                    c_indices = extract_class_indices(task_dict["target_labels"], c)
+                    c_indices = utils.extract_class_indices(task_dict["target_labels"], c)
                     task_dict["target_labels"][c_indices] = clean_count
                     clean_count += 1
 
@@ -1377,80 +1122,6 @@ class Learner:
         task_dict["noisy_context_indices"] = mislabeled_indices
         return task_dict
         
-
-    
-
-    def plot_hist(self, x, bins, filename, task_num=None, title='', x_label='', y_label='', density=False):
-        x = convert_to_numpy(x)
-        plt.hist(x, bins=bins, density=density)
-        plt.xlabel(x_label)
-        plt.ylabel(y_label)
-        plt.title(title)
-        plt.grid(True)
-        if task_num != None:
-            filename = "{}_".format(task_num) + filename
-        filename += ".png"
-        plt.savefig(os.path.join(self.args.checkpoint_dir, filename))
-        plt.close()
-
-
-    def plot_tsne(self, points, labels, prototypes, descrip):
-        class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c", "#323ca8", "#ff0303", "#03ffc4", "#afff03", "#a566e3"]
-        prototypes = convert_to_numpy(prototypes)
-        prototype_labels = convert_to_numpy(torch.unique(labels)) # Need the ordering of torch.unique
-        points = convert_to_numpy(points)
-        labels = convert_to_numpy(labels)
-        points = np.concatenate([points, prototypes], axis=0)
-        labels = np.concatenate([labels, prototype_labels], axis=0)
-        perplexities = [30] #[2, 5, 10, 20, 30, 50, 75, 100]
-        learning_rates = [50] #[10.0, 25, 50, 100, 200, 500]
-        for r in learning_rates:
-            for p in perplexities:
-                p_embedded = TSNE(n_components=2, init='random', n_iter=1000, learning_rate=r).fit_transform(points)
-                fig = plt.figure()
-                ax = fig.add_subplot(111)
-                for class_label in range(self.args.way):
-                    class_mask = labels == class_label
-                    # Plot regular points
-                    ax.scatter(p_embedded[class_mask][:-1, 0],p_embedded[class_mask][:-1, 1], label='Class {}'.format(class_label), c=class_colors[class_label])
-                    # Plot prototypes
-                    ax.scatter(p_embedded[class_mask][-1:, 0],p_embedded[class_mask][-1:, 1], c=class_colors[class_label], marker='s')
-
-                plt.legend()
-                plt.savefig(os.path.join(self.args.checkpoint_dir, "tsne_" + descrip.replace(":", "-") + "_perp_{}_lr_{}.png".format(p, r)))
-                plt.close()
-
-
-    def plot_scatter(self, x, y, x_label, y_label, plot_title, output_name, class_labels=None, color=None, split_by_class_label=False, x_min=None, x_max=None, y_min=None, y_max=None):
-        class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
-        x = convert_to_numpy(x)
-        y = convert_to_numpy(y)
-        if class_labels != None:
-            t_color = [class_colors[lbl] for lbl in class_labels]
-            num_classes_local = len(class_labels.unique())
-        else:
-            assert not split_by_class_label
-            assert color != None
-            t_color = color
-            num_classes_local = self.args.way
-
-        if split_by_class_label:
-            x_min, x_max = x.min(), x.max()
-            y_min, y_max = y.min(), y.max()
-            for tc in range(0, num_classes_local):
-                class_mask = (class_labels == tc).cpu().numpy()
-                self.plot_scatter(x[class_mask], y[class_mask], x_label, y_label, plot_title + "_{}".format(tc), output_name + "_{}".format(tc), color = class_colors[tc], 
-                    x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max, split_by_class_label=False)
-
-        handles = [mpatches.Rectangle((0, 0), 1, 1, fc=ccol) for ccol in class_colors ]
-        plt.scatter(x, y, c=t_color)
-        plt.xlabel(x_label)
-        plt.ylabel(y_label)
-        plt.title(plot_title)
-        plt.grid(True)
-        plt.legend(handles, ['Class {}'.format(lbl) for lbl in range(num_classes_local)])
-        plt.savefig(os.path.join(self.args.checkpoint_dir, output_name + ".png"))
-        plt.close()
         
     def detect_noisy_shots(self, path):
         self.logger.print_and_log("")  # add a blank line
@@ -1480,7 +1151,7 @@ class Learner:
 
                 # If mislabelling, then we calculate clean accuracy before doing any mislabeling
                 if self.args.noise_type == "mislabel":
-                    context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
+                    context_images, target_images, context_labels, target_labels = utils.prepare_task(task_dict, self.device)
                     # Calculate clean accuracy 
                     with torch.no_grad():
                         target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
@@ -1489,8 +1160,8 @@ class Learner:
 
                         if ti<50:
                             initial_predictions = target_logits.argmax(axis=1)
-                            self.plot_hist(initial_predictions, bins=class_bins, filename="class_distrib_initial", task_num=ti, title='Predicted classes (initial)', x_label='Predicted class label', density=True)
-                            self.plot_tsne(self.model.context_features, context_labels, self.model.prototypes, "{}_tsne_initial_{:.3}_acc".format(ti, task_accuracy))
+                            self.metrics.plot_hist(initial_predictions, bins=class_bins, filename="class_distrib_initial", task_num=ti, title='Predicted classes (initial)', x_label='Predicted class label', density=True)
+                            self.metrics.plot_tsne(self.model.context_features, context_labels, self.model.classifier_params["class_prototypes"], "{}_tsne_initial_{:.3}_acc".format(ti, task_accuracy))
 
                         del target_logits
                     del context_images
@@ -1498,7 +1169,7 @@ class Learner:
 
                 # Noisiness
                 task_dict = self.make_noisy(task_dict)
-                context_images, target_images, context_labels, target_labels = prepare_task(task_dict, self.device)
+                context_images, target_images, context_labels, target_labels = utils.prepare_task(task_dict, self.device)
 
                 # For now, just don't bother with "clean" accuracy; it's hard to be comparable
                 # If ood, then we need to first remove the superfluous class (i.e. make noisy), 
@@ -1515,8 +1186,8 @@ class Learner:
                     if ti<50:
                         noisy_predictions = target_logits.argmax(axis=1)
                         noisy_losses = self.loss(target_logits, target_labels, reduce=False)
-                        self.plot_hist(noisy_predictions, bins=class_bins, filename="class_distrib_noisy", task_num=ti, title='Predicted classes (noisy)', x_label='Predicted class label', density=True)
-                        self.plot_tsne(self.model.context_features, context_labels, self.model.prototypes, "{}_tsne_noisy_{:.3}_acc".format(ti, task_accuracy))
+                        self.metrics.plot_hist(noisy_predictions, bins=class_bins, filename="class_distrib_noisy", task_num=ti, title='Predicted classes (noisy)', x_label='Predicted class label', density=True)
+                        self.metrics.plot_tsne(self.model.context_features, context_labels, self.model.classifier_params["class_prototypes"], "{}_tsne_noisy_{:.3}_acc".format(ti, task_accuracy))
 
                     del target_logits
                     gc.collect()
@@ -1526,8 +1197,8 @@ class Learner:
                 weights = {}
 
                 if ti < 10 and self.args.way * self.args.shot <= 100:
-                    self.save_image_set(ti, context_images, "context", labels=context_labels)
-                    self.save_image_set(ti, target_images, "target", labels=target_labels)
+                    self.metrics.save_image_set(ti, context_images, "context", labels=context_labels)
+                    self.metrics.save_image_set(ti, target_images, "target", labels=target_labels)
 
                 # Save the target/context features
                 # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
@@ -1542,7 +1213,7 @@ class Learner:
                     torch.cuda.empty_cache()
                     print(mode)
                     if mode == 'loo':
-                        weights_per_qp['loo'] = self.calculate_loo(context_images, context_labels, target_images, target_labels)
+                        weights_per_qp['loo'] = metaloo.calculate_loo(self.model, self.loss, context_images, context_labels, target_images, target_labels)
 
                     elif mode == 'attention':
                         # Make a copy of the attention weights otherwise we get a reference to what the model is storing
@@ -1551,7 +1222,7 @@ class Learner:
                         weights_per_qp['attention'] = self.reshape_attention_weights(self.model.attention_weights, context_labels, len(target_labels))
                         
                     elif mode == 'representer':
-                        weights_per_qp['representer'] = self.calculate_representer_values(context_images, context_labels, context_features, target_labels, target_features)
+                        weights_per_qp['representer'] = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, target_labels, target_features, self.representer_args)
                     elif mode == 'random':
                         weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
                     rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
@@ -1561,13 +1232,13 @@ class Learner:
                 for key in ranking_modes:
                     removed_indices_set = None
                     if self.args.selection_mode == "top_k":
-                        candidate_indices = self.select_top_k(weights[key], context_labels)
+                        candidate_indices = self.select_top_k(self.args.top_k, weights[key], context_labels, self.args.spread_constraint)
                     elif self.args.selection_mode == "multinomial":
-                        candidate_indices = self.select_multinomial(weights[key], context_labels)
+                        candidate_indices = metaloo.select_multinomial(self.args.top_k, weights[key], context_labels, self.args.spread_constraint)
                     elif self.args.selection_mode == "divine":
-                        candidate_indices = self.select_divine(weights[key], context_features, context_labels, key)
+                        candidate_indices = metaloo.select_divine(self.args.top_k, weights[key], context_features, context_labels, self.args.spread_constraint, key)
                     elif self.args.selection_mode == "drop":
-                        candidate_indices, removed_indices = self.select_by_dropping(weights[key])
+                        candidate_indices, removed_indices = metaloo.select_by_dropping(weights[key], drop_rate=self.args.drop_rate)
                         removed_indices_set = set(removed_indices.tolist())
                     if removed_indices_set is None:
                         removed_indices_set = set(range(len(context_labels))).difference(set(candidate_indices.tolist()))
@@ -1577,7 +1248,7 @@ class Learner:
                     candidate_images, candidate_labels = context_images[candidate_indices], context_labels[candidate_indices]
                     
                     # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
-                    reduced_candidate_labels, reduced_target_images, reduced_target_labels = self.remove_unrepresented_points(candidate_labels, target_images, target_labels)
+                    reduced_candidate_labels, reduced_target_images, reduced_target_labels = metaloo.remove_unrepresented_points(candidate_labels, target_images, target_labels)
 
                     # Calculate accuracy on task using only selected candidates as context points
                     with torch.no_grad():
@@ -1589,180 +1260,42 @@ class Learner:
 
                         if ti<50:
                             red_predictions = target_logits.argmax(axis=1)
-                            self.plot_hist(red_predictions, bins=class_bins, filename="class_distrib_reduced", task_num=ti, 
+                            self.metrics.plot_hist(red_predictions, bins=class_bins, filename="class_distrib_reduced", task_num=ti, 
                                     title='Predicted classes (reduced, -{})'.format(self.args.way-len(reduced_candidate_labels.unique())), x_label='Predicted class label', density=True)
                             red_losses = self.loss(target_logits, target_labels, reduce=False)            
-                            self.plot_tsne(self.model.context_features, candidate_labels, self.model.prototypes, "{}_tsne_reduced_{:.3}_acc".format(ti, task_accuracy))
+                            self.metrics.plot_tsne(self.model.context_features, candidate_labels, self.model.classifier_params["class_prototypes"], "{}_tsne_reduced_{:.3}_acc".format(ti, task_accuracy))
 
-                            self.plot_scatter(noisy_losses, red_losses, x_label="Loss when context points flipped", y_label="Loss when selected context points are dropped", plot_title="Target Point Losses",
+                            self.metrics.plot_scatter(noisy_losses, red_losses, x_label="Loss when context points flipped", y_label="Loss when selected context points are dropped", plot_title="Target Point Losses",
                                 output_name="{}_target_scatter_dropped.png".format(ti), class_labels=reduced_target_labels, split_by_class_label=True)
                         del target_logits
                             
                         # Save out the selected candidates (?)
                     if ti < 50  and self.args.way * self.args.shot <= 100:
-                        self.save_image_set(ti, context_images[removed_indices], "removed_by_{}".format(key), labels=context_labels[removed_indices])
-                        self.plot_hist(task_dict["true_context_labels"][removed_indices], class_bins, "selected_label_hist_true", ti, 'Classes selected for dropping', 'True class label', 'Num points selected for drop')
-                        self.plot_hist(context_labels[removed_indices], class_bins, "selected_label_hist_flipped", ti, 'Classes selected for dropping', 'Presented class label', 'Num points selected for drop')
+                        self.metrics.save_image_set(ti, context_images[removed_indices], "removed_by_{}".format(key), labels=context_labels[removed_indices])
+                        self.metrics.plot_hist(task_dict["true_context_labels"][removed_indices], class_bins, "selected_label_hist_true", ti, 'Classes selected for dropping', 'True class label', 'Num points selected for drop')
+                        self.metrics.plot_hist(context_labels[removed_indices], class_bins, "selected_label_hist_flipped", ti, 'Classes selected for dropping', 'Presented class label', 'Num points selected for drop')
 
             if len(accuracies_clean) > 0:
-                self.print_and_log_metric(accuracies_clean, item, 'Clean Accuracy')
-            self.print_and_log_metric(accuracies_noisy, item, 'Noisy Accuracy')
+                self.metrics.plot_scatter(accuracies_clean, item, 'Clean Accuracy')
+            self.metrics.plot_scatter(accuracies_noisy, item, 'Noisy Accuracy')
 
             for key in ranking_modes:
-                self.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
-                self.print_and_log_metric(overlaps[key], item, 'Shot Overlap {}'.format(key))
-        
-        
-    def select_divine(self, weights, embeddings, class_labels, gamma):
-        if self.args.spread_constraint == "by_class":
-            classes = torch.unique(class_labels)
-            candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
-            for c in classes:
-                c_indices = extract_class_indices(class_labels, c)
-                indices, div_terms, weight_terms = self.select_top_sum_redun_k(weights[c_indices], embeddings[c_indices], k=self.top_k)
-                #self.logger.log("{} (class {})\n".format(importance_weight_descrip, c))
-                #self.logger.log("\tDiversity terms {}\n".format(div_terms))
-                #self.logger.log("\tWeight terms {}\n".format(weight_terms))
-                class_candidate_indices = c_indices[indices]
-                candidate_indices[c] = class_candidate_indices
-            return candidate_indices.flatten()
-        elif self.args.spread_constraint == "none":
-            indices, div_terms, weight_terms =  self.select_top_sum_redun_k(weights, embeddings, k=self.top_k)
-            #self.logger.log("{}\n".format(importance_weight_descrip))
-            #self.logger.log("\tDiversity terms {}\n".format(div_terms))
-            #self.logger.log("\tWeight terms {}\n".format(weight_terms))
-            return indices
-        
-    def select_top_sum_redun_k(self, weights, embeddings, k, gamma=25, plus_div=False):
-        """
-        Returns indices of k diverse points with highest importance; based on facility location
-        """
-        top_ind = torch.argsort(weights, descending=True)[0]
-        selected_influence = weights[top_ind]
-        selected_data = [embeddings[top_ind]]
-        selected_indices = [top_ind.item()]
+                self.metrics.plot_scatter(accuracies[key], item, 'Accuracy {}'.format(key))
+                self.metrics.plot_scatter(overlaps[key], item, 'Shot Overlap {}'.format(key))
 
-        kappa = np.sum(rbf_kernel(embeddings.cpu()).sum(axis=1))
-        n = np.shape(weights)[0]
-        weights = np.array(weights)
-        diversity_terms, weight_terms = [], []
-        while len(selected_indices) < k:
-            candidates = np.setdiff1d(range(n), selected_indices)
-            selected_data_cpu = torch.stack(selected_data).cpu()
-            curr = np.sum(rbf_kernel(selected_data_cpu).sum(axis=1))
-            diversity_term = rbf_kernel(embeddings.cpu(), selected_data_cpu).sum(axis=1)[candidates]
-            diversity_term = (kappa - (curr+diversity_term))
-            weights_term = selected_influence + weights[candidates]
-            diversity_terms.append((diversity_term.mean(), diversity_term.max(), diversity_term.min()))
-            weight_terms.append((weights_term.mean(), weights_term.max(), weights_term.min()))
-
-            if plus_div:
-                dist_term = pairwise_distances(embeddings.cpu(),selected_data_cpu).sum(axis=1)[candidates]
-                objective_term = weights_term + gamma*diversity_term + dist_term
-            else:
-                objective_term = weights_term + gamma*diversity_term
-            
-            cand = candidates[np.argmax(objective_term)]
-            selected_influence += weights[cand]
-            selected_data += [embeddings[cand]]
-            selected_indices += [cand]
-        return selected_indices, weight_terms, diversity_terms
-
-    def select_by_dropping(self, weights, use_top_k=False):
-        if use_top_k:
-            num_to_keep = len(weights) - self.args.top_k
-        else:
-            num_to_keep = int(len(weights) * (1 - self.args.drop_rate))
-        ranking = torch.argsort(weights, descending=True)
-        return ranking[0:num_to_keep], ranking[num_to_keep:]
-
-    def select_top_k(self, weights, class_labels=None):
-        if self.args.spread_constraint == "by_class":
-            classes = torch.unique(class_labels)
-            candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
-            for c in classes:
-                c_indices = extract_class_indices(class_labels, c)
-                sub_weights = weights[c_indices]
-                sub_ranking = torch.argsort(sub_weights, descending=True)
-                class_candidate_indices = c_indices[sub_ranking[0:self.top_k]]
-                candidate_indices[c] = class_candidate_indices
-            return candidate_indices.flatten()
-        elif self.args.spread_constraint == "none":
-            ranking = torch.argsort(weights, descending=True)
-            return ranking[0:self.top_k]
-            
-            
-    def select_multinomial(self, weights, class_labels):
-        if self.args.spread_constraint == "by_class":
-            classes = torch.unique(class_labels)
-            candidate_indices = torch.zeros((len(classes), self.top_k), dtype=torch.long)
-            for c in classes:
-                c_indices = extract_class_indices(class_labels, c)
-                sub_weights = weights[c_indices]
-                sub_weights_sm = torch.nn.functional.softmax(sub_weights, dim=0)
-                class_candidate_indices = c_indices[torch.multinomial(sub_weights_sm, self.top_k, replacement=False)]
-                candidate_indices[c] = class_candidate_indices
-            return candidate_indices.flatten()
-        elif self.args.spread_constraint == "none":
-            weights_sm = torch.nn.functional.softmax(weights, dim=0)
-            return torch.multinomial(weights_sm, self.top_k, replacement=False)
-
-
-    def print_and_log_metric(self, values, item, metric_name="Accuracy"):
-        metric = np.array(values).mean() * 100.0
-        metric_confidence = (196.0 * np.array(values).std()) / np.sqrt(len(values))
-
-        self.logger.print_and_log('{} {}: {:3.1f}+/-{:2.1f}'.format(metric_name, item, metric, metric_confidence))
-    
-
-    def compare_rankings(self, series1, series2, descriptor="", weights=False):
-        if weights:
-            ranking1 = torch.argsort(series1, dim=1, descending=True)
-            ranking2 = torch.argsort(series2, dim=1, descending=True)
-        else:
-            ranking1, ranking2 = series1, series2
-            
-        ave_corr = 0.0
-        ave_intersected = 0.0
-        
-        for t in range(ranking1.shape[0]):
-            corr, p_value = kendalltau(ranking1[t], ranking2[t])
-            ave_corr = ave_corr + corr
-            
-            top_k_1 = set(np.array(ranking1[t][1:self.top_k]))
-            top_k_2 = set(np.array(ranking2[t][1:self.top_k]))
-            intersected = sorted(top_k_1 & top_k_2)
-            ave_intersected =  ave_intersected + len(intersected)
-            
-        ave_corr = ave_corr/ranking1.shape[0]
-        ave_intersected = ave_intersected/ranking1.shape[0]
-        
-        #self.logger.print_and_log("Ave num intersected {}: {}".format(descriptor, ave_intersected))
-        #self.logger.print_and_log("Ave corr {}: {}".format(descriptor, ave_corr))
-        
-        return ave_corr, ave_intersected
 
     def reshape_attention_weights(self, attention_weights, context_labels, num_target_points):
         weights_per_query_point = torch.zeros((num_target_points, len(context_labels)), device="cpu")
         # The method below of accessing attention weights per class is alright because it is how the model 
         # constructs this data structure.
         for ci, c in enumerate(torch.unique(context_labels)):
-            c_indices = extract_class_indices(context_labels, c)
+            c_indices = utils.extract_class_indices(context_labels, c)
             c_weights = attention_weights[ci].cpu().squeeze().clone()
             for q in range(c_weights.shape[0]):
                 weights_per_query_point[q][c_indices] = c_weights[q]
                 
         return weights_per_query_point
 
-    def slim_images_and_labels(self, images, labels):
-        slimmed_images = []
-        slimmed_labels = []
-        for c in torch.unique(labels):
-            slimmed_labels.append(c)
-            class_images = torch.index_select(images, 0, extract_class_indices(labels, c))
-            slimmed_images.append(class_images[0])
-
-        return torch.stack(slimmed_images), torch.stack(slimmed_labels)
 
     def _augment(self, num_augment_per_class, images, labels):
         if num_augment_per_class < 1:
