@@ -1,6 +1,8 @@
 import utils
 import numpy as np
 import torch
+from utils import MetaLearningState
+
             
 def select_multinomial(number, weights, class_labels, spread_constraint):
     if spread_constraint == "by_class":
@@ -66,7 +68,7 @@ def select_top_sum_redun_k(k, weights, embeddings, gamma=25, plus_div=False):
         selected_indices += [cand]
     return selected_indices, weight_terms, diversity_terms
 
-def select_by_dropping(weights, drop_rate=None, number=None):
+def select_by_dropping(weights, drop_rate=None, number=None, spread_constraint=None, class_labels=None):
     if (drop_rate != None and number != None):
         print("When selecting by dropping, only number to drop or drop rate can be specified, not both")
         return None
@@ -78,8 +80,37 @@ def select_by_dropping(weights, drop_rate=None, number=None):
     else:
         num_to_keep = int(len(weights) * (1 - drop_rate))
     ranking = torch.argsort(weights, descending=True)
-    return ranking[0:num_to_keep], ranking[num_to_keep:]
+    if spread_constraint == None or spread_constraint == "none":
+        return ranking[0:num_to_keep], ranking[num_to_keep:]
 
+    if spread_constraint == "by_class":
+        print("By class spread constraint not yet supported when selecting by dropping x")
+        return
+
+    if spread_constraint == "nonempty":
+        # Only dropping 1 point
+        if num_to_keep != len(ranking)-1:
+            print("nonempty spread constraint currenlty only support dropping 1 point at a time")
+            return None
+        drop_index = num_to_keep
+        keep_mask = torch.ones(len(ranking), dtype=bool)
+        keep_mask[drop_index] = False
+
+        total_num_classes = len(class_labels.unique())
+        num_represented_classes = len(class_labels[ranking[keep_mask]].unique())
+        while num_represented_classes != total_num_classes:
+            import pdb; pdb.set_trace()
+
+            # We shouldn't reach the end of the loop as long as the way/shot setup makes sense
+            keep_mask[drop_index] = True
+            drop_index -= 1
+            keep_mask[drop_index] = False
+
+            num_represented_classes = len(class_labels[ranking[keep_mask]].unique())
+        drop_mask = torch.logical_not(keep_mask)
+        return ranking[keep_mask], ranking[drop_mask]
+
+# class_labels must be specified if spread_constraint isn't "none"
 def select_top_k(number, weights, spread_constraint, class_labels=None):
     if spread_constraint == "by_class":
         classes = torch.unique(class_labels)
@@ -94,10 +125,25 @@ def select_top_k(number, weights, spread_constraint, class_labels=None):
     elif spread_constraint == "none":
         ranking = torch.argsort(weights, descending=True)
         return ranking[0:number]
-        
-        
+    elif spread_constraint == "nonempty":
+        print("By class spread constraint not yet supported when selecting by dropping x")
+        return None
+        """
+        end_index = number
+        indices = ranking[0:end_index]
+        total_num_classes = len(class_labels.unique())
+        num_represented_classes = len(class_labels[indices].unique())
+        while num_represented_classes != total_num_classes:
+            end_index -= 1
+            # We shouldn't reach the end of the loop as long as the way/shot setup makes sense
+            indices = torch.cat(ranking[0:end_index], ranking[end_index+1:])
+            num_represented_classes = len(class_labels[indices].unique())
+        return ranking[indices]
+        """
+
+
 def calculate_representer_values(model, loss, context_images, context_labels, context_features, target_labels, target_features,     
-        params):
+        params, by_query_point=True):
     l2_regularize_classifier = params["l2_regularize_classifier"]
     l2_lambda = params["l2_lambda"]
     kernel_agg = params["kernel_agg"]
@@ -147,7 +193,11 @@ def calculate_representer_values(model, loss, context_images, context_labels, co
     else:
         print("Unsupported kernel aggregation method specified")
         return None
-    return representers_agg
+    if by_query_point:
+        return representers_agg
+
+    weights = representers_agg.sum(dim=0)
+    return weights
 
 def alternative_loo(model, loss, context_images, context_labels, target_images, target_labels, way):
 
@@ -173,7 +223,7 @@ def alternative_loo(model, loss, context_images, context_labels, target_images, 
             logits = model(context_images_loo, context_labels_loo, target_images, target_labels, MetaLearningState.META_TEST)
             loss = loss(logits, target_labels)
             weights[i] = loss
-            
+
     return weights
     
 def remove_unrepresented_points(candidate_labels, target_images, target_labels):
@@ -197,7 +247,38 @@ def remove_unrepresented_points(candidate_labels, target_images, target_labels):
         reduced_candidate_labels[reduced_candidate_labels > unc] = reduced_candidate_labels[reduced_candidate_labels > unc] - 1
     return reduced_candidate_labels, reduced_target_images, reduced_labels  
 
-def calculate_loo(model, loss,  context_images, context_labels, target_images, target_labels):
+def calculate_kl_loo(model, initial_parameters,  context_images, context_labels, target_images, target_labels):
+    num_classes = len(context_labels.unique())
+    kl_change = torch.zeros(len(context_labels))
+    mu1, precision_matrix1 = initial_parameters["class_means"], initial_parameters["class_precision_matrices"]
+    with torch.no_grad():
+         for i in range(context_images.shape[0]):
+            if i == 0:
+                context_images_loo = context_images[i + 1:]
+                context_labels_loo = context_labels[i + 1:]
+            else:
+                context_images_loo = torch.cat((context_images[0:i], context_images[i + 1:]), 0)
+                context_labels_loo = torch.cat((context_labels[0:i], context_labels[i + 1:]), 0)
+            # Don't technically need to do a full forward pass, since we don't care about the loss. 
+            if len(context_labels_loo.unique()) != num_classes:
+                # Don't try dropping this point; it is the last one of the class
+                kl_change[i] = 1000 * num_classes
+                continue
+
+            model(context_images_loo, context_labels_loo, target_images, target_labels, MetaLearningState.META_TEST)
+            loo_params = model.get_classifier_params()
+            mu2, precision_matrix2 = loo_params["class_means"], loo_params["class_precision_matrices"]
+            for c in range(num_classes):
+                
+                class_distance = utils.kl_divergence(mu1[c], precision_matrix1[c], mu2[c], precision_matrix2[c])
+                kl_change[i] += class_distance.cpu()
+            # Maybe we should only add distance for class it belongs to?
+            #kl_change[i] = distance
+
+    return kl_change
+
+
+def calculate_loo(model, loss,  context_images, context_labels, target_images, target_labels, by_query_point=True):
     target_classes = target_labels.unique()
     loss_per_qp = torch.zeros((len(target_labels), len(context_labels)))
     with torch.no_grad():
@@ -237,10 +318,13 @@ def calculate_loo(model, loss,  context_images, context_labels, target_images, t
             
     #Somehow turn the loss into a weight:
     #weight_per_qp = loss_per_qp/loss_per_qp.max() - 1
-    return loss_per_qp 
-    
-    
-    
+    if by_query_point:
+        return loss_per_qp
+    weights = loss_per_qp.sum(dim=0)
+    return weights
+
+
+
 def add_image_rankings(image_ranking_dict, image_key, image, ranking_key, ranking):
     if image_key not in image_ranking_dict.keys():
        image_ranking_dict[image_key] = {}

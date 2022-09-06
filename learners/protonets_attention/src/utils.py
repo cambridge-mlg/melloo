@@ -156,6 +156,17 @@ def cross_entropy_loss(logits, labels, reduce=True):
     return F.cross_entropy(logits, labels, reduce=reduce)
 
 
+# Each centroid/class cluster has a mu and sigma.
+# The size of the final embedding layer determines the dimension of mu
+def kl_divergence(mu1, prec1, mu2, prec2):
+    sigma1 = torch.inverse(prec1)
+    return 0.5 * (
+        (  (mu2 - mu1).T @ prec2 @ (mu2 - mu1)
+        + (prec2 @ sigma1).trace()
+        - torch.log(torch.det(prec2)/torch.det(prec1))  ) # det(A) = 1/deta(A^-1)
+        .add(mu1.shape[0], -1)
+    )
+
 def coalesce_labels(labels, mode="by_example"):
     if mode == "by_class":
         labels = torch.unique(labels)

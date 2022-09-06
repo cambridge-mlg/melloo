@@ -11,21 +11,13 @@ import utils
 from model import FewShotClassifier
 from normalization_layers import TaskNormI
 from dataset import get_dataset_reader
-import matplotlib.pyplot as plt
-from PIL import Image
 import pickle
 import math
-import matplotlib
-import matplotlib.pyplot as plt
 import gc
-import matplotlib.patches as mpatches
-from sklearn.manifold import TSNE
-import sklearn.metrics
+
 import metaloo
 import metrics
 
-from scipy.stats import kendalltau
-from sklearn.metrics.pairwise import rbf_kernel
 
 NUM_VALIDATION_TASKS = 200
 PRINT_FREQUENCY = 1000
@@ -46,7 +38,7 @@ class Learner:
         self.logger.print_and_log("Options: %s\n" % self.args)
         self.logger.print_and_log("Checkpoint Directory: %s\n" % self.log_files.checkpoint_dir)
         
-        self.metrics = new metrics.Metrics(self.args.checkpoint_dir, self.args.way, self.args.top_k, self.logger)
+        self.metrics = metrics.Metrics(self.args.checkpoint_dir, self.args.way, self.args.top_k, self.logger)
         self.representer_args = {
                 "l2_regularize_classifier": self.args.l2_regularize_classifier,
                 "l2_lambda": self.args.l2_lambda,
@@ -84,7 +76,7 @@ class Learner:
         elif self.args.task_type == "generate_coreset":
             assert self.args.selection_mode != "drop"
         else:
-            assert self.args.spread_constraint == "none"
+            assert self.args.spread_constraint == "none" or self.args.spread_constraint == "nonempty"
             if self.args.task_type == "noisy_shots" or self.args.task_type == "generate_coreset_discard":
                 assert self.args.selection_mode == "drop"
             else:
@@ -189,13 +181,13 @@ class Learner:
         parser.add_argument("--top_k", type=int, default=2, help="How many points to retain from each class")
         parser.add_argument("--selection_mode", choices=["top_k", "multinomial", "divine", "drop"], default="top_k",
                             help="How to select the candidates from the importance weights. Drop option only works for noisy shot selection at present.")
-        parser.add_argument("--importance_mode", choices=["attention", "loo", "representer", "random", "all"], default="all",
+        parser.add_argument("--importance_mode", choices=["attention", "loo", "representer", "random", "kl_loo", "all"], default="all",
                             help="How to calculate candidate importance")
         parser.add_argument("--kernel_agg", choices=["sum", "sum_abs", "class"], default="class",
                             help="When using representer importance, how to aggregate kernel information")
         # Shot selection settings
-        parser.add_argument("--spread_constraint", choices=["by_class", "none"], default="by_class",
-                            help="Spread coresets over classes (by_class) or no constraint (none)")
+        parser.add_argument("--spread_constraint", choices=["by_class", "nonempty", "none"], default="none",
+                            help="Spread coresets over classes (by_class) or by not allowing it to drop the last instance of a class (nonempty) or no constraint (none)")
         # Noisy task settings
         parser.add_argument("--drop_rate", type=float, default=0.1, help="Percentage of points to drop (as float in [0,1])")
         parser.add_argument("--noise_type", choices=["mislabel", "ood"], default="mislabel",
@@ -258,7 +250,7 @@ class Learner:
             if self.args.task_type == "generate_coreset":
                 self.generate_coreset(self.args.test_model_path)
             elif self.args.task_type == "generate_coreset_discard":
-                self.generate_coreset_discard(self.args.test_model_path)
+                self.discard_to_generate_coreset(self.args.test_model_path)
                 #self.save_coreset_from_ranking(self.args.test_model_path)
             elif self.args.task_type == "noisy_shots":
                 self.detect_noisy_shots(self.args.test_model_path)
@@ -417,8 +409,12 @@ class Learner:
             self.logger.print_and_log('{0:}: {1:3.1f}+/-{2:2.1f}'.format(item, accuracy, accuracy_confidence))
             
 
-    def random_weights(self, context_images, context_labels, target_images, target_labels):
-        return torch.tensor(np.random.rand(len(target_labels), len(context_labels)))
+    def random_weights(self, context_images, context_labels, target_images, target_labels, by_query_point=True):
+        weights_per_qp = torch.tensor(np.random.rand(len(target_labels), len(context_labels)))
+        if (by_query_point):
+            return weights_per_qp
+        weights = weights_per_qp.sum(dim=0)
+        return weights
 
     
 
@@ -439,8 +435,7 @@ class Learner:
 
             self.metrics.save_image_set(0, context_images, "selected_{}".format(key))
 
-    def generate_coreset_discard(self, path):
-        #import pdb; pdb.set_trace()
+    def discard_to_generate_coreset(self, path):
         self.logger.print_and_log("")  # add a blank line
         self.logger.print_and_log('Generating coreset (by discard) using model {0:}: '.format(path))
         self.model = self.init_model()
@@ -463,7 +458,7 @@ class Learner:
             entropies = []
             restart_checkpoints = []
             if self.args.importance_mode == 'all':
-                self.metrics.plot_scatter("Error - coreset construction by discard does not support doing all importance modes simultaneously")
+                self.metrics.print_and_log_metric("Error - coreset construction by discard does not support doing all importance modes simultaneously")
                 return  
             # Start with the original, random context set
             task_dict = self.dataset.get_test_task(item)
@@ -496,24 +491,26 @@ class Learner:
                         context_features, target_features = self.model.context_features.clone(), self.model.target_features.clone()
 
                 if ranking_mode == 'loo':
-                    weight_per_qp = metaloo.calculate_loo(self.model, self.loss, context_images, context_labels, target_images, target_labels)
+                    weights = metaloo.calculate_loo(self.model, self.loss, context_images, context_labels, target_images, target_labels, by_query_point=False)
                 elif ranking_mode == 'attention':
                     # Make a copy of the attention weights otherwise we get a reference to what the model is storing
                     with torch.no_grad():
                         self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     attention_weights = self.model.attention_weights.copy()
-                    weight_per_qp = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
+                    weights = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels), by_query_point=False).cpu()
                 elif ranking_mode == 'representer':
-                    weight_per_qp = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, target_labels, target_features, self.representer_args, self.representer_args)
+                    weights = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, target_labels, target_features, self.representer_args, self.representer_args, by_query_point=False)
                 elif ranking_mode == 'random':
-                    weight_per_qp = self.random_weights(context_images, context_labels, target_images, target_labels)
+                    weights = self.random_weights(context_images, context_labels, target_images, target_labels, by_query_point=False)
+                elif ranking_mode == 'kl_loo':
+                    weights = metaloo.calculate_kl_loo(self.model, self.model.get_classifier_params(), context_images, context_labels, target_images, target_labels)
                     
                 # May want to normalize here:
-                weights = weight_per_qp.sum(dim=0)
+                #weights = weight_per_qp.sum(dim=0)
                 rankings = torch.argsort(weights, descending=True)
                 
                 # Discard least valuable point/s
-                candidate_indices, dropped_indices = metaloo.select_by_dropping(weights, number=self.args.top_k)
+                candidate_indices, dropped_indices = metaloo.select_by_dropping(weights, number=self.args.top_k, spread_constraint=self.args.spread_constraint, class_labels=context_labels)
                 candidate_ids = image_ids[candidate_indices]
                 dropped_ids = image_ids[dropped_indices]
                 if len(dropped_indices) == 1:
@@ -618,9 +615,9 @@ class Learner:
             all_eval_predictions = torch.cat(eval_predictions)
             self.metrics.plot_confusion_matrix(all_eval_labels, pred_labels=all_eval_predictions, filename="confusion_eval.png")
             
-            self.metrics.plot_scatter(accuracies, item, 'Accuracy')
-            self.metrics.plot_scatter(eval_accuracies, item, 'Eval Accuracy')
-            self.metrics.plot_scatter(eval_losses, item, 'Eval Loss')
+            self.metrics.print_and_log_metric(accuracies, item, 'Accuracy')
+            self.metrics.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy')
+            self.metrics.print_and_log_metric(eval_losses, item, 'Eval Loss')
             self.logger.print_and_log("Number of no_drop iterations: {}".format(no_drop_count))
             self.metrics.save_image_set(ti, context_images, "context_final".format(ti), labels=context_labels)
             self.metrics.plot_and_log(accuracies, "Accuracies over tasks", "accuracies.png")
@@ -704,7 +701,7 @@ class Learner:
                         image_rankings = metaloo.add_image_rankings(image_rankings, task_dict["context_ids"][i], context_images[i], mode, normalized_weights[i])
 
             #import pdb; pdb.set_trace()
-            self.metrics.plot_scatter(accuracies_full, item, 'Full Accuracy')
+            self.metrics.print_and_log_metric(accuracies_full, item, 'Full Accuracy')
 
             # Righty-oh, now that we have our image_rankings, we need to do something with them.
             # Let's get some basic stats about them;
@@ -735,7 +732,7 @@ class Learner:
 
                         del target_logits
                     
-                self.metrics.plot_scatter(eval_accuracies, item, 'Eval Accuracy ({})'.format(mode))
+                self.metrics.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy ({})'.format(mode))
 
     def _funky_bimodal_inner_loop(self, context_images, context_labels, context_labels_orig, target_images, target_labels, ranking_modes, accuracies, num_unique_labels, ti, descrip):
         full_accuracy = -1
@@ -869,16 +866,16 @@ class Learner:
             for key in num_unique_labels_bimodal.keys():
                 unique_np = np.array(num_unique_labels_bimodal[key])
                 self.logger.print_and_log("Average number of unique labels (bimodal) ({}): {}+/-{}".format(key, unique_np.mean(), unique_np.std()))
-            self.metrics.plot_scatter(accuracies_full_bimodal, item, 'Accuracy (bimodal)')
+            self.metrics.print_and_log_metric(accuracies_full_bimodal, item, 'Accuracy (bimodal)')
             for key in accuracies_bimodal.keys():
-                self.metrics.plot_scatter(accuracies_bimodal[key], item, 'Accuracy (bimodal) {}'.format(key))
+                self.metrics.print_and_log_metric(accuracies_bimodal[key], item, 'Accuracy (bimodal) {}'.format(key))
                 
             for key in num_unique_labels_unimodal.keys():
                 unique_np = np.array(num_unique_labels_unimodal[key])
                 self.logger.print_and_log("Average number of unique labels (unimodal) ({}): {}+/-{}".format(key, unique_np.mean(), unique_np.std()))
-            self.metrics.plot_scatter(accuracies_full_unimodal, item, 'Accuracy (unimodal)')
+            self.metrics.print_and_log_metric(accuracies_full_unimodal, item, 'Accuracy (unimodal)')
             for key in accuracies_unimodal.keys():
-                self.metrics.plot_scatter(accuracies_unimodal[key], item, 'Accuracy (unimodal) {}'.format(key))
+                self.metrics.print_and_log_metric(accuracies_unimodal[key], item, 'Accuracy (unimodal) {}'.format(key))
            
     def select_shots(self, path):
         self.logger.print_and_log("")  # add a blank line
@@ -1029,19 +1026,19 @@ class Learner:
                     unique_np = np.array(num_unique_labels[key])
                     self.logger.print_and_log("Average number of unique labels ({}): {}+/-{}".format(key, unique_np.mean(), unique_np.std()))
 
-                self.metrics.plot_scatter(accuracies_orig_full, item, '*Accuracy (Not bimodal)')
+                self.metrics.print_and_log_metric(accuracies_orig_full, item, '*Accuracy (Not bimodal)')
                 for key in accuracies_orig_by_mode.keys():
-                    self.metrics.plot_scatter(accuracies_orig_by_mode[key], item, '*Accuracy (Not bimodal) {}'.format(key))
+                    self.metrics.print_and_log_metric(accuracies_orig_by_mode[key], item, '*Accuracy (Not bimodal) {}'.format(key))
                 
-            self.metrics.plot_scatter(accuracies_full, item, 'Accuracy')
+            self.metrics.print_and_log_metric(accuracies_full, item, 'Accuracy')
 
             for key in weights.keys():
-                self.metrics.plot_scatter(accuracies[key], item, 'Accuracy {}'.format(key))
+                self.metrics.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
             if self.args.importance_mode == 'all':
                 for key in correlations:
-                    self.metrics.plot_scatter(correlations[key], item, 'Correlation {}'.format(key))
+                    self.metrics.print_and_log_metric(correlations[key], item, 'Correlation {}'.format(key))
                 for key in intersections:
-                    self.metrics.plot_scatter(intersections[key], item, 'Intersections {}'.format(key))
+                    self.metrics.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
         
     def make_noisy(self, task_dict):
         num_classes = len(np.unique(task_dict["target_labels"]))
@@ -1276,12 +1273,12 @@ class Learner:
                         self.metrics.plot_hist(context_labels[removed_indices], class_bins, "selected_label_hist_flipped", ti, 'Classes selected for dropping', 'Presented class label', 'Num points selected for drop')
 
             if len(accuracies_clean) > 0:
-                self.metrics.plot_scatter(accuracies_clean, item, 'Clean Accuracy')
-            self.metrics.plot_scatter(accuracies_noisy, item, 'Noisy Accuracy')
+                self.metrics.print_and_log_metric(accuracies_clean, item, 'Clean Accuracy')
+            self.metrics.print_and_log_metric(accuracies_noisy, item, 'Noisy Accuracy')
 
             for key in ranking_modes:
-                self.metrics.plot_scatter(accuracies[key], item, 'Accuracy {}'.format(key))
-                self.metrics.plot_scatter(overlaps[key], item, 'Shot Overlap {}'.format(key))
+                self.metrics.print_and_log_metric(accuracies[key], item, 'Accuracy {}'.format(key))
+                self.metrics.print_and_log_metric(overlaps[key], item, 'Shot Overlap {}'.format(key))
 
 
     def reshape_attention_weights(self, attention_weights, context_labels, num_target_points):
@@ -1294,7 +1291,10 @@ class Learner:
             for q in range(c_weights.shape[0]):
                 weights_per_query_point[q][c_indices] = c_weights[q]
                 
-        return weights_per_query_point
+        if by_query_point:
+            return weights_per_query_point
+        weights = weights_per_query_point.sum(dim=0)
+        return weights
 
 
     def _augment(self, num_augment_per_class, images, labels):

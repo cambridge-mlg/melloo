@@ -1,5 +1,14 @@
 import utils
 
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import sklearn.metrics
+from sklearn.manifold import TSNE
+from scipy.stats import kendalltau
+import numpy as np
+import torch
+import os
 
 
 class Metrics:
@@ -11,7 +20,7 @@ class Metrics:
         self.logger = logger
         
         
-    def save_image_set(task_num, images, descrip, labels=None):
+    def save_image_set(self, task_num, images, descrip, labels=None):
         if task_num != -1:
             path = os.path.join(self.checkpoint_dir, str(task_num))
         else:
@@ -29,7 +38,7 @@ class Metrics:
                 image_path = os.path.join(path, '{}_index_{}_label_{}.png'.format(descrip, i, labels[i]))
             utils.save_image(tmp_images[i], image_path)
 
-    def plot_scatter(x, y, x_label, y_label, plot_title, output_name, 
+    def plot_scatter(self, x, y, x_label, y_label, plot_title, output_name, 
         class_labels=None, color=None, split_by_class_label=False, x_min=None, x_max=None, y_min=None, y_max=None):
         class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
         x = utils.convert_to_numpy(x)
@@ -95,7 +104,7 @@ class Metrics:
         
         return ave_corr, ave_intersected
         
-    def plot_confusion_matrix(true_labels, filename, logits=None, pred_labels=None):
+    def plot_confusion_matrix(self, true_labels, filename, logits=None, pred_labels=None):
         labels = true_labels.cpu()
         if logits is not None:
             preds = logits.argmax(axis=1).cpu()
@@ -109,14 +118,14 @@ class Metrics:
         plt.savefig(os.path.join(self.checkpoint_dir, filename))
         plt.close()
             
-    def plot_and_log(vals, descrip, filename):
+    def plot_and_log(self, vals, descrip, filename):
         self.logger.log(descrip)
         self.logger.log("{}".format(vals))
         plt.plot(vals)
         plt.savefig(os.path.join(self.checkpoint_dir, filename))
         plt.close()
         
-    def bar_plot_and_log(keys, vals, descrip, filename):
+    def bar_plot_and_log(self, keys, vals, descrip, filename):
         self.logger.log(descrip)
         for key, val in zip(keys, vals):
             self.logger.log("{} : {}".format(key, val))
@@ -125,7 +134,7 @@ class Metrics:
         plt.close()
     
 
-    def plot_hist(x, bins, filename, task_num=None, title='', x_label='', y_label='', density=False):
+    def plot_hist(self, x, bins, filename, task_num=None, title='', x_label='', y_label='', density=False):
         x = utils.convert_to_numpy(x)
         plt.hist(x, bins=bins, density=density)
         plt.xlabel(x_label)
@@ -139,7 +148,7 @@ class Metrics:
         plt.close()
 
 
-    def plot_tsne(points, labels, prototypes, descrip):
+    def plot_tsne(self, points, labels, prototypes, descrip):
         class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c", "#323ca8", "#ff0303", "#03ffc4", "#afff03", "#a566e3"]
         prototypes = utils.convert_to_numpy(prototypes)
         prototype_labels = utils.convert_to_numpy(torch.unique(labels)) # Need the ordering of torch.unique

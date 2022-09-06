@@ -35,7 +35,7 @@ class FewShotClassifier(nn.Module):
         self.feature_adaptation_network = networks.get_feature_adaptation()
         self.task_representation = None
         self.feature_extractor_params = {}
-        self.class_representations = OrderedDict()  # Dictionary mapping class label (integer) to encoded representation
+        #self.class_representations = OrderedDict()  # Dictionary mapping class label (integer) to encoded representation
         self.context_features = None
         self.target_features = None
         self.classifier_params = None
@@ -46,8 +46,8 @@ class FewShotClassifier(nn.Module):
         if self.args.classifier == "protonets_cross_transformer":
             self.cross_attention = CrossTransformer(temperature=self.args.attention_temperature)
             
-        if self.args.classifier == "protonets_mahalanobis":
-            self.class_precision_matrices = OrderedDict() # Dictionary mapping class label (integer) to regularized precision matrices estimated
+        #if self.args.classifier == "protonets_mahalanobis":
+        #    self.class_precision_matrices = OrderedDict() # Dictionary mapping class label (integer) to regularized precision matrices estimated
 
 
 
@@ -79,25 +79,19 @@ class FewShotClassifier(nn.Module):
             logits = self._cross_transformer_euclidiean_distances(prototypes, target_embeddings, h, w)
 
         elif self.args.classifier == "protonets_mahalanobis":
-            logits = _protonets_mahalanobis_classifier(self.context_features, self.target_features, context_labels)
+            logits = self._protonets_mahalanobis_classifier(self.context_features, self.target_features, context_labels)
         else:
             print("Unsupported model type requested")
             return
 
         return logits
-        
+
     def _protonets_mahalanobis_classifier(self, context_features, target_features, context_labels):
         """
         SCM: we build both class representations and the regularized covariance estimates.
         """
-        # clear all dictionaries from previous forward pass
-        self.class_representations.clear()
-        self.class_precision_matrices.clear()
-        
         # get the class means and covariance estimates in tensor form
-        self._build_class_reps_and_covariance_estimates(context_features, context_labels)
-        class_means = torch.stack(list(self.class_representations.values())).squeeze(1)
-        class_precision_matrices = torch.stack(list(self.class_precision_matrices.values())) 
+        class_means, class_precision_matrices = self._build_class_reps_and_covariance_estimates(context_features, context_labels)
         self.classifier_params = {
             'class_means': class_means,
             'class_precision_matrices': class_precision_matrices
@@ -121,7 +115,7 @@ class FewShotClassifier(nn.Module):
         logits = torch.mul(first_half, repeated_difference).sum(dim=2).transpose(1, 0) * -1
         return logits
     
-    def set_class_prototypes(prototypes):
+    def set_class_prototypes(self, prototypes):
         self.classifier_params = {"class_prototypes": prototypes}
     
     def _build_class_reps_and_covariance_estimates(self, context_features, context_labels):
@@ -136,13 +130,15 @@ class FewShotClassifier(nn.Module):
         SCM: calculating a task level covariance estimate using the provided function.
         """
         task_covariance_estimate = self.estimate_cov(context_features)
+        class_representations = OrderedDict()
+        class_precision_matrices = OrderedDict()
         for c in torch.unique(context_labels):
             # filter out feature vectors which have class c
             class_features = torch.index_select(context_features, 0, extract_class_indices(context_labels, c))
             # mean pooling examples to form class means
             class_rep = mean_pooling(class_features)
             # updating the class representations dictionary with the mean pooled representation
-            self.class_representations[c.item()] = class_rep
+            class_representations[c.item()] = class_rep
             """
             Calculating the mixing ratio lambda_k_tau for regularizing the class level estimate with the task level estimate."
             Then using this ratio, to mix the two estimate; further regularizing with the identity matrix to assure invertability, and then
@@ -150,9 +146,14 @@ class FewShotClassifier(nn.Module):
             dictionary for use later in infering of the query data points.
             """
             lambda_k_tau = (class_features.size(0) / (class_features.size(0) + 1))
-            self.class_precision_matrices[c.item()] = torch.inverse(
+            class_precision_matrices[c.item()] = torch.inverse(
                 (lambda_k_tau * self.estimate_cov(class_features)) + ((1 - lambda_k_tau) * task_covariance_estimate) \
                 + torch.eye(class_features.size(1), class_features.size(1)).cuda(0))
+
+        class_means = torch.stack(list(class_representations.values())).squeeze(1)
+        class_precs = torch.stack(list(class_precision_matrices.values())) 
+
+        return class_means, class_precs
         
     def estimate_cov(self, examples, rowvar=False, inplace=False):
         """
