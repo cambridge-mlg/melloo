@@ -124,6 +124,14 @@ class Metrics:
         plt.plot(vals)
         plt.savefig(os.path.join(self.checkpoint_dir, filename))
         plt.close()
+
+    def plot_with_error(self, vals, errs,  descrip, filename):
+        self.logger.log(descrip)
+        self.logger.log("{}".format(vals))
+        plt.errorbar(x=range(len(vals)),y=vals, yerr=errs)
+        plt.savefig(os.path.join(self.checkpoint_dir, filename))
+        plt.close()
+
         
     def bar_plot_and_log(self, keys, vals, descrip, filename):
         self.logger.log(descrip)

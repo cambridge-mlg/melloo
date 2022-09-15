@@ -195,6 +195,12 @@ class Learner:
         parser.add_argument("--DEBUG_bimodal_code", choices=["old", "funky"], default="funky")
         parser.add_argument("--error_rate", type=float, default=0.1,
                             help="Rate at which noise is introduced. For mislabelling, this is the percentage of the context set to mislabel. For ood, this how many ood patterns are shuffled into the other classes (calculated as num context patterns * error rate)")
+        parser.add_argument("--random_restart_interval", type=int, default=250,
+                            help="If doing random restarts, how long should we stagnate before retrying")
+        parser.add_argument("--greedy_replace", dest="greedy_replace", default=False,
+                            action="store_true", help="If True, only replace the dropped point with a point that has lower loss.")
+
+  
         
         args = parser.parse_args()
         return args
@@ -441,6 +447,7 @@ class Learner:
         self.model = self.init_model()
         if path != 'None':
             self.model.load_state_dict(torch.load(path))
+        print(" Greedy replace? {}".format(self.args.greedy_replace))
         ranking_mode = self.args.importance_mode  
         save_out_interval = 500
         if self.args.tasks <= 1000:
@@ -456,6 +463,8 @@ class Learner:
             accuracies = []
             losses = []
             entropies = []
+            kl_change_mean = []
+            kl_change_std = []
             restart_checkpoints = []
             if self.args.importance_mode == 'all':
                 self.metrics.print_and_log_metric("Error - coreset construction by discard does not support doing all importance modes simultaneously")
@@ -504,6 +513,8 @@ class Learner:
                     weights = self.random_weights(context_images, context_labels, target_images, target_labels, by_query_point=False)
                 elif ranking_mode == 'kl_loo':
                     weights = metaloo.calculate_kl_loo(self.model, self.model.get_classifier_params(), context_images, context_labels, target_images, target_labels)
+                    kl_change_mean.append(weights.mean())
+                    kl_change_std.append(weights.std())
                     
                 # May want to normalize here:
                 #weights = weight_per_qp.sum(dim=0)
@@ -532,6 +543,10 @@ class Learner:
                         context_images[dropped_indices[i]] = new_images[i]
                         context_labels[dropped_indices[i]] = new_labels[i]
                         image_ids[dropped_indices[i]] = idd
+                    # If we don't care how good the new point is, just swap it in and carry on with loo
+                    if self.args.greedy_replace == False:
+                        break
+                    # Otherwise, go on to calculate loss with newly sampled point
                     if len(context_labels.unique()) != len(target_labels.unique()):
                         # We have dropped all points of a class; penalise heavily
                         new_loss = 10000
@@ -549,10 +564,11 @@ class Learner:
                         no_drop_count += 1
                         ti += 1
                         
-                        if no_drop_count < 5:
+                        if no_drop_count < self.args.random_restart_interval:
                             self.dataset.mark_discarded(new_ids) # Try again
-                        # If we've gone 5 or more iterations without dropping anything, do a random restart
-                        if no_drop_count >= 5:
+                            continue
+                        # If we've gone random_retsart_interval-many iterations or more without dropping anything, do a random restart
+                        if no_drop_count >= self.args.random_restart_interval:
                             # Mark the "stuck" context set as discarded; has to happen before we reset the list of iamge_ids because the ValueTrackingDataset 
                             # knows what has been issued; there is a small chance that we might get reissued some of the same points
                             # import pdb; pdb.set_trace()
@@ -588,13 +604,6 @@ class Learner:
                     self.metrics.save_image_set(ti, target_images, "target_{}".format(ti), labels=target_labels)
 
 
-                    # Remove the old points, replace with new points
-
-                    # Get new query set as well
-                    #if ti == int(self.args.tasks/2):
-                    #    target_images, target_labels, _ = self.dataset.get_query_set()
-                    #    target_images, target_labels = utils.move_set_to_cuda(target_images ,target_labels, self.device)
-
             eval_accuracies = []
             num_eval_tasks = 100
             eval_predictions = []
@@ -611,6 +620,7 @@ class Learner:
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                     eval_accuracies.append(task_accuracy)
                     del target_logits
+
             all_eval_labels = torch.cat(eval_labels)
             all_eval_predictions = torch.cat(eval_predictions)
             self.metrics.plot_confusion_matrix(all_eval_labels, pred_labels=all_eval_predictions, filename="confusion_eval.png")
@@ -625,6 +635,8 @@ class Learner:
             self.metrics.plot_and_log(entropies, "Entropy of context labels", "entropy.png")
             self.metrics.bar_plot_and_log(list(self.dataset.returned_label_counts.keys()), self.dataset.returned_label_counts.values(), "Returned label counts: ", "returned_label_counts.png")
             self.metrics.plot_hist(context_labels.cpu(), np.arange(10), "final_context_distrib", title='Final Context Distribution', x_label='class', y_label='count', density=False)
+            if len(kl_change_mean) > 0:
+                self.metrics.plot_with_error(kl_change_mean, kl_change_std, "Mean KL-div Change", "kl_change.png")
             import pdb; pdb.set_trace()
             self.logger.log("{}".format(restart_checkpoints))
 
