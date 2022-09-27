@@ -268,8 +268,6 @@ class ValueTrackingDatasetWrapper(IdentifiableDatasetWrapper):
         self.drawable_context_ids = self._reset_drawable_ids()
         self.rounds_not_discarded = {}
         self.returned_label_counts = {}
-        # TODO: Recomputing this every time is expensive, save a master version and make a copy on reset.
-        self.master_drawable_list = []
 
     def _reset_drawable_ids(self):
         drawable_ids = []

@@ -533,7 +533,7 @@ class Learner:
                 old_labels = context_labels[dropped_indices].clone()
                     
                 ti_start = ti
-                while ti < self.args.tasks - 1:
+                while ti < self.args.tasks:
                     # Request new points to replace those
                     new_images, new_labels, new_ids = self.dataset.sample_new_context_points(self.args.top_k)
                     # Re-prepare data
@@ -556,14 +556,17 @@ class Learner:
                         #print("new_logits shape: {} target_labels shape: {} target_label classes {} context_label classes {}".format(new_logits.shape, target_labels.shape, target_labels.unique(), context_labels.unique()))
                         new_loss = self.loss(new_logits, target_labels, reduce=True).item()
                     #TODO: Do we want to compare accuracies or losses? I wouldn't thought losses...
-                    if new_loss <= losses[-1]:
+                    if new_loss <= losses[-1] or ti == self.args.tasks -1:
                         # New task improves or is equal to old accuracy; continue with loo 
                         no_drop_count = 0
                         break
+
                     else:
                         no_drop_count += 1
                         ti += 1
-                        
+                        # If we're out of compute, don't discard, just break out of loop
+                        if ti == self.args.tasks:
+                            break
                         if no_drop_count < self.args.random_restart_interval:
                             self.dataset.mark_discarded(new_ids) # Try again
                             continue
@@ -588,6 +591,7 @@ class Learner:
                             while len(context_labels.unique()) != len(target_labels.unique()):
                                 print("Somehow whole new context set was missing a class, retrying")
                                 # Request whole new context set; force reset so we don't get unbalanced classes
+                                self.dataset.mark_discarded(image_ids)
                                 context_images, context_labels, image_ids = self.dataset.sample_new_context_points(context_images.shape[0], force_reset=True)
     
                             # Re-prepare data
