@@ -282,3 +282,28 @@ def shuffle_set(images, labels):
     """
     permutation = np.random.permutation(images.shape[0])
     return images[permutation], labels[permutation]
+
+
+def get_indices_with_these_labels(class_labels, context_labels):
+    indices = np.empty(0, dtype=np.int8)
+    for cl in class_labels:
+        # Build a list of all indices that we want to corrupt/drop
+        indices = np.append(indices, utils.extract_class_indices(context_labels, cl))
+        
+    return indices.reshape(-1)
+    
+    
+# Normalize labels    
+# We used to have original_num_classes, but we randomly removed some of them
+# kept_class_labels is a list of the labels retained, task_labels are the labels we want to normalize
+# new_task_labels is the new, normalized task labels object to modify. If not provided, the input task_labels will be modified
+def normalize_labels(kept_class_labels, task_labels, new_task_labels=None):
+    if new_task_labels is None:
+        new_task_labels = task_labels 
+    kept_class_labels.sort() # So count must be <= clabel
+    for count, clabel in enumerate(kept_class_labels):
+        if count == clabel:
+            continue
+        c_indices = utils.extract_class_indices(task_labels, clabel)
+        new_task_labels[c_indices] = count
+    return new_task_labels

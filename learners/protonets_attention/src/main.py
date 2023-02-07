@@ -17,6 +17,7 @@ import gc
 
 import metaloo
 import metrics
+from utils import get_indices_with_these_labels, normalize_labels
 
 
 NUM_VALIDATION_TASKS = 200
@@ -192,7 +193,6 @@ class Learner:
         parser.add_argument("--drop_rate", type=float, default=0.1, help="Percentage of points to drop (as float in [0,1])")
         parser.add_argument("--noise_type", choices=["mislabel", "ood"], default="mislabel",
                             help="Type of noise to use for noisy shot detection")
-        parser.add_argument("--DEBUG_bimodal_code", choices=["old", "funky"], default="funky")
         parser.add_argument("--error_rate", type=float, default=0.1,
                             help="Rate at which noise is introduced. For mislabelling, this is the percentage of the context set to mislabel. For ood, this how many ood patterns are shuffled into the other classes (calculated as num context patterns * error rate)")
         parser.add_argument("--random_restart_interval", type=int, default=250,
@@ -261,12 +261,8 @@ class Learner:
             elif self.args.task_type == "noisy_shots":
                 self.detect_noisy_shots(self.args.test_model_path)
             elif self.args.task_type == "shot_selection":
-
                 if self.args.test_case == "bimodal":
-                    if self.args.DEBUG_bimodal_code == "funky":
-                        self.funky_bimodal_task(self.args.test_model_path)
-                    else:
-                        self.select_shots(self.args.test_model_path)
+                    self.bimodal_task(self.args.test_model_path)
                 else:
                     self.select_shots(self.args.test_model_path)
             else:
@@ -750,7 +746,7 @@ class Learner:
                     
                 self.metrics.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy ({})'.format(mode))
 
-    def _funky_bimodal_inner_loop(self, context_images, context_labels, context_labels_orig, target_images, target_labels, ranking_modes, accuracies, num_unique_labels, ti, descrip):
+    def _bimodal_inner_loop(self, context_images, context_labels, context_labels_orig, target_images, target_labels, ranking_modes, accuracies, num_unique_labels, ti, descrip):
         full_accuracy = -1
         rankings_per_qp = {}
         weights_per_qp = {}
@@ -818,7 +814,7 @@ class Learner:
                     
         return full_accuracy, accuracies, num_unique_labels
 
-    def funky_bimodal_task(self, path):
+    def bimodal_task(self, path):
         self.logger.print_and_log("")  # add a blank line
         self.logger.print_and_log('Funky bimodal task using model {0:}: '.format(path))
         self.model = self.init_model()
@@ -904,33 +900,20 @@ class Learner:
             accuracies = {}
             if self.args.importance_mode == 'all':
                 ranking_modes = ['loo', 'attention', 'representer', 'random']
-                correlations = {'attention_representer':[], 'attention_loo': [], 'representer_loo': [], 
-                                    'attention_random': [], 'loo_random': [], 'representer_random': []}
-                intersections = {'attention_representer':[], 'attention_loo': [], 'representer_loo': [], 
-                                    'attention_random': [], 'loo_random': [], 'representer_random': []}
+                correlations, intersections = {}, {}
+                for i in range(len(ranking_modes)):
+                    for j in range(i+1, len(ranking_modes)):
+                        correlations[ranking_modes[i] + "_" + ranking_modes[j]] = []
+                        intersections[ranking_modes[i] + "_" + ranking_modes[j]] = []
             else:
                 ranking_modes = [self.args.importance_mode]
                 
             for mode in ranking_modes:
                 accuracies[mode] = []
-                
-            if self.args.test_case == "bimodal":
-                # "accuracies_full" will track the bimodal problem (i.e. reshaped with half as many classes)
-                # accuracies_orig will track accuracy w.r.t. the non bimodal problem
-                accuracies_orig_full = []
-                num_unique_labels = {}
-                accuracies_orig_by_mode = {}
-                for mode in ranking_modes:
-                    num_unique_labels[mode] = []
-                    accuracies_orig_by_mode[mode] = []
 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
                 context_images, target_images, context_labels, target_labels = utils.prepare_task(task_dict, self.device)
-                if self.args.test_case == "bimodal":
-                    context_labels_orig, target_labels_orig = context_labels.clone(), target_labels.clone()
-                    context_labels = context_labels.floor_divide(2)
-                    target_labels = target_labels.floor_divide(2)
 
                 rankings_per_qp = {}
                 weights_per_qp = {}
@@ -946,11 +929,6 @@ class Learner:
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                     accuracies_full.append(task_accuracy)
                     del target_logits
-
-                    if self.args.test_case == "bimodal":
-                        target_logits = self.model(context_images, context_labels_orig, target_images, target_labels_orig, MetaLearningState.META_TEST)
-                        task_accuracy = self.accuracy_fn(target_logits, target_labels_orig).item()
-                        accuracies_orig_full.append(task_accuracy)
                 
                 # Save the target/context features
                 # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
@@ -981,24 +959,12 @@ class Learner:
                     
                 # Great, now we have the importance weights. Now what to do with them
                 if self.args.importance_mode == 'all':
-                    corr, inters = self.metrics.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['representer'], "Attention vs Representer")
-                    correlations['attention_representer'].append(corr)
-                    intersections['attention_representer'].append(inters)
-                    corr, inters = self.metrics.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['loo'], "Attention vs Meta-LOO")
-                    correlations['attention_loo'].append(corr)
-                    intersections['attention_loo'].append(inters)
-                    corr, inters = self.metrics.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['loo'], "Representer vs Meta-LOO")
-                    correlations['representer_loo'].append(corr) 
-                    intersections['representer_loo'].append(inters)
-                    corr, inters = self.metrics.compare_rankings(rankings_per_qp['attention'], rankings_per_qp['random'], "Attention vs Random")
-                    correlations['attention_random'].append(corr)
-                    intersections['attention_random'].append(inters)
-                    corr, inters = self.metrics.compare_rankings(rankings_per_qp['loo'], rankings_per_qp['random'], "Meta-LOO vs Random")
-                    correlations['loo_random'].append(corr)
-                    intersections['loo_random'].append(inters)
-                    corr, inters = self.metrics.compare_rankings(rankings_per_qp['representer'], rankings_per_qp['random'], "Representer vs Random")
-                    correlations['representer_random'].append(corr) 
-                    intersections['representer_random'].append(inters)
+                    for i in range(len(ranking_modes)):
+                        for j in range(i+1, len(ranking_modes)):
+                            corr, inters = self.metrics.compare_rankings(rankings_per_qp[ranking_modes[i]], rankings_per_qp[ranking_modes[j]], "{} vs {}".format(ranking_modes[i], ranking_modes[j]))
+                            key = ranking_modes[i] + "_" + ranking_modes[j]
+                            correlations[key].append(corr)
+                            intersections[key].append(inters)
 
                 for key in weights.keys():
                     if self.args.selection_mode == "top_k":
@@ -1011,11 +977,6 @@ class Learner:
 
                     # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
                     reduced_candidate_labels, reduced_target_images, reduced_target_labels = metaloo.remove_unrepresented_points(candidate_labels, target_images, target_labels)
-
-                    if self.args.test_case == "bimodal":
-                        num_unique_labels[key].append(len(context_labels_orig[candidate_indices].unique()))
-                        candidate_labels_orig = context_labels_orig[candidate_indices]
-                        reduced_candidate_labels_orig, reduced_target_images_orig, reduced_target_labels_orig = metaloo.remove_unrepresented_points(candidate_labels_orig, target_images, target_labels_orig)
                     
                     # Calculate accuracy on task using only selected candidates as context points
                     with torch.no_grad():
@@ -1029,22 +990,6 @@ class Learner:
 
                         if ti < 10 and self.args.way * self.args.shot <= 100:
                             self.metrics.save_image_set(ti, candidate_images, "candidate_{}_{}".format(ti, key), labels=candidate_labels)
-
-                        if self.args.test_case == "bimodal":
-                            target_logits = self.model(candidate_images, reduced_candidate_labels_orig, reduced_target_images_orig, reduced_target_labels_orig, MetaLearningState.META_TEST)
-                            task_accuracy = self.accuracy_fn(target_logits, reduced_target_labels_orig).item()
-                            task_accuracy = (task_accuracy * len(reduced_target_labels_orig))/float(len(target_labels_orig))
-                            accuracies_orig_by_mode[key].append(task_accuracy)
-
-                     
-            if self.args.test_case == "bimodal":
-                for key in num_unique_labels.keys():
-                    unique_np = np.array(num_unique_labels[key])
-                    self.logger.print_and_log("Average number of unique labels ({}): {}+/-{}".format(key, unique_np.mean(), unique_np.std()))
-
-                self.metrics.print_and_log_metric(accuracies_orig_full, item, '*Accuracy (Not bimodal)')
-                for key in accuracies_orig_by_mode.keys():
-                    self.metrics.print_and_log_metric(accuracies_orig_by_mode[key], item, '*Accuracy (Not bimodal) {}'.format(key))
                 
             self.metrics.print_and_log_metric(accuracies_full, item, 'Accuracy')
 
@@ -1056,21 +1001,64 @@ class Learner:
                 for key in intersections:
                     self.metrics.print_and_log_metric(intersections[key], item, 'Intersections {}'.format(key))
         
+        
     def make_noisy(self, task_dict):
         num_classes = len(np.unique(task_dict["target_labels"]))
         num_context_images = len(task_dict["context_labels"])
         
         if torch.is_tensor(task_dict["context_labels"]):
-            new_context_labels = task_dict["context_labels"].clone()
+            context_labels_copy = task_dict["context_labels"].clone()
         else:
-            new_context_labels = task_dict["context_labels"].copy()
+            context_labels_copy = task_dict["context_labels"].copy()
+        num_noisy = max(1, int(self.args.error_rate * num_context_images))
+        
         if self.args.noise_type == "mislabel":
-            num_noisy = max(1, int(self.args.error_rate * num_context_images))
             assert num_noisy < num_context_images
             # Select images from the context set randomly to be mislabeled 
             mislabeled_indices = rng.choice(num_context_images, num_noisy, replace=False)
             # Mislabels selected images randomly
-            new_context_labels[mislabeled_indices] = (new_context_labels[mislabeled_indices] + rng.integers(1, num_classes, num_noisy)) % num_classes
+            context_labels_copy[mislabeled_indices] = (context_labels_copy[mislabeled_indices] + rng.integers(1, num_classes, num_noisy)) % num_classes
+            
+            task_dict["true_context_labels"] = task_dict["context_labels"]
+            task_dict["context_labels"] = context_labels_copy
+            task_dict["noisy_context_indices"] = mislabeled_indices
+            
+        elif self.args.noise_type == "ood":
+            assert num_classes % 2 == 0
+            num_noisy = max(1, int(self.args.error_rate * num_context_images))
+            classes_ood = rng.choice(num_classes, int(num_classes/2), replace=False)
+            classes_id = [ck for ck in range(num_classes) if ck not in classes_ood]
+            
+            # Choose num_noisy-many images randomly from the current context
+            ood_indices = get_indices_with_these_labels(classes_ood, task_dict["context_labels"])
+            id_indices = get_indices_with_these_labels(classes_id, task_dict["context_labels"])
+            
+            mislabeled_id_indices = rng.choice(id_indices, num_noisy, replace=False)
+            mislabel_ood_indices = rng.choice(ood_indices, num_noisy, replace=False)
+            
+            # The "true labels" are the unmodified labels, but without the ood classes
+            true_context_labels = np.delete(context_labels_copy, mislabel_ood_indices)
+            
+            # Now we just want to swap the id for ood. 
+            task_dict["context_images"][mislabeled_id_indices] = task_dict["context_images"][mislabel_ood_indices]
+            task_dict["context_labels"][mislabeled_id_indices] = task_dict["context_labels"][mislabel_ood_indices]
+            # And drop all remaining ood, so we only have id classes in the context set (and ood masquerading as id)
+            task_dict["context_images"] = np.delete(task_dict["context_images"], mislabel_ood_indices)
+            task_dict["context_labels"] = np.delete(task_dict["context_labels"], mislabel_ood_indices)
+            
+            
+            # Remove the dropped classes from the target set
+            for class_to_drop in classes_ood:
+                target_class_indices = utils.extract_class_indices(task_dict["target_labels"], class_to_drop)
+                task_dict["target_images"] = np.delete(task_dict["target_images"], target_class_indices, axis=0)
+                task_dict["target_labels"] = np.delete(task_dict["target_labels"], target_class_indices)
+                
+            task_dict["target_labels"] = normalize_labels(classes_id, task_dict["target_labels"])
+            task_dict["context_labels"] = normalize_labels(classes_id, task_dict["context_labels"])
+            task_dict["true_context_labels"] = true_context_labels
+            task_dict["noisy_context_indices"] = mislabeled_id_indices
+
+        '''    
         elif self.args.noise_type == "ood":
             # We want num_noisy/total patterns = error rate, where total patterns = num_clean + num_noisy
             # And num_clean = num_at_start/2
@@ -1080,20 +1068,21 @@ class Learner:
             num_noisy = math.ceil(self.args.error_rate * ( num_context_images / 2.0) / (1 - self.args.error_rate))
             # Choose a class to drop
             classes_to_drop = rng.choice(num_classes, int(num_classes/2), replace=False)
+            classes_id = [ck for ck in range(num_classes) if ck not in classes_to_drop]
             num_remaining_classes = num_classes - len(classes_to_drop)
             assert len(classes_to_drop) * self.args.shot >= num_noisy
             print("Resulting problem is approximately {}-way and {}-shot".format(num_remaining_classes, self.args.shot + num_noisy/num_remaining_classes))
             new_context_labels = task_dict["context_labels"].copy()
-            wild_card_indices = np.empty(0, dtype=np.int8)
-            for class_to_drop in classes_to_drop:
-                # Build a list of all indices that we want to corrupt/drop
-                wild_card_indices = np.append(wild_card_indices, utils.extract_class_indices(task_dict["context_labels"], class_to_drop))
-            wild_card_indices = wild_card_indices.reshape(-1)
+            
+            # Get the indices of all images from classes we want to drop/use as OOD
+            wild_card_indices = get_indices_with_these_labels(classes_to_drop, task_dict["context_labels"])
             np.random.shuffle(wild_card_indices)
-
-            new_context_labels[wild_card_indices] = rng.integers(0, num_remaining_classes, len(wild_card_indices))
-            #for index in wild_card_indices:
-            #    new_context_labels[index] = rng.integers(0, num_remaining_classes, 1)[0]
+            
+            # Assign the images from classes we want to drop/use as OOD to random classes within the appropriate range
+            # TODO: Bug? range(0, num_remaining_classes) != actual labels of remaining classes
+            # I think we want to choose w replacement
+            new_context_labels[wild_card_indices] = rng.choice(classes_id, len(wild_card_indices), replace=True)
+            
             # Normalize labels
             clean_count = 0
             for c in range(num_classes):
@@ -1129,10 +1118,10 @@ class Learner:
                     c_indices = utils.extract_class_indices(task_dict["target_labels"], c)
                     task_dict["target_labels"][c_indices] = clean_count
                     clean_count += 1
-
-        task_dict["true_context_labels"] = task_dict["context_labels"]
-        task_dict["context_labels"] = new_context_labels
-        task_dict["noisy_context_indices"] = mislabeled_indices
+            task_dict["true_context_labels"] = task_dict["context_labels"]
+            task_dict["context_labels"] = context_labels_copy
+            task_dict["noisy_context_indices"] = mislabeled_indices
+        '''
         return task_dict
         
         
@@ -1243,18 +1232,8 @@ class Learner:
                     weights[mode] = weights_per_qp[mode].sum(dim=0)
                     
                 for key in ranking_modes:
-                    removed_indices_set = None
-                    if self.args.selection_mode == "top_k":
-                        candidate_indices = self.select_top_k(self.args.top_k, weights[key], context_labels, self.args.spread_constraint)
-                    elif self.args.selection_mode == "multinomial":
-                        candidate_indices = metaloo.select_multinomial(self.args.top_k, weights[key], context_labels, self.args.spread_constraint)
-                    elif self.args.selection_mode == "divine":
-                        candidate_indices = metaloo.select_divine(self.args.top_k, weights[key], context_features, context_labels, self.args.spread_constraint, key)
-                    elif self.args.selection_mode == "drop":
-                        candidate_indices, removed_indices = metaloo.select_by_dropping(weights[key], drop_rate=self.args.drop_rate)
-                        removed_indices_set = set(removed_indices.tolist())
-                    if removed_indices_set is None:
-                        removed_indices_set = set(range(len(context_labels))).difference(set(candidate_indices.tolist()))
+                    candidate_indices, removed_indices = metaloo.select_by_dropping(weights[key], drop_rate=self.args.drop_rate)
+                    removed_indices_set = set(removed_indices.tolist())
 
                     # Determine overlap between removed candidates and noisy shots
                     overlaps[key].append(float(len(removed_indices_set.intersection(set(task_dict["noisy_context_indices"]))))/float(len(task_dict["noisy_context_indices"])))
