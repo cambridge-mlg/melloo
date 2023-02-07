@@ -57,10 +57,11 @@ class Metrics:
             y_min, y_max = y.min(), y.max()
             for tc in range(0, num_classes_local):
                 class_mask = (class_labels == tc).cpu().numpy()
-                plot_scatter(x[class_mask], y[class_mask], x_label, y_label, plot_title + "_{}".format(tc), output_name + "_{}".format(tc), color = class_colors[tc], 
+                self.plot_scatter(x[class_mask], y[class_mask], x_label, y_label, plot_title + "_{}".format(tc), output_name + "_{}".format(tc), color = class_colors[tc], 
                     x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max, split_by_class_label=False)
 
         handles = [mpatches.Rectangle((0, 0), 1, 1, fc=ccol) for ccol in class_colors ]
+        plt.axes().set_aspect('equal')
         plt.scatter(x, y, c=t_color)
         plt.xlabel(x_label)
         plt.ylabel(y_label)

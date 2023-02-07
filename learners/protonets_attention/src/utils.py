@@ -287,8 +287,8 @@ def shuffle_set(images, labels):
 def get_indices_with_these_labels(class_labels, context_labels):
     indices = np.empty(0, dtype=np.int8)
     for cl in class_labels:
-        # Build a list of all indices that we want to corrupt/drop
-        indices = np.append(indices, utils.extract_class_indices(context_labels, cl))
+        # Build a list of all indices from desired classes
+        indices = np.append(indices, extract_class_indices(context_labels, cl))
         
     return indices.reshape(-1)
     
@@ -304,6 +304,6 @@ def normalize_labels(kept_class_labels, task_labels, new_task_labels=None):
     for count, clabel in enumerate(kept_class_labels):
         if count == clabel:
             continue
-        c_indices = utils.extract_class_indices(task_labels, clabel)
+        c_indices = extract_class_indices(task_labels, clabel)
         new_task_labels[c_indices] = count
     return new_task_labels

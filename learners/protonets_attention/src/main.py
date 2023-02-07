@@ -570,10 +570,8 @@ class Learner:
                         if no_drop_count >= self.args.random_restart_interval:
                             # Mark the "stuck" context set as discarded; has to happen before we reset the list of iamge_ids because the ValueTrackingDataset 
                             # knows what has been issued; there is a small chance that we might get reissued some of the same points
-                            # import pdb; pdb.set_trace()
                             self.dataset.mark_discarded(image_ids)
                             print("Doing random restart")
-                            #import pdb; pdb.set_trace()
                             # Swap the old ones back in so we get back to the set that first got stuck
                             for i, dropped_id in enumerate(dropped_ids):
                               image_ids[dropped_indices[i]] = dropped_id
@@ -637,7 +635,6 @@ class Learner:
             self.metrics.plot_hist(context_labels.cpu(), np.arange(10), "final_context_distrib", title='Final Context Distribution', x_label='class', y_label='count', density=False)
             if len(kl_change_mean) > 0:
                 self.metrics.plot_with_error(kl_change_mean, kl_change_std, "Mean KL-div Change", "kl_change.png")
-            import pdb; pdb.set_trace()
             self.logger.log("{}".format(restart_checkpoints))
 
     def generate_coreset(self, path):
@@ -712,7 +709,6 @@ class Learner:
                     for i in range(len(context_images)):
                         image_rankings = metaloo.add_image_rankings(image_rankings, task_dict["context_ids"][i], context_images[i], mode, normalized_weights[i])
 
-            #import pdb; pdb.set_trace()
             self.metrics.print_and_log_metric(accuracies_full, item, 'Full Accuracy')
 
             # Righty-oh, now that we have our image_rankings, we need to do something with them.
@@ -1025,7 +1021,6 @@ class Learner:
             
         elif self.args.noise_type == "ood":
             assert num_classes % 2 == 0
-            num_noisy = max(1, int(self.args.error_rate * num_context_images))
             classes_ood = rng.choice(num_classes, int(num_classes/2), replace=False)
             classes_id = [ck for ck in range(num_classes) if ck not in classes_ood]
             
@@ -1033,18 +1028,19 @@ class Learner:
             ood_indices = get_indices_with_these_labels(classes_ood, task_dict["context_labels"])
             id_indices = get_indices_with_these_labels(classes_id, task_dict["context_labels"])
             
-            mislabeled_id_indices = rng.choice(id_indices, num_noisy, replace=False)
+            mislabel_id_indices = rng.choice(id_indices, num_noisy, replace=False)
             mislabel_ood_indices = rng.choice(ood_indices, num_noisy, replace=False)
             
-            # The "true labels" are the unmodified labels, but without the ood classes
-            true_context_labels = np.delete(context_labels_copy, mislabel_ood_indices)
+            # The "true labels" reflect ood points as label -1, but we still drop the unused ood points
+            context_labels_copy[mislabel_id_indices] = -1 #context_labels_copy[mislabel_ood_indices]
+            true_context_labels = np.delete(context_labels_copy, ood_indices)
             
             # Now we just want to swap the id for ood. 
-            task_dict["context_images"][mislabeled_id_indices] = task_dict["context_images"][mislabel_ood_indices]
-            task_dict["context_labels"][mislabeled_id_indices] = task_dict["context_labels"][mislabel_ood_indices]
+            task_dict["context_images"][mislabel_id_indices] = task_dict["context_images"][mislabel_ood_indices]
+            # Don't modify the task_dict's context labels; they should be incorrect now that we've swapped the ood images in.
             # And drop all remaining ood, so we only have id classes in the context set (and ood masquerading as id)
-            task_dict["context_images"] = np.delete(task_dict["context_images"], mislabel_ood_indices)
-            task_dict["context_labels"] = np.delete(task_dict["context_labels"], mislabel_ood_indices)
+            task_dict["context_images"] = np.delete(task_dict["context_images"], ood_indices, axis=0)
+            task_dict["context_labels"] = np.delete(task_dict["context_labels"], ood_indices)
             
             
             # Remove the dropped classes from the target set
@@ -1055,8 +1051,8 @@ class Learner:
                 
             task_dict["target_labels"] = normalize_labels(classes_id, task_dict["target_labels"])
             task_dict["context_labels"] = normalize_labels(classes_id, task_dict["context_labels"])
-            task_dict["true_context_labels"] = true_context_labels
-            task_dict["noisy_context_indices"] = mislabeled_id_indices
+            task_dict["true_context_labels"] = normalize_labels(classes_id, true_context_labels) # normalise so we can compare
+            task_dict["noisy_context_indices"] = mislabel_id_indices
 
         '''    
         elif self.args.noise_type == "ood":
@@ -1131,7 +1127,7 @@ class Learner:
         self.model = self.init_model()
         if path != 'None':
             self.model.load_state_dict(torch.load(path))
-
+        num_output_tasks = 10
 
         for item in self.test_set:
             accuracies = {}
@@ -1149,10 +1145,12 @@ class Learner:
                 overlaps[mode] = []
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
-                class_bins = list(range(0, self.args.way+1))
 
                 # If mislabelling, then we calculate clean accuracy before doing any mislabeling
-                if self.args.noise_type == "mislabel":
+                if self.args.noise_type == "ood":
+                    class_bins = list(range(-1, self.args.way)) # Add extra bin for OOD class
+                elif self.args.noise_type == "mislabel":
+                    class_bins = list(range(0, self.args.way+1))
                     context_images, target_images, context_labels, target_labels = utils.prepare_task(task_dict, self.device)
                     # Calculate clean accuracy 
                     with torch.no_grad():
@@ -1160,10 +1158,10 @@ class Learner:
                         task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                         accuracies_clean.append(task_accuracy)
 
-                        if ti<50:
+                        if ti < num_output_tasks:
                             initial_predictions = target_logits.argmax(axis=1)
                             self.metrics.plot_hist(initial_predictions, bins=class_bins, filename="class_distrib_initial", task_num=ti, title='Predicted classes (initial)', x_label='Predicted class label', density=True)
-                            self.metrics.plot_tsne(self.model.context_features, context_labels, self.model.classifier_params["class_prototypes"], "{}_tsne_initial_{:.3}_acc".format(ti, task_accuracy))
+                            #self.metrics.plot_tsne(self.model.context_features, context_labels, self.model.classifier_params["class_prototypes"], "{}_tsne_initial_{:.3}_acc".format(ti, task_accuracy))
 
                         del target_logits
                     del context_images
@@ -1185,11 +1183,11 @@ class Learner:
                     task_accuracy = self.accuracy_fn(target_logits, target_labels).item()
                     accuracies_noisy.append(task_accuracy)
 
-                    if ti<50:
+                    if ti < num_output_tasks:
                         noisy_predictions = target_logits.argmax(axis=1)
                         noisy_losses = self.loss(target_logits, target_labels, reduce=False)
                         self.metrics.plot_hist(noisy_predictions, bins=class_bins, filename="class_distrib_noisy", task_num=ti, title='Predicted classes (noisy)', x_label='Predicted class label', density=True)
-                        self.metrics.plot_tsne(self.model.context_features, context_labels, self.model.classifier_params["class_prototypes"], "{}_tsne_noisy_{:.3}_acc".format(ti, task_accuracy))
+                        #self.metrics.plot_tsne(self.model.context_features, context_labels, self.model.classifier_params["class_prototypes"], "{}_tsne_noisy_{:.3}_acc".format(ti, task_accuracy))
 
                     del target_logits
                     gc.collect()
@@ -1250,22 +1248,24 @@ class Learner:
                         task_accuracy = (task_accuracy * len(reduced_target_labels))/float(len(target_labels)) # TODO: We should add random accuracy back in, not zero.
                         accuracies[key].append(task_accuracy)
 
-                        if ti<50:
+                        if ti < num_output_tasks:
                             red_predictions = target_logits.argmax(axis=1)
                             self.metrics.plot_hist(red_predictions, bins=class_bins, filename="class_distrib_reduced", task_num=ti, 
                                     title='Predicted classes (reduced, -{})'.format(self.args.way-len(reduced_candidate_labels.unique())), x_label='Predicted class label', density=True)
                             red_losses = self.loss(target_logits, target_labels, reduce=False)            
-                            self.metrics.plot_tsne(self.model.context_features, candidate_labels, self.model.classifier_params["class_prototypes"], "{}_tsne_reduced_{:.3}_acc".format(ti, task_accuracy))
+                            #self.metrics.plot_tsne(self.model.context_features, candidate_labels, self.model.classifier_params["class_prototypes"], "{}_tsne_reduced_{:.3}_acc".format(ti, task_accuracy))
 
-                            self.metrics.plot_scatter(noisy_losses, red_losses, x_label="Loss when context points flipped", y_label="Loss when selected context points are dropped", plot_title="Target Point Losses",
+                            self.metrics.plot_scatter(noisy_losses, red_losses, x_label="Loss on noisy set", y_label="Loss when selected context points are dropped", plot_title="Target Point Losses",
                                 output_name="{}_target_scatter_dropped.png".format(ti), class_labels=reduced_target_labels, split_by_class_label=True)
                         del target_logits
                             
                         # Save out the selected candidates (?)
-                    if ti < 50  and self.args.way * self.args.shot <= 100:
+                    if ti <  num_output_tasks  and self.args.way * self.args.shot <= 100:
                         self.metrics.save_image_set(ti, context_images[removed_indices], "removed_by_{}".format(key), labels=context_labels[removed_indices])
                         self.metrics.plot_hist(task_dict["true_context_labels"][removed_indices], class_bins, "selected_label_hist_true", ti, 'Classes selected for dropping', 'True class label', 'Num points selected for drop')
-                        self.metrics.plot_hist(context_labels[removed_indices], class_bins, "selected_label_hist_flipped", ti, 'Classes selected for dropping', 'Presented class label', 'Num points selected for drop')
+                        self.metrics.plot_hist(context_labels[removed_indices], class_bins, "selected_label_hist_noisy", ti, 'Classes selected for dropping', 'Presented class label', 'Num points selected for drop')
+                        self.metrics.plot_hist(task_dict["true_context_labels"][candidate_indices], class_bins, "resulting_context_label_distrib", ti, 'Context set label distribution', 'True class label', 'Num points')
+
 
             if len(accuracies_clean) > 0:
                 self.metrics.print_and_log_metric(accuracies_clean, item, 'Clean Accuracy')
