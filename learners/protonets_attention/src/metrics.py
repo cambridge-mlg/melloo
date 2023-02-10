@@ -38,8 +38,36 @@ class Metrics:
                 image_path = os.path.join(path, '{}_index_{}_label_{}.png'.format(descrip, i, labels[i]))
             utils.save_image(tmp_images[i], image_path)
 
+    def table_print(self, data_dict, descrip):
+        self.logger.log("=====\n" + descrip + "\n=====\n")
+        output_str = ""
+        keys = data_dict.keys()
+        for key in keys:
+            output_str += key + ","
+        output_str += "\n"
+        num_rows = len(data_dict[list(keys)[0]]) # length of first item's data array
+        for r in range(num_rows):
+            for key in keys:
+                output_str += "{},".format(data_dict[key][r])
+            output_str += "\n"
+        self.logger.log(output_str + "\n")
+
     def plot_scatter(self, x, y, x_label, y_label, plot_title, output_name, 
         class_labels=None, color=None, split_by_class_label=False, x_min=None, x_max=None, y_min=None, y_max=None):
+
+        self.logger.delay_log("Scatter plot data for {} ({})".format(plot_title, output_name))
+        self.logger.delay_log("Plotting {} as x vs {} as y".format(x_label, y_label))
+        if class_labels is None:
+            output_str = "x,y\n"
+            for xi, yi in zip(x,y):
+                output_str += "{},{}\n".format(xi, yi)
+        else:
+            output_str = "x,y,c\n"
+            for xi, yi, ci in zip(x,y,class_labels):
+                output_str += "{},{},{}\n".format(xi, yi, ci)
+
+        self.logger.delay_log(output_str)
+
         class_colors = ["#dc0f87", "#e8b90e", "#29e414", "#f76b1f", "#585d9c"]
         x = utils.convert_to_numpy(x)
         y = utils.convert_to_numpy(y)
@@ -155,6 +183,12 @@ class Metrics:
         filename += ".png"
         plt.savefig(os.path.join(self.checkpoint_dir, filename))
         plt.close()
+
+        self.logger.delay_log("Histogram data for {} ({})".format(title, filename))
+        self.logger.delay_log("Plotting {} x as vs {} as y".format(x_label, y_label))
+        self.logger.delay_log("bins:\n{}".format(bins))
+        self.logger.delay_log("values:\n{}".format(x))
+
 
 
     def plot_tsne(self, points, labels, prototypes, descrip):

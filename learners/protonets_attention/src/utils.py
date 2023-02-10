@@ -114,6 +114,7 @@ class Logger:
             self.file = open(log_file_path, "a", buffering=1)
         else:
             self.file = open(log_file_path, "w", buffering=1)
+        self.delay_buffer = ""
 
     def __del__(self):
         self.file.close()
@@ -125,6 +126,14 @@ class Logger:
         print(message, flush=True)
         self.log(message)
 
+    # Eventually log to file, but not right now
+    def delay_log(self, message):
+        self.delay_buffer += message + '\n'
+
+    # Write delay buffer to file and clear buffer
+    def write_delay_log(self):
+        self.log(self.delay_buffer)
+        self.delay_buffer = ""
 
 def linear_classifier(x, param_dict):
     """
@@ -262,7 +271,7 @@ def np_set_to_torch(images_np, labels_np, shuffle=False):
     return images, labels
     
 
-def prepare_task(task_dict, device, shuffle=False):
+def prepare_task(task_dict, device, shuffle=False, split_out_indep_eval=False):
     # If context_images are already a tensor, just assign
     context_images, context_labels = task_dict['context_images'], task_dict['context_labels']
     target_images, target_labels = task_dict['target_images'], task_dict['target_labels']
@@ -271,9 +280,29 @@ def prepare_task(task_dict, device, shuffle=False):
         context_images, context_labels = np_set_to_torch(context_images, context_labels, shuffle)
         target_images, target_labels = np_set_to_torch(target_images, target_labels, shuffle)
 
+    if split_out_indep_eval:
+        # We want to split out half the target set for evaluation, class-balanced but random otherwise
+        target_set_indices, eval_set_indices = np.empty(0, dtype=np.int8), np.empty(0, dtype=np.int8)
+        class_labels = target_labels.unique()
+        class_labels.sort()
+        for cl in class_labels:
+            class_indices = extract_class_indices(target_labels, cl)
+            num_shots = len(class_indices)
+            shuffled_indices = np.random.permutation(class_indices)
+            target_set_indices = np.append(target_set_indices, shuffled_indices[0:int(num_shots/2)])
+            eval_set_indices = np.append(eval_set_indices, shuffled_indices[int(num_shots/2):])
+        target_set_indices.sort()
+        eval_set_indices.sort()
+        eval_images, eval_labels = target_images[eval_set_indices], target_labels[eval_set_indices]
+        target_images, target_labels = target_images[target_set_indices], target_labels[target_set_indices]
+
     context_images, context_labels = move_set_to_cuda(context_images, context_labels, device)
     target_images, target_labels = move_set_to_cuda(target_images, target_labels, device)
-    return context_images, target_images, context_labels, target_labels
+    if split_out_indep_eval:
+        eval_images, eval_labels = move_set_to_cuda(eval_images, eval_labels, device)
+        return context_images, target_images, context_labels, target_labels, eval_images, eval_labels
+    else:
+        return context_images, target_images, context_labels, target_labels
 
     
 def shuffle_set(images, labels):

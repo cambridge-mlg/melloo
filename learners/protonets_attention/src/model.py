@@ -211,7 +211,9 @@ class FewShotClassifier(nn.Module):
     def _euclidean_distances(self, target_features, class_prototypes):
         num_target_features = target_features.shape[0]
         num_prototypes = class_prototypes.shape[0]
-
+        # Expand out the target features, so that we have a copy to subtract from each of the prototypes
+        # Similarly, expand out the prototypes, but expand along different dimension so that we get 
+        # qp1 - proto1, qp1 - proto2, ... qp2 - proto1, qp2 - proto2, ....
         distances = (target_features.unsqueeze(1).expand(num_target_features, num_prototypes, -1) -
                      class_prototypes.unsqueeze(0).expand(num_target_features, num_prototypes, -1)).pow(2).sum(dim=2)
 
@@ -230,7 +232,7 @@ class FewShotClassifier(nn.Module):
         class_representations = []
         attention_weights = []
         for c in torch.unique(context_labels):
-            # filter out feature vectors which have class c
+            # select feature vectors which have class c
             class_features = torch.index_select(context_features, 0, extract_class_indices(context_labels, c))
 
             # replicate the class features x target_set_size
@@ -250,7 +252,11 @@ class FewShotClassifier(nn.Module):
     def _euclidean_distances_with_attention(self, target_features, class_prototypes):
         num_target_features = target_features.shape[0]
         num_prototypes = class_prototypes.shape[0]
-
+        # Expand out the target features, so that we have a copy to subtract from each of the prototypes
+        # The attention-prototypes already have a value per target point, so no need to expan. 
+        # Instead, we're going to subtract a target-point-specific version of the prototype from the target point
+        # (which was calculated using attention)
+        # Just permute so the dimensions match up, then calculate euclidean distance.
         distances = (target_features.unsqueeze(1).expand(num_target_features, num_prototypes, -1) -
                      class_prototypes.permute(1, 0, 2)).pow(2).sum(dim=2)
 
@@ -272,7 +278,7 @@ class FewShotClassifier(nn.Module):
             print("Classifier regularization term not available for selected classifer: {}".format(self.args.classifier))
             return None
         
-        prototypes = sel.classifier_params["class_prototypes"]
+        prototypes = self.classifier_params["class_prototypes"]
         
         # In all cases, the most recently calculated prototypes are saved on the model
         # The classifier head's parameters are wk and bk with wk = 2ck, bk = -ck^Tck
