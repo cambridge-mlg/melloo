@@ -184,7 +184,7 @@ class Learner:
                             help="How to select the candidates from the importance weights. Drop option only works for noisy shot selection at present.")
         parser.add_argument("--importance_mode", choices=["attention", "loo", "representer", "random", "kl_loo", "all"], default="all",
                             help="How to calculate candidate importance")
-        parser.add_argument("--kernel_agg", choices=["sum", "sum_abs", "class"], default="class",
+        parser.add_argument("--kernel_agg", choices=["sum", "sum_abs", "class", "query_class"], default="class",
                             help="When using representer importance, how to aggregate kernel information")
         parser.add_argument("--filter_by_predicted_class", dest="filter_by_predicted_class", default=False,
                             action="store_true", 
@@ -486,7 +486,6 @@ class Learner:
                     losses.append(task_loss)
                     if ti % save_out_interval == 0 or ti == self.args.tasks-1:
                         self.metrics.plot_confusion_matrix(target_labels, "confusion_{}.png".format(ti), logits=target_logits)
-                    del target_logits
 
                 one_hot = torch.nn.functional.one_hot(context_labels).to("cpu")
                 probs = one_hot.sum(dim=0)/float(len(context_labels))
@@ -510,7 +509,8 @@ class Learner:
                     attention_weights = self.model.attention_weights.copy()
                     weights = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels), by_query_point=False).cpu()
                 elif ranking_mode == 'representer':
-                    weights = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, target_labels, target_features, self.representer_args, self.representer_args, by_query_point=False)
+                    weights = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, 
+                                    len(target_labels), target_logits.argmax(axis=1), target_features, self.representer_args, self.representer_args, by_query_point=False)
                 elif ranking_mode == 'random':
                     weights = self.random_weights(context_images, context_labels, target_images, target_labels, by_query_point=False)
                 elif ranking_mode == 'kl_loo':
@@ -681,8 +681,6 @@ class Learner:
                     if ti < self.args.num_output_tasks and self.args.way <= 10:
                         self.metrics.plot_tsne(self.model.context_features, context_labels, self.model.classifier_params["class_prototypes"], "{}_tsne_initial_coreset_{:.3}".format(ti, task_accuracy))
 
-                    del target_logits
-
                 # Save the target/context features
                 # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
                 with torch.no_grad():
@@ -703,7 +701,8 @@ class Learner:
                         weights_per_qp['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
                         
                     elif mode == 'representer':
-                        weights_per_qp['representer'] = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, target_labels, target_features, self.representer_args)
+                        weights_per_qp['representer'] = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, 
+                                                                len(target_labels), target_logits.argmax(axis=1), target_features, self.representer_args)
                     elif mode == 'random':
                         weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
                     #rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
@@ -758,7 +757,6 @@ class Learner:
         with torch.no_grad():
             target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
             full_accuracy = self.accuracy_fn(target_logits, target_labels).item()
-            del target_logits
         
         # Save the target/context features
         # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
@@ -778,9 +776,9 @@ class Learner:
                     self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                 attention_weights = self.model.attention_weights.copy()
                 weights_per_qp['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels)).cpu()
-                
             elif mode == 'representer':
-                weights_per_qp['representer'] = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, target_labels, target_features, self.representer_args)
+                weights_per_qp['representer'] = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, 
+                                                    len(target_labels), target_logits.argmax(axis=1), target_features, self.representer_args)
             elif mode == 'random':
                 weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
             rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
@@ -962,10 +960,12 @@ class Learner:
                         attention_weights = self.model.attention_weights.copy()
                         weights_per_qp['attention'] = self.reshape_attention_weights(attention_weights, context_labels, len(target_labels), target_logits = target_logits, filter_predicted_class=self.args.filter_by_predicted_class).cpu()
                     elif mode == 'representer':
-                        weights_per_qp['representer'] = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, target_labels, target_features, self.representer_args)
+                        with torch.no_grad():
+                            target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                        weights_per_qp['representer'] = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, 
+                                                                    len(target_labels), target_logits.argmax(axis=1), target_features, self.representer_args)
                     elif mode == 'random':
                         weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
-                    #import pdb; pdb.set_trace()
                     rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
                     # May want to normalize here:
                     weights[mode] = weights_per_qp[mode].sum(dim=0)
@@ -1231,7 +1231,7 @@ class Learner:
                 # We could optimize by only doing this if we're doing attention or divine selection, but for now whatever, it's a single forward pass
                 # And we usually calculate attention weights
                 with torch.no_grad():
-                    self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
+                    target_logits = self.model(context_images, context_labels, target_images, target_labels, MetaLearningState.META_TEST)
                     # Make a copy of the target features, otherwise we get a reference to what the model is storing
                     # (and we're about to send another task through it, so that's not what we want)
                     context_features, target_features = self.model.context_features.cpu(), self.model.target_features.cpu()                
@@ -1249,7 +1249,8 @@ class Learner:
                         weights_per_qp['attention'] = self.reshape_attention_weights(self.model.attention_weights, context_labels, len(target_labels), target_logits=target_logits, filter_predicted_class=self.args.filter_by_predicted_class)
                         
                     elif mode == 'representer':
-                        weights_per_qp['representer'] = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, target_labels, target_features, self.representer_args)
+                        weights_per_qp['representer'] = metaloo.calculate_representer_values(self.model, self.loss, context_images, context_labels, context_features, 
+                                                                len(target_labels), target_logits.argmax(axis=1), target_features, self.representer_args)
                     elif mode == 'random':
                         weights_per_qp['random'] = self.random_weights(context_images, context_labels, target_images, target_labels)
                     rankings_per_qp[mode] = torch.argsort(weights_per_qp[mode], dim=1, descending=True)
@@ -1316,7 +1317,8 @@ class Learner:
             predictions = torch.argmax(target_logits, dim=1)
         else:
             predictions = None
-
+        # attention_weights is a list where index 0 corresponds to weights for class 0, etc.
+        # each entry in the list is a vector of [num_qp x num_shots] i.e. the attn b/w qp_i and cp_j from class K
         for ci, c in enumerate(torch.unique(context_labels)):
             c_indices = utils.extract_class_indices(context_labels, c)
             c_weights = attention_weights[ci].cpu().squeeze().clone()

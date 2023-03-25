@@ -142,19 +142,21 @@ def select_top_k(number, weights, spread_constraint, class_labels=None):
         """
 
 
-def calculate_representer_values(model, loss, context_images, context_labels, context_features, target_labels, target_features,     
+def calculate_representer_values(model, loss, context_images, context_labels, context_features, num_target_points, target_predictions, target_features,     
         params, by_query_point=True):
     l2_regularize_classifier = params["l2_regularize_classifier"]
     l2_lambda = params["l2_lambda"]
     kernel_agg = params["kernel_agg"]
-    
+
     # Do the forward pass with the context set for the representer points:
     context_logits = model(context_images, context_labels, context_images, context_labels, MetaLearningState.META_TEST)
     task_loss = loss(context_logits, context_labels)
+    # Feature adaptation network's regularisation term
     regularization_term = (model.feature_adaptation_network.regularization_term())
-    regularizer_scaling = 0.001
+    regularizer_scaling = 0.001 # Same as lambda really, but this was probably hardcoded when training the L2 version of the feature adaptation network
     task_loss += regularizer_scaling * regularization_term
 
+    # Classifier's regularisation term; both must be added
     if l2_regularize_classifier:
         classifier_regularization_term = model.classifer_regularization_term()
         task_loss += l2_lambda * classifier_regularization_term
@@ -162,40 +164,58 @@ def calculate_representer_values(model, loss, context_images, context_labels, co
     # Representer values calculation    
     dl_dphi = torch.autograd.grad(task_loss, context_logits, retain_graph=True)[0]
     del context_logits
-    gc.collect()
+
+    # Have double-checked these calculations on 10 Feb 2023
     alphas = dl_dphi/(-2.0 * l2_lambda * float(len(context_labels)))
     alphas_t = alphas.transpose(1,0)
+    # We want the dot product between each context feature and each target feature
+    # Code below gives us a matrix with the dot product between cfi and tf j at entry (i,j)
     feature_prod = torch.matmul(context_features, target_features.transpose(1,0)).to(context_images.device)
     
     kernels_agg = []
+    # For each class
     for k in range(alphas.shape[1]):
+        # Get alphas for all context points, w.r.t. class k
         alphas_k = alphas_t[k]
-        tmp_mat = alphas_k.unsqueeze(1).expand(len(context_labels), len(target_labels))
+        # Repeat these values for each target point
+        tmp_mat = alphas_k.unsqueeze(1).expand(len(context_labels), num_target_points)
+        # Scale each cf_i dot tf_j with alpha_i
         kernels_k = tmp_mat * feature_prod
         kernels_agg.append(kernels_k.unsqueeze(0))
+    # kernels_agg is now a list of matrices, one for each class k where each matrix entry (i,j) is (alpha_ik cf_i dot tf_j)
+    # Stack them to be num_classes x num_context x num_query
     representers = torch.cat(kernels_agg, dim=0)
-    
 
     if kernel_agg == 'sum':
         representers_agg = representers.sum(dim=0).transpose(1,0).cpu()
     
     elif kernel_agg == 'sum_abs':
         representers_agg = representers.abs().sum(dim=0).transpose(1,0).cpu()
-    
     elif kernel_agg == 'class':
         representer_tmp = []
+        # torch.unique always calls sort, so this should access labels in the same order as alpha's entries are defined
         for c in torch.unique(context_labels):
             c_indices = utils.extract_class_indices(context_labels, c)
             for i in c_indices:    
                 representer_tmp.append(representers[c][i])
+        # When looking at representer values, rep_{i,c} is usually positive for c = class of pattern i and negative otherwise
+        # So if we extract values w.r.t. context point classes, everything ends of being positive
+        # Might still be a measure of importance? But it feels like splitting w.r.t. query point's class makes more sense 
+        # (See case below)
         representers_agg = torch.stack(representer_tmp).transpose(1,0).cpu()
-        
+    elif kernel_agg == 'query_class':
+        # Get representer values for target point's predicted class; absolute value for "importance" rather than excitation/inhibition
+        representer_tmp = []
+        for t in range(num_target_points):
+            representer_tmp.append(representers[target_predictions[t],:,t]) # Add block corresponding to target point's predicted class
+        representers_agg = torch.stack(representer_tmp).cpu()
+        representers_agg = representers_agg.abs()
     else:
         print("Unsupported kernel aggregation method specified")
         return None
+
     if by_query_point:
         return representers_agg
-
     weights = representers_agg.sum(dim=0)
     return weights
 

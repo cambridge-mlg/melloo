@@ -246,7 +246,8 @@ class FewShotClassifier(nn.Module):
     
             class_representations.append(class_prototype.squeeze())
             attention_weights.append(attn_weights)
-
+        # attention_weights is a list of weights with shape [num_query x num_shots]
+        # each entry in the list corresponds to a different class
         return torch.stack(class_representations), attention_weights
 
     def _euclidean_distances_with_attention(self, target_features, class_prototypes):
