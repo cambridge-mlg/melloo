@@ -747,7 +747,15 @@ class Learner:
                     
                 self.metrics.print_and_log_metric(eval_accuracies, item, 'Eval Accuracy ({})'.format(mode))
 
-    def _bimodal_inner_loop(self, context_images, context_labels, context_labels_orig, target_images, target_labels, ranking_modes, accuracies, num_unique_labels, ti, descrip):
+    def calc_fraction_from_mode(self, target_labels_orig, candidate_labels_orig):
+        #import pdb; pdb.set_trace()
+        target_classes = target_labels_orig.unique()
+        correct_mask = candidate_labels_orig == target_classes[0]
+        for k in range(1, len(target_classes)):
+            correct_mask  = correct_mask.logical_or(candidate_labels_orig == target_classes[k])
+        return 100*correct_mask.sum()/len(correct_mask)
+
+    def _bimodal_inner_loop(self, context_images, context_labels, context_labels_orig, target_images, target_labels, target_labels_orig, ranking_modes, accuracies, num_unique_labels, ti, descrip, num_labels_from_mode=None):
         full_accuracy = -1
         rankings_per_qp = {}
         weights_per_qp = {}
@@ -796,7 +804,8 @@ class Learner:
 
             # If there aren't restrictions to ensure that every class is represented, we need to make special provision:
             reduced_candidate_labels, reduced_target_images, reduced_target_labels = metaloo.remove_unrepresented_points(candidate_labels, target_images, target_labels)
-
+            if num_labels_from_mode is not None:
+                num_labels_from_mode[key].append(self.calc_fraction_from_mode(target_labels_orig.cpu(), context_labels_orig[candidate_indices].cpu()))
             num_unique_labels[key].append(len(context_labels_orig[candidate_indices].unique()))
             
             # Calculate accuracy on task using only selected candidates as context points
@@ -812,11 +821,11 @@ class Learner:
                 if ti < self.args.num_output_tasks:
                     self.metrics.save_image_set(ti, candidate_images, "candidate_{}_{}".format(descrip, key), labels=candidate_labels)
                     
-        return full_accuracy, accuracies, num_unique_labels
+        return full_accuracy, accuracies, num_unique_labels, num_labels_from_mode
 
     def bimodal_task(self, path):
         self.logger.print_and_log("")  # add a blank line
-        self.logger.print_and_log('Funky bimodal task using model {0:}: '.format(path))
+        self.logger.print_and_log('Bimodal task using model {0:}: '.format(path))
         self.model = self.init_model()
         if path != 'None':
             self.model.load_state_dict(torch.load(path))
@@ -838,9 +847,13 @@ class Learner:
             # "accuracies_full_bimodal" will track the bimodal problem (i.e. reshaped with half as many classes)
             num_unique_labels_bimodal = {}
             num_unique_labels_unimodal = {}
+            num_labels_from_mode = {}
+            num_labels_from_mode_sanity = {} # Should always be 10 since it contains bimodal data
             for mode in ranking_modes:
                 num_unique_labels_bimodal[mode] = []
                 num_unique_labels_unimodal[mode] = []
+                num_labels_from_mode[mode] = []
+                num_labels_from_mode_sanity[mode] = []
 
             for ti in tqdm(range(self.args.tasks), dynamic_ncols=True):
                 task_dict = self.dataset.get_test_task(item)
@@ -854,8 +867,8 @@ class Learner:
                     self.metrics.save_image_set(ti, context_images, "context")
                     self.metrics.save_image_set(ti, target_images, "target")
 
-                full_acc_bimodal, accuracies_bimodal, num_unique_labels_bimodal = self._funky_bimodal_inner_loop(context_images, context_labels, context_labels_orig, 
-                                target_images, target_labels, ranking_modes, accuracies_bimodal, num_unique_labels_bimodal, ti, "bimodal")
+                full_acc_bimodal, accuracies_bimodal, num_unique_labels_bimodal, num_labels_from_mode_sanity = self._bimodal_inner_loop(context_images, context_labels, context_labels_orig, 
+                                target_images, target_labels, target_labels_orig, ranking_modes, accuracies_bimodal, num_unique_labels_bimodal, ti, "bimodal", num_labels_from_mode=num_labels_from_mode_sanity)
                 accuracies_full_bimodal.append(full_acc_bimodal)
                 
                 # Randomly drop one of the modes in target set
@@ -870,21 +883,31 @@ class Learner:
 
                 if ti < self.args.num_output_tasks:
                     self.metrics.save_image_set(ti, target_images[keep_indices], "unimodal_target", labels=target_labels_orig[keep_indices])
-                
-                full_acc_unimodal, accuracies_unimodal, num_unique_labels_unimodal = self._funky_bimodal_inner_loop(context_images, context_labels, context_labels_orig,
-                                new_target_images, new_target_labels, ranking_modes, accuracies_unimodal, num_unique_labels_unimodal, ti, "unimodal")
+
+                full_acc_unimodal, accuracies_unimodal, num_unique_labels_unimodal, num_labels_from_mode  = self._bimodal_inner_loop(context_images, context_labels, context_labels_orig,
+                                new_target_images, new_target_labels, target_labels_orig[keep_indices], ranking_modes, accuracies_unimodal, num_unique_labels_unimodal, ti, "unimodal", num_labels_from_mode=num_labels_from_mode)
                 accuracies_full_unimodal.append(full_acc_unimodal)
                 
             for key in num_unique_labels_bimodal.keys():
                 unique_np = np.array(num_unique_labels_bimodal[key])
                 self.logger.print_and_log("Average number of unique labels (bimodal) ({}): {}+/-{}".format(key, unique_np.mean(), unique_np.std()))
             self.metrics.print_and_log_metric(accuracies_full_bimodal, item, 'Accuracy (bimodal)')
+
+            for key in  num_labels_from_mode_sanity.keys():
+                mode_np = np.array(num_labels_from_mode_sanity[key])
+                self.logger.print_and_log("Correct mode composition ({}): {}+/-{}".format(key, mode_np.mean(), mode_np.std()))
+
+
             for key in accuracies_bimodal.keys():
                 self.metrics.print_and_log_metric(accuracies_bimodal[key], item, 'Accuracy (bimodal) {}'.format(key))
                 
             for key in num_unique_labels_unimodal.keys():
                 unique_np = np.array(num_unique_labels_unimodal[key])
                 self.logger.print_and_log("Average number of unique labels (unimodal) ({}): {}+/-{}".format(key, unique_np.mean(), unique_np.std()))
+
+            for key in  num_labels_from_mode.keys():
+                mode_np = np.array(num_labels_from_mode[key])
+                self.logger.print_and_log("Correct mode composition ({}): {}+/-{}".format(key, mode_np.mean(), mode_np.std()))
             self.metrics.print_and_log_metric(accuracies_full_unimodal, item, 'Accuracy (unimodal)')
             for key in accuracies_unimodal.keys():
                 self.metrics.print_and_log_metric(accuracies_unimodal[key], item, 'Accuracy (unimodal) {}'.format(key))

@@ -118,7 +118,6 @@ class DotProdAttention(nn.Module):
         Returns:
             tensor: Output of shape `(num_functions, num_queries, dim_value)`.
         """
-        import pdb; pdb.set_trace()
         dk = keys.shape[-1]
         attn_logits = torch.bmm(queries, keys.permute(0, 2, 1)) / self.temperature
         attn_weights = nn.functional.softmax(attn_logits, dim=-1)
